@@ -1,0 +1,113 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<beans xmlns="http://www.springframework.org/schema/beans"
+       xmlns:context="http://www.springframework.org/schema/context"
+       xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+       xmlns:cache="http://www.springframework.org/schema/cache"
+       xmlns:aop="http://www.springframework.org/schema/aop"
+       xmlns:tx="http://www.springframework.org/schema/tx"
+       xsi:schemaLocation="
+        http://www.springframework.org/schema/beans
+        http://www.springframework.org/schema/beans/spring-beans-4.0.xsd
+        http://www.springframework.org/schema/context
+        http://www.springframework.org/schema/context/spring-context-4.0.xsd
+  http://www.springframework.org/schema/cache
+      http://www.springframework.org/schema/cache/spring-cache-3.2.xsd
+    http://www.springframework.org/schema/tx http://www.springframework.org/schema/tx/spring-tx-2.0.xsd
+    http://www.springframework.org/schema/aop http://www.springframework.org/schema/aop/spring-aop-2.0.xsd  ">
+    <!-- 加载资源文件  其中包含变量信息，必须在Spring配置文件的最前面加载，即第一个加载-->
+    <bean id="configProperties" class="org.springframework.beans.factory.config.PropertiesFactoryBean">
+        <property name="locations">
+            <list>
+                <value>classpath:jdbc-core.properties</value>
+            </list>
+        </property>
+    </bean>
+    <bean id="propertyConfigurer"
+          class="org.springframework.beans.factory.config.PropertyPlaceholderConfigurer">
+        <property name="ignoreResourceNotFound" value="false" />
+        <property name="properties" ref="configProperties" />
+    </bean>
+    <context:component-scan base-package="com.*"/>
+
+
+    <!-- 数据源配置, 使用 alibaba.druid 数据库连接池 -->
+    <bean id="dataSource" class="com.alibaba.druid.pool.DruidDataSource"
+          destroy-method="close" autowire="byName">
+        <!-- 数据源驱动类可不写，Druid默认会自动根据URL识别DriverClass -->
+        <!-- 基本属性 url、user、password -->
+        <property name="driverClassName" value="${jdbc.driver}"/>
+        <property name="url" value="${jdbc.url}"/>
+        <property name="username" value="${jdbc.username}"/>
+        <property name="password" value="${jdbc.password}"/>
+        <!-- 初始化连接大小 -->
+        <property name="initialSize" value="${initialSize}"/>
+        <!-- 连接池最大数量 -->
+        <property name="maxActive" value="${maxActive}"/>
+        <!-- 连接池最大空闲 -->
+        <property name="maxIdle" value="${maxIdle}"/>
+        <!-- 连接池最小空闲 -->
+        <property name="minIdle" value="${minIdle}"/>
+
+        <!-- 配置获取连接等待超时的时间 -->
+        <property name="maxWait" value="6000"/>
+
+        <!-- 配置间隔多久才进行一次检测，检测需要关闭的空闲连接，单位是毫秒 -->
+        <property name="timeBetweenEvictionRunsMillis" value="60000"/>
+
+        <!-- 配置一个连接在池中最小生存的时间，单位是毫秒 -->
+        <property name="minEvictableIdleTimeMillis" value="30000"/>
+
+        <!--新增配置-->
+        <!-- 这里建议配置为TRUE，防止取到的连接不可用 -->
+        <property name="testOnBorrow" value="true" />
+        <property name="testOnReturn" value="false" />
+        <!--监测连接是否有效-->
+        <property name="validationQuery" value="select 1" />
+        <!--建议配置为true，不影响性能，并且保证安全性-->
+        <property name="testWhileIdle" value="true" />
+    </bean>
+    <!--<bean id="dataSource" class="org.apache.commons.dbcp.BasicDataSource"-->
+          <!--destroy-method="close">-->
+        <!--<property name="driverClassName" value="${jdbc.driver}"/>-->
+        <!--<property name="url" value="${jdbc.url}"/>-->
+        <!--<property name="username" value="${jdbc.username}"/>-->
+        <!--<property name="password" value="${jdbc.password}"/>-->
+        <!--&lt;!&ndash; 初始化连接大小 &ndash;&gt;-->
+        <!--<property name="initialSize" value="${initialSize}"></property>-->
+        <!--&lt;!&ndash; 连接池最大数量 &ndash;&gt;-->
+        <!--<property name="maxActive" value="${maxActive}"></property>-->
+        <!--&lt;!&ndash; 连接池最大空闲 &ndash;&gt;-->
+        <!--<property name="maxIdle" value="${maxIdle}"></property>-->
+        <!--&lt;!&ndash; 连接池最小空闲 &ndash;&gt;-->
+        <!--<property name="minIdle" value="${minIdle}"></property>-->
+        <!--&lt;!&ndash; 获取连接最大等待时间 &ndash;&gt;-->
+        <!--<property name="maxWait" value="${maxWait}"></property>-->
+    <!--</bean>-->
+
+
+
+
+    <!-- spring-MyBatis -->
+    <bean id="sqlSessionFactory" class="org.mybatis.spring.SqlSessionFactoryBean">
+        <property name="dataSource" ref="dataSource" />
+        <!-- 自动扫描mapping.xml文件，**表示迭代查找 -->
+        <property name="mapperLocations" value="classpath*:com/dao/sqlmap/*.xml" />
+    </bean>
+
+    <!-- DAO接口所在包名，Spring会自动查找其下的类 ,包下的类需要使用@MapperScan注解,否则容器注入会失败 -->
+    <bean class="org.mybatis.spring.mapper.MapperScannerConfigurer">
+        <property name="basePackage" value="com.dao" />
+        <property name="sqlSessionFactoryBeanName" value="sqlSessionFactory" />
+    </bean>
+
+    <!-- (事务管理)transaction manager, use JtaTransactionManager for global tx -->
+    <bean id="transactionManager" class="org.springframework.jdbc.datasource.DataSourceTransactionManager">
+        <property name="dataSource" ref="dataSource" />
+    </bean>
+    <!-- 开启事务控制的注解支持 -->
+    <tx:annotation-driven transaction-manager="transactionManager"/>
+
+
+
+
+</beans>
