@@ -7183,3 +7183,350 @@ public interface ExcelExportService
     }
 ```
 
+## 11、Spring  MVC的数据转换和格式化
+
+​		当一个请求到达DispatcherServlet的时候，需要找到对应的HandlerMapping，然后根据HandlerMapping去找到对应的HandlerAdapter执行处理器，处理器在要调用的控制器之前，需要先获取HTTP发送过来的信息，然后将其转变为控制的各种不同类型的参数，这就是各类注解能够得到丰富类型参数的原因。
+
+​		它首先用HTTP的消息转换器对消息转换，但这是一个比较原始的转换，它是String类型和文件类型比较简易的转换，还需哟啊进一步转换才能转换为POJO或者其他丰富的参数类型。
+
+​		当处理器处理完了这些参数的转换，它就会进行验证。完成了这些内容，下一步就是调用开发者所提供的控制器了，将之前转换成功的参数传递进去，这样控制器就能够得到丰富的Java类型的支持。，进而完成控制器的逻辑，控制器完成了对应的逻辑，返回结果后，处理如果可以找到对应结果类型的HttpMessageConverter的实现类，它就会调用对应的HttpMessageConverter的实现类方法。对控制器返回的结果进行HTTP转换，这一步不是必须的，可以转化的前提是能够找到对应的转换器，做完这些处理的功能就完成了。
+
+​		接下来就是关于视图解析和视图解析器。
+
+![](image/QQ截图20191121203246.png)
+
+​		对于Spring  MVC，在XML中配置了 <mvc:annotation-driven />，或者Java配置的注解上加入@EnableWebMvc的时候，Spring  IoC容器会自定义生成一个关于转换器和格式化器的类实例——FormattingConversionServiceFactoryBean，这样就可以从Spring  IoC容器中获取这个对象了，其是一个工厂，产品主要就是DefaultFormattingConversionService类对象，类对象继承了一些类，并实现了许多接口。
+
+![](image/QQ截图20191121203953.png)
+
+​		在Java类型转换之前，在Spring  MVC中，为了应对HTTP请求，还定义了HttpMessageConverter，它是一个总体的接口，通过它可以读入HTTP的请求内容，也就是说，在读取HTTP请求的参数和内容的时候会先用HttpMessageConverter读出，做一次简单转换为Java类型，主要是字符串，然后就可以使用各类转换器进行转换了，在逻辑业务处理完成后，还可以通过它把数据转换为响应给用户的内容。
+
+​		转换器：两大类，它们都可以使用注册机注册。
+
+​				1、由Converter接口所定义的。
+
+​				2、GenericConverter。
+
+### 11.1、HttpMessageConverter和JSON消息转换器
+
+​		HttpMessageConverter是定义从HTTP接收请求信息和应答给用户的。
+
+```java
+public interface HttpMessageConverter<T> {
+    //判断类型是否可读，var1是类别，var2是HTTP类型
+    boolean canRead(Class<?> var1, MediaType var2);
+
+    //判断类型是否可写，var1是类别，var2是HTTP类型
+    boolean canWrite(Class<?> var1, MediaType var2);
+
+    //MediaType是HTTP类型
+    List<MediaType> getSupportedMediaTypes();
+
+    //读取数据类型，进行转换，var1是类，var2是HTTP请求消息
+    T read(Class<? extends T> var1, HttpInputMessage var2) throws IOException, HttpMessageNotReadableException;
+
+    //消息写，var2是HTTP类型，var3是HTTP的应答消息
+    void write(T var1, MediaType var2, HttpOutputMessage var3) throws IOException, HttpMessageNotWritableException;
+}
+```
+
+​		其实现中用得最多的是：MappingJackson2HttpMessageConverter
+
+​	![](image/QQ截图20191121205537.png)
+
+​		注册 MappingJackson2HttpMessageConverter：
+
+```java
+	@Bean(name = "requestMappingHandlerAdapter")
+    public HandlerAdapter initRequestMappingHandlerAdapter()
+    {
+        //创建RequestMappingHandlerAdapter适配器
+        RequestMappingHandlerAdapter rmhd = new RequestMappingHandlerAdapter();
+        //HTTP JSON转换器
+        MappingJackson2HttpMessageConverter json = new MappingJackson2HttpMessageConverter();
+        //http类型支持为JSON类型
+        MediaType mediaType = MediaType.APPLICATION_JSON_UTF8;
+        List<MediaType> mediaTypes = new ArrayList<>();
+        mediaTypes.add(mediaType);
+        //键入转换器的支持类型
+        json.setSupportedMediaTypes(mediaTypes);
+        //往适配器加入JSON转换器
+        rmhd.getMessageConverters().add(json);
+        return rmhd;
+    }
+```
+
+```xml
+	<bean class="org.springframework.web.servlet.mvc.method.annotation.RequestMappingHandlerAdapter">
+        <property name="messageConverters">
+            <list>
+                <ref bean="jsonConverter" />
+            </list>
+        </property>
+    </bean>
+    <bean id="jsonConverter" class="org.springframework.http.converter.json.MappingJackson2HttpMessageConverter">
+        <property name="supportedMediaTypes">
+            <list>
+                <value>APPLICATION_JSON_UTF8</value>
+            </list>
+        </property>
+    </bean>
+```
+
+​		注册后，当在控制器中加入注解@ResponseBody的时候，Spring  MVC便会将应带请求转变为关于JSON的类型，这样的一次转换，就意味着处理器会在控制器返回结果后，遍历其项目中定义的各类HttpMessageConverter实现类，由于MappingJackson2HttpMessageConverter定义为支持JSON数据的转换，它和@ResponseBody所定义的响应类型一致，因此Spring  MVC会将其转换为JSON数据集，此时控制器返回的ModelAndView为null，也就没有后面的视图渲染的过程了。
+
+### 11.2、一对一转换器（Converter）
+
+```java
+/**
+* 转换器接口，
+* S：源类型
+* T：目标类型
+*/
+public interface Converter<S, T> {
+    T convert(S var1);
+}
+```
+
+​		部分转换器：
+
+![](image/QQ截图20191121211621.png)
+
+​		自定义转换器：（转换器未生效，问题未解决）
+
+```java
+public class StringToRoleConverter implements Converter<String, Role>
+{
+
+    @Override
+    public Role convert(String str)
+    {
+        if()
+        {
+            StringUtils.isEmpty(str)
+            {
+                return null;
+            }
+            if(str.indexOf("-") == -1)
+            {
+                return null;
+            }
+            String[] arr = str.split("-");
+            if(arr.length != 3)
+            {
+                return null;
+            }
+            Role role = new Role();
+            role.setId(Integer.parseInt(arr[0]));
+            role.setRoleName(arr[1]);
+            role.setNote(arr[2]);
+            return role;
+        }
+    }
+}
+```
+
+​		此时还不够，还需要注册：
+
+```java
+	private List<Converter> styleConverter = null;
+
+	//需要通过这个工厂类来进行注册
+	@Autowired
+	private FormattingConversionServiceFactoryBean fcsfb = null;
+
+    @Bean("styleConverter")
+    public List<Converter> initStyleConverter()
+    {
+        if(styleConverter == null)
+        {
+            styleConverter = new ArrayList<>();
+        }
+        Converter roleConverter = new StringToRoleConverter();
+        styleConverter.add(roleConverter);
+        fcsfb.getObject().addConverter(roleConverter);
+        return styleConverter;
+    }
+```
+
+```xml
+<!-- 指定转换服务类 -->
+<mvc:annotation-driven conversion-service="conversionService" />
+<bean id="conversionService" class="org.springframework.format.support.FormattingConversionServiceFactoryBean">
+        <property name="converters">
+            <list>
+                <bean class="com.shanji.converter.StringToRoleConverter" />
+            </list>
+        </property>
+    </bean>
+```
+
+### 11.3、数组和集合转换器 GenericConverter
+
+​		Conver存在弊端：只能从一种类型转换成另一种类型，不能进行一对多的转换。
+
+​		为了解决这个问题，Spring  Core项目加入了另一个转换器结构GenericConverter，它能够满足数组和集合转换的要求。
+
+```java
+public interface GenericConverter {
+    //返回可接受的转换类型
+    Set<GenericConverter.ConvertiblePair> getConvertibleTypes();
+
+    //转换方法
+    Object convert(Object var1, TypeDescriptor var2, TypeDescriptor var3);
+
+    //可转换匹配类
+    public static final class ConvertiblePair {
+        //源类型
+        private final Class<?> sourceType;
+        //目标类型
+        private final Class<?> targetType;
+
+        public ConvertiblePair(Class<?> sourceType, Class<?> targetType) {
+            Assert.notNull(sourceType, "Source type must not be null");
+            Assert.notNull(targetType, "Target type must not be null");
+            this.sourceType = sourceType;
+            this.targetType = targetType;
+        }
+
+        public Class<?> getSourceType() {
+            return this.sourceType;
+        }
+
+        public Class<?> getTargetType() {
+            return this.targetType;
+        }
+
+        public boolean equals(Object other) {
+            if (this == other) {
+                return true;
+            } else if (other != null && other.getClass() == GenericConverter.ConvertiblePair.class) {
+                GenericConverter.ConvertiblePair otherPair = (GenericConverter.ConvertiblePair)other;
+                return this.sourceType == otherPair.sourceType && this.targetType == otherPair.targetType;
+            } else {
+                return false;
+            }
+        }
+
+        public int hashCode() {
+            return this.sourceType.hashCode() * 31 + this.targetType.hashCode();
+        }
+
+        public String toString() {
+            return this.sourceType.getName() + " -> " + this.targetType.getName();
+        }
+    }
+}
+```
+
+​		为了进行类型匹配判断，还定义了另一个接口：ConditionalConverter
+
+```java
+public interface ConditionalConverter {
+    //var1:源数据类型，var2目标数据类型，如果返回true，才进行下一步转换
+    boolean matches(TypeDescriptor var1, TypeDescriptor var2);
+}
+```
+
+​		为了整合原有的接口GenericConverter有了一个新的接口：ConditionalGenericConverter，它是最常用的集合转换器接口。由于继承了GenericConverter, ConditionalConverter，所以它既能判断，又能转换。
+
+```java
+public interface ConditionalGenericConverter extends GenericConverter, ConditionalConverter {
+}
+```
+
+​		基于此接口，Spring  Core给出了许多实现类，这些实现类都会注册到ConversionService对象中，通过ConditionalConverter的matches进行匹配，如果可以匹配，则会调用Conver方法进行转换，它能够提供各种对数组和集合的转换。
+
+![](image/QQ截图20191121233245.png)
+
+​		StringToArrayConverter源码：
+
+```java
+final class StringToArrayConverter implements ConditionalGenericConverter {
+    //转换服务类
+    private final ConversionService conversionService;
+
+    public StringToArrayConverter(ConversionService conversionService) {
+        this.conversionService = conversionService;
+    }
+
+    //可接收的类型
+    public Set<ConvertiblePair> getConvertibleTypes() {
+        //确定转换类型
+        return Collections.singleton(new ConvertiblePair(String.class, Object[].class));
+    }
+
+    //查找是否存在Converter支持转换，如果不使用系统的，那么需要自己注册
+    public boolean matches(TypeDescriptor sourceType, TypeDescriptor targetType) {
+        return this.conversionService.canConvert(sourceType, targetType.getElementTypeDescriptor());
+    }
+
+    //转换方法
+    public Object convert(Object source, TypeDescriptor sourceType, TypeDescriptor targetType) {
+        if (source == null) {
+            return null;
+        } else {
+            //源数据
+            String string = (String)source;
+            //逗号分隔字符串
+            String[] fields = StringUtils.commaDelimitedListToStringArray(string);
+            //转换目标
+            Object target = Array.newInstance(targetType.getElementTypeDescriptor().getType(), fields.length);
+
+            //转换数组
+            for(int i = 0; i < fields.length; ++i) {
+                String sourceElement = fields[i];
+                //使用conversionService做类型转换，要求我们使用一个自定义或者Spring  Core的Converter
+                Object targetElement = this.conversionService.convert(sourceElement.trim(), sourceType, targetType.getElementTypeDescriptor());
+                Array.set(target, i, targetElement);
+            }
+
+            return target;
+        }
+    }
+}
+```
+
+### 11.4、格式化器
+
+​		为了支持数据格式化，Spring  Context提供了相关的Formatter。
+
+![](image/QQ截图20191121234619.png)
+
+​		通过print方法能将结果按照一定的格式输出字符串，通过parse方法能够将满足一定格式的字符串转换为对象。它的内部实际是委托给Converter机制去实现的。
+
+​		@DateTimeFormat：标注日期参数。
+
+​		@NumberFormar：标注数字参数。
+
+```java
+<form action="<%=baseUrl%>/params/format.do">
+        <table>
+            <tr>
+                <td>日期</td>
+                <td><input type="text" value="2019-11-21" name="date" /></td>
+            </tr>
+            <tr>
+                <td>金额</td>
+                <td><input type="text" value="123,000.00" name="amount" /></td>
+            </tr>
+            <tr>
+                <td></td>
+                <td align="right"><input type="submit" value="提交" /></td>
+            </tr>
+        </table>
+</form>
+```
+
+```java
+	@RequestMapping("/format")
+    @ResponseBody
+    public Map<String,Object> format(@RequestParam("date") @DateTimeFormat(iso = DateTimeFormat.ISO.DATE)Date date, @RequestParam("amount") @NumberFormat(pattern = "#,###.##")Double amont)
+    {
+        Map<String,Object> result = new HashMap<>();
+        result.put("date",date);
+        result.put("amount",amont);
+        return result;
+    }
+```
+
