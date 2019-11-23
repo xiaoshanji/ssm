@@ -7530,3 +7530,216 @@ final class StringToArrayConverter implements ConditionalGenericConverter {
     }
 ```
 
+## 12、为控制器添加通知
+
+​		与Spring  AOP一样，Spring  MVC也能够给控制器加入通知。涉及4个注解：
+
+​				@ControllerAdvice：主要作用于类，用以标注全局性的控制器的拦截器，它将应用与对应的控制器。
+
+​				@InitBinder：一个允许构建POJO参数的方法，允许在构造控制器参数的时候，加入一定的自定义控		制。
+
+​				@ExceptionHandler：通过它可以注册一个控制器异常，使用当控制器发生异常时，就会跳转到该方法		上。
+
+​				@ModelAttribute：一种针对于数据模型的注解，它选育控制器方法运行，当标注方法返回对象时，它		会保存到数据模型中。
+
+```java
+@ControllerAdvice(basePackages = {"com.shanji.advice"})
+public class CommonControllerAdvice
+{
+    @InitBinder
+    public void InitBinder(WebDataBinder binder)
+    {
+        //针对日期类型的格式化，其中CustomDateEditor是客户自定义编辑器
+        binder.registerCustomEditor(Date.class,new CustomDateEditor(new SimpleDateFormat("yyyy-MM-dd"),false));
+    }
+
+    //处理数据模型，如果返回对象，则该对象会保存在数据模型中
+    @ModelAttribute
+    public void populateModel(Model model)
+    {
+        model.addAttribute("style","小杉杉");
+    }
+
+    //此返回值，在控制器抛出异常时，被当做逻辑视图名
+    @ExceptionHandler(Exception.class)
+    public String exception()
+    {
+        return "exception";
+    }
+}
+```
+
+```java
+@Controller
+@RequestMapping("/advice")
+public class AdviceController
+{
+    @RequestMapping("/test")
+    @ResponseBody
+    public Map<String,Object> testAdvice(Date date, @NumberFormat(pattern = "##,###.00")BigDecimal amount, Model model)
+    {
+        Map<String,Object> result = new HashMap<>();
+        result.put("style",model.asMap().get("style"));
+        result.put("date", DateUtils.formatDate(date,"yyyy-MM-dd"));
+        result.put("amount",amount);
+        return result;
+    }
+
+    @RequestMapping("/exception")
+    public void exception()
+    {
+        throw new RuntimeException("测试异常跳转");
+    }
+}
+```
+
+​		控制器也可以使用除@ControllerAdvice以外的其余的三个注解。此时如果控制器不在@ControllerAdvice标注的包下，那么它只对当前控制器有效。
+
+​		@ModelAttribute：另外一个作用，在同一个控制器中，为不同方法传值。
+
+```java
+	@ModelAttribute("role")
+    public Role initRole(@RequestParam(value = "id",required = false)Integer id)
+    {
+        if(id == null || id < 1)
+        {
+            return null;
+        }
+        Role role = roleService.getRole(id);
+        return role;
+    }
+
+    @RequestMapping("/getRoleFromModelAttribute")
+    @ResponseBody
+    public Role getRoleFromModelAttribute(@ModelAttribute("role")Role role)
+    {
+        return role;
+    }
+```
+
+## 13、处理异常
+
+​		除了@ExceptionHandler可以处理异常，Spring会将自身产生的异常转换成合适的状态码。
+
+![](image/QQ截图20191124002215.png)
+
+```java
+public enum HttpStatus {
+    CONTINUE(100, "Continue"),
+    SWITCHING_PROTOCOLS(101, "Switching Protocols"),
+    PROCESSING(102, "Processing"),
+    CHECKPOINT(103, "Checkpoint"),
+    OK(200, "OK"),
+    CREATED(201, "Created"),
+    ACCEPTED(202, "Accepted"),
+    NON_AUTHORITATIVE_INFORMATION(203, "Non-Authoritative Information"),
+    NO_CONTENT(204, "No Content"),
+    RESET_CONTENT(205, "Reset Content"),
+    PARTIAL_CONTENT(206, "Partial Content"),
+    MULTI_STATUS(207, "Multi-Status"),
+    ALREADY_REPORTED(208, "Already Reported"),
+    IM_USED(226, "IM Used"),
+    MULTIPLE_CHOICES(300, "Multiple Choices"),
+    MOVED_PERMANENTLY(301, "Moved Permanently"),
+    FOUND(302, "Found"),
+    /** @deprecated */
+    @Deprecated
+    MOVED_TEMPORARILY(302, "Moved Temporarily"),
+    SEE_OTHER(303, "See Other"),
+    NOT_MODIFIED(304, "Not Modified"),
+    /** @deprecated */
+    @Deprecated
+    USE_PROXY(305, "Use Proxy"),
+    TEMPORARY_REDIRECT(307, "Temporary Redirect"),
+    PERMANENT_REDIRECT(308, "Permanent Redirect"),
+    BAD_REQUEST(400, "Bad Request"),
+    UNAUTHORIZED(401, "Unauthorized"),
+    PAYMENT_REQUIRED(402, "Payment Required"),
+    FORBIDDEN(403, "Forbidden"),
+    NOT_FOUND(404, "Not Found"),
+    METHOD_NOT_ALLOWED(405, "Method Not Allowed"),
+    NOT_ACCEPTABLE(406, "Not Acceptable"),
+    PROXY_AUTHENTICATION_REQUIRED(407, "Proxy Authentication Required"),
+    REQUEST_TIMEOUT(408, "Request Timeout"),
+    CONFLICT(409, "Conflict"),
+    GONE(410, "Gone"),
+    LENGTH_REQUIRED(411, "Length Required"),
+    PRECONDITION_FAILED(412, "Precondition Failed"),
+    PAYLOAD_TOO_LARGE(413, "Payload Too Large"),
+    /** @deprecated */
+    @Deprecated
+    REQUEST_ENTITY_TOO_LARGE(413, "Request Entity Too Large"),
+    URI_TOO_LONG(414, "URI Too Long"),
+    /** @deprecated */
+    @Deprecated
+    REQUEST_URI_TOO_LONG(414, "Request-URI Too Long"),
+    UNSUPPORTED_MEDIA_TYPE(415, "Unsupported Media Type"),
+    REQUESTED_RANGE_NOT_SATISFIABLE(416, "Requested range not satisfiable"),
+    EXPECTATION_FAILED(417, "Expectation Failed"),
+    I_AM_A_TEAPOT(418, "I'm a teapot"),
+    /** @deprecated */
+    @Deprecated
+    INSUFFICIENT_SPACE_ON_RESOURCE(419, "Insufficient Space On Resource"),
+    /** @deprecated */
+    @Deprecated
+    METHOD_FAILURE(420, "Method Failure"),
+    /** @deprecated */
+    @Deprecated
+    DESTINATION_LOCKED(421, "Destination Locked"),
+    UNPROCESSABLE_ENTITY(422, "Unprocessable Entity"),
+    LOCKED(423, "Locked"),
+    FAILED_DEPENDENCY(424, "Failed Dependency"),
+    UPGRADE_REQUIRED(426, "Upgrade Required"),
+    PRECONDITION_REQUIRED(428, "Precondition Required"),
+    TOO_MANY_REQUESTS(429, "Too Many Requests"),
+    REQUEST_HEADER_FIELDS_TOO_LARGE(431, "Request Header Fields Too Large"),
+    UNAVAILABLE_FOR_LEGAL_REASONS(451, "Unavailable For Legal Reasons"),
+    INTERNAL_SERVER_ERROR(500, "Internal Server Error"),
+    NOT_IMPLEMENTED(501, "Not Implemented"),
+    BAD_GATEWAY(502, "Bad Gateway"),
+    SERVICE_UNAVAILABLE(503, "Service Unavailable"),
+    GATEWAY_TIMEOUT(504, "Gateway Timeout"),
+    HTTP_VERSION_NOT_SUPPORTED(505, "HTTP Version not supported"),
+    VARIANT_ALSO_NEGOTIATES(506, "Variant Also Negotiates"),
+    INSUFFICIENT_STORAGE(507, "Insufficient Storage"),
+    LOOP_DETECTED(508, "Loop Detected"),
+    BANDWIDTH_LIMIT_EXCEEDED(509, "Bandwidth Limit Exceeded"),
+    NOT_EXTENDED(510, "Not Extended"),
+    NETWORK_AUTHENTICATION_REQUIRED(511, "Network Authentication Required");
+    ......
+}
+```
+
+​		新增一个自定义异常映射码：
+
+```java
+@ResponseStatus(code = HttpStatus.NOT_FOUND,reason = "找不到角色信息异常")
+public class RoleException extends RuntimeException
+{
+    private static final long serialVersionUID = 6602340062281161155L;
+}
+```
+
+```java
+	@ModelAttribute("role")
+    public Role initRole(@RequestParam(value = "id",required = false)Integer id)
+    {
+        if(id == null || id < 1)
+        {
+            return null;
+        }
+        Role role = roleService.getRole(id);
+        if(role == null)
+        {
+            throw new RoleException();
+        }
+        return role;
+    }
+
+    @ExceptionHandler(RoleException.class)
+    public String HandlerRoleException(RoleException e)
+    {
+        return "index";
+    }
+```
+
