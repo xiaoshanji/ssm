@@ -7743,3 +7743,112 @@ public class RoleException extends RuntimeException
     }
 ```
 
+## 14、国际化
+
+​		DispatcherServlet会解析一个LocaleResover接口对象，通过它来决定用户区域，读出对应用户系统设定的语言或者用户选择的语言，以确定国际化。但对于DispatcherServlet而言，只能够注册一个LocaleResover接口对象。
+
+![](image/QQ截图20191124105719.png)
+
+​		LocaleResolver主要作用是实现解析国际化，此外还会解析内容的问题，尤其是时区。所以在LocaleResolver的基础上，Spring 还扩展了LocaleContextResolver，它还能处理一些用户区域上的问题，包括语言和时区的问题。CookieLocalResolver主要是使用浏览的Cookie实现国际化的，而Cookie有时候需要服务器去写入到浏览器中，所以它会继承一个产生Cookie的类CookieGenerator。FixedLocaleResolver和SessionLocaleResolver有公共的方法，所以被抽象为AbstractLocaleContextResolver。它是一个能够提供语言和时区的抽象类，而它的语言功能则继承了AbstractLocaleResolver，而时区的实现则扩展了LocaleContextResolver接口。
+
+​		1、AcceptHeaderLocaleResolver：Spring默认的区域解析器，它功过检验HTTP请求的accept-language头部来解析 区域。这个头部是由用户的web浏览器根据底层操作系统的区域设置进行设定。注意，这个区域解析器无法改变用户的区域，因为它无法修改用户操作系统的区域设置。
+
+​		2、FixedLocaleResolver：使用固定Locale国际化，不可修改Locale。
+
+​		3、CookieLocaleResolver：根据Cookie数据获取国际化数据，由于用户禁止Cookie或者没有设置，如果是这样，它会金桔accept-language HTTP头部来确定默认区域。
+
+​		4、SeesionLocaleResolver：根据Session进行国际化，也就是根据用户Session的变量读取区域设置，可变，如果Session也没有设置，那么它也会使用开发者设置默认的值。
+
+​		为了修改国际化，Spring  MVC还提供了一个国际化的拦截器——LocaleChangeInterceptor，通过它可以获取参数，然后既可以通过CookieLocaleResolver使用浏览器的Cookie来实现国际化，也可以用SessionLocaleResolver通过服务器的Session来实现国际化。
+
+### 14.1、MessageSource接口
+
+​		MessageSource接口是Spring  MVC为了加载消息所设置的接口，通过它来加载对应的国际化属性文件。
+
+![](image/QQ截图20191124111659.png)
+
+​		StaticMessageSource：静态消息源。
+
+​		DelegatingMessageSource：实现的是一个代理的功能。
+
+​		ResourceBundleMessageSource：使用的是JDK提供的ResourceBundle，它只能把文件放在对应的类路径下，不具备热加载的功能，也就是需要重启系统才能重新加载它。
+
+​		ReloadableResourceBundleMessageSource：可以把属性文件放置在任何地方，可以在系统不重新启动的情况下重新加载属性文件，这样就可以在系统运行期修改对应的国际化文件，重新定制国际化的内容。
+
+```xml
+<!-- id="messageSource",Spring  MVC默认的名称，不能随意修改。basename可以传递一个文件名(带路径从classpath算起)的前缀，后缀通过Locale来确定 -->
+<bean id="messageSource" class="org.springframework.context.support.ResourceBundleMessageSource" p:defaultEncoding="UTF-8" p:basename="msg" />
+
+<!-- cacheSeconds：每隔相应的设置时间，探测属性文件的最后修改时间，如果被修改过则会重新加载，默认值为-1，表示永远缓存，系统运行期间不在修改，如果设置为0，每次访问国际化文件时都会探测属性文件的最后修改时间
+	basename：可以是多个属性文件名组成。 
+-->
+<bean id="messageSource" class="org.springframework.context.support.ReloadableResourceBundleMessageSource" p:defaultEncoding="UTF-8" p:basename="classpath:msg" p:cacheSeconds="3600" />
+```
+
+### 14.2、CookieLocaleResolver和SessionLocaleResolver
+
+​		CookieLocaleResolver：创建时，需要设置两个属性。
+
+​				cookieName：一个cookie变量的名称。
+
+​				maxAge：cookie超时时间，单位为秒。
+
+```xml
+<!-- localeResolver:不能修改，此时设置了默认为中文简体，当cookie值无效时，就会使用简体中文 -->
+<bean id="localeResolver" class="org.springframework.web.servlet.i18n.CookieLocaleResolver" p:cookieName="lang" p:cookieMaxAge="1800" p:defaultLocale="zh_CN" />
+```
+
+​		SessionLocaleResolver：
+
+```xml
+<bean id="localeResolver" class="org.springframework.web.servlet.i18n.SessionLocaleResolver" p:defaultLocale="zh_CN" />
+```
+
+​		SessionLocaleResolver定义了两个静态公共常量：可以通过控制器读取 
+
+​				1、LOCALE_SESSION_ATTRIBUTE_NAME：Session的Locale的键。
+
+​				2、TIME_ZONE_SESSION_ATTRIBUTE_NAME：时区。
+
+### 14.3、国际化拦截器
+
+​		通过请求参数去改变国际化的值，可以使用Spring提供的拦截器LocaleChangeInterceptor，它继承了HandlerInterceptorAdapter，通过覆盖它的preHandle方法，然后使用系统所配置的LocaleResolver实现国际化。
+
+```xml
+<mvc:interceptors>
+        <mvc:interceptor>
+            <mvc:mapping path="/**/**"/>
+            <bean class="org.springframework.web.servlet.i18n.LocaleChangeInterceptor">
+                <property name="paramName" value="language" />
+            </bean>
+        </mvc:interceptor>
+    </mvc:interceptors>
+```
+
+​		当请求到来，首先拦截器会监控有无language参数，有则获取它，然后通过使用系统所配置的LocaleResolver实现国际化。注意：获取不到参数，或者获取的参数的国际化并非系统能够支持，那么此时会采用默认值。
+
+### 14.4、开发
+
+```jsp
+<%@ taglib prefix="s" uri="http://www.springframework.org/tags" %>
+<%--
+  Created by IntelliJ IDEA.
+  User: 小杉杉
+  Date: 2019/11/24
+  Time: 12:10
+  To change this template use File | Settings | File Templates.
+--%>
+<%@ page contentType="text/html;charset=UTF-8" language="java" %>
+<html>
+<head>
+    <title>Title</title>
+</head>
+<body>
+    <h2>
+        <s:message code="welcome" />
+    </h2>
+Locale：${pageContext.response.locale}
+</body>
+</html>
+```
+
