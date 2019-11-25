@@ -7852,3 +7852,170 @@ Locale：${pageContext.response.locale}
 </html>
 ```
 
+# 六、Redis
+
+​		一般而言Redis在 Java  Web应用中存在两个主要的场景：
+
+​				1、缓存常用的数据。
+
+​				2、在需要高速读/写的场合使用它快速读/写。
+
+![](image/QQ截图20191125210119.png)
+
+![](image/QQ截图20191125210227.png)
+
+​		如果业务数据写次数远大于读次数没有必要使用Redis，如果是读次数远大于写次数，则使用Redis就有其价值了，因为写入Redis虽然要消耗一定的代价，但是其性能良好，相对数据库而言，几乎可以忽略不急。
+
+![](image/QQ截图20191125210635.png)
+
+​		当一个请求到达服务器，只是把业务数据先在Redis读/写，而没有进行任何对数据库的操作，系统仅仅是操作Redis缓存，而没有操作数据库，这个速度就比操作数据库要快得多，从而达到需要高速响应的效果，但是一般缓存不能持久化，或者所持久化的数据不太规范，因此需要吧这些数据存入数据库，所以在一个请求操作完Redis的读/写后，会去判断该高速读/写的业务是否结束。
+
+​		简单使用：
+
+```java
+Jedis jedis = new Jedis("192.168.58.129",6379);
+        jedis.auth("179980");
+        int i = 0;
+        try
+        {
+            long start = System.currentTimeMillis();
+            while (true)
+            {
+                long end = System.currentTimeMillis();
+                if(end - start >= 1000)
+                {
+                    break;
+                }
+                i++;
+                jedis.set("test" + i,i + "");
+            }
+        }
+        finally {
+            jedis.close();
+        }
+        System.out.println(i);
+```
+
+​		Java  Redis的连接池提供了类 JedisPool用来创建Redis连接池对象。使用这个对象，需要使用 JedisPoolConfig对连接池进行配置。
+
+```java
+JedisPoolConfig poolConfig = new JedisPoolConfig();
+        //最大空闲数
+        poolConfig.setMaxIdle(50);
+        //最大连接数
+        poolConfig.setMaxTotal(100);
+        //最大等待毫秒数
+        poolConfig.setMaxWaitMillis(20000);
+        //使用配置创建连接池
+        JedisPool pool = new JedisPool(poolConfig,"192.138.58.129",6379);
+        //从连接池中连接单个连接
+        Jedis resource = pool.getResource();
+        resource.auth("179980");
+```
+
+​		Spring中使用Redis：
+
+​			Redis只能提供基于字符串型的操作。
+
+```xml
+<bean id="poolConfig" class="redis.clients.jedis.JedisPoolConfig" p:maxIdle="50" p:maxTotal="100" p:maxWaitMillis="20000" />
+```
+
+​		在使用Spring提供的RedisTemplate之前需要配置Spring所提供的连接工厂，在Spring Data Redis提供了工厂模型。
+
+​				1、JedisConnectionFactory
+
+​				2、LettuceConnectionFactory
+
+​		配置 JedisConnectionFactory：
+
+```xml
+<bean id="connectionFactory" class="org.springframework.data.redis.connection.jedis.JedisConnectionFactory" p:hostName="192.138.58.129" p:port="6379" p:password="179980" c:poolConfig-ref="poolConfig" />
+```
+
+​		普通的连接使用没有办法把 Java对象直接存入Redis，而需要我们自己提供方案，这时往往就是将对象序列化，然后使用Reids进行存储，而取回序列化的内容后，在通过转换变为 Java对象，Spring中提供了封装的方案，在其内部提供了RedisSerializer接口和一些实现类。
+
+![](image/QQ截图20191125220003.png)
+
+​		Spring提供了实现RedisSerializer接口的序列化器：
+
+​				1、GenericJackson2JsonRedisSerializer：通用的使用 Json2.jar的包，将Redis对象的序列化器。
+
+​				2、Jackson2JsonRedisSerializer：通过 Jackson2.jar包提供的序列化进行转换。
+
+​				3、JdkSerializationRedisSerializer：使用JDK的序列化器进行转化。
+
+​				4、OxmSerializer：使用Spring  O/X对象Object和XML相互转化。
+
+​				5、StringRedisSerializer：使用字符串进行序列化。
+
+​				6、GenericToStringSerializer：通过通用的字符串序列化进行相互转换。
+
+​		使用他们就能够将对象通过系列化存储到Redis中，也可以把Redis存储的内容转换为 Java对象，为此Spring提供的RedisTemplate还有两个属性：
+
+​				1、keySerializer——键序列器
+
+​				2、valueSerializer——值序列器
+
+```xml
+<bean id="jdkSerializationRedisSerializer" class="org.springframework.data.redis.serializer.JdkSerializationRedisSerializer" />
+    <bean id="stringRedisSerializer" class="org.springframework.data.redis.serializer.StringRedisSerializer" />
+    <bean id="redisTemplate" class="org.springframework.data.redis.core.RedisTemplate">
+        <property name="connectionFactory" ref="connectionFactory" />
+        <property name="keySerializer" ref="stringRedisSerializer" />
+        <property name="valueSerializer" ref="jdkSerializationRedisSerializer" />
+    </bean>
+```
+
+```java
+ApplicationContext applicationContext = new ClassPathXmlApplicationContext("applicationConetxt.xml");
+        RedisTemplate bean = applicationContext.getBean(RedisTemplate.class);
+        Role role = new Role();
+        role.setId(1);
+        role.setRoleName("小杉杉");
+        role.setNote("测试");
+        bean.opsForValue().set("role_1",role);
+        Role role_1 = (Role) bean.opsForValue().get("role_1");
+        System.out.println(role_1.getRoleName());
+```
+
+​		此时并不能保证每次使用RedisTemplate是操作同一个对Redis的连接。可能来自于同一个Redis连接池 的不同Redis的连接。为了使得所有的操作都来自于同一个连接。可以使用SessionCallback或者RedisCallback这两个接口，而RedisCallback是比较底层的封装，使用不是很友好，所以更到使用SessionCallback，通过这个接口就可以把多个命令放入到同一个Redis连接中去执行。
+
+```java
+ApplicationContext applicationContext = new ClassPathXmlApplicationContext("applicationConetxt.xml");
+        RedisTemplate bean = applicationContext.getBean(RedisTemplate.class);
+        Role role = new Role();
+        role.setId(1);
+        role.setRoleName("小杉杉");
+        role.setNote("测试");
+        SessionCallback callback = new SessionCallback<Role>() {
+            @Override
+            public Role execute(RedisOperations redisOperations) throws DataAccessException {
+                redisOperations.boundValueOps("role_1").set(role);
+                return (Role) redisOperations.boundValueOps("role_1").get();
+            }
+        };
+        Role execute = (Role) bean.execute(callback);
+        System.out.println(execute.getRoleName());
+```
+
+## 1、Redis的6中数据类型
+
+​		Redis是一种基于内存的数据库，并且提供了一定的持久化能力，它是一种键值数据库，使用key作为索引找到当前缓存的数据，并且返回给程序调用者。
+
+​		6种类型：
+
+​				1、字符串（String）
+
+​				2、列表（List）
+
+​				3、集合（set）
+
+​				4、哈希结构（hash）
+
+​				5、有序集合（zset）
+
+​				6、基数（HyperLogLog）
+
+![](image/QQ截图20191125230653.png)
+
