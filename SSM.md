@@ -7963,7 +7963,7 @@ JedisPoolConfig poolConfig = new JedisPoolConfig();
     <bean id="redisTemplate" class="org.springframework.data.redis.core.RedisTemplate">
         <property name="connectionFactory" ref="connectionFactory" />
         <property name="keySerializer" ref="stringRedisSerializer" />
-        <property name="valueSerializer" ref="jdkSerializationRedisSerializer" />
+        <property name="valueSerializer" ref="stringRedisSerializer" />
     </bean>
 ```
 
@@ -8018,4 +8018,277 @@ ApplicationContext applicationContext = new ClassPathXmlApplicationContext("appl
 ​				6、基数（HyperLogLog）
 
 ![](image/QQ截图20191125230653.png)
+
+## 2、常用命令
+
+### 1、字符串
+
+​		字符串是Redis最基本的数据结构，它将一个键和值存储与Redis内部，犹如 Java 的 Map 结构，让Redis通过键去找到值。
+
+![](image/QQ截图20191127222540.png)
+
+![](image/QQ截图20191127222643.png)
+
+![](image/QQ截图20191127222838.png)
+
+```java
+ApplicationContext applicationContext = new ClassPathXmlApplicationContext("applicationConetxt.xml");
+        RedisTemplate redisTemplate = applicationContext.getBean(RedisTemplate.class);
+        redisTemplate.opsForValue().set("key_one","value_one");
+        redisTemplate.opsForValue().set("key_two","value_two");
+        String value_one = (String) redisTemplate.opsForValue().get("key_one");
+        System.out.println(value_one);
+        redisTemplate.delete("key_one");
+        Long length = redisTemplate.opsForValue().size("key_two");
+        System.out.println(length);
+        String oldValueTwo = (String)redisTemplate.opsForValue().getAndSet("key_two", "xiaoshanshan");
+        System.out.println(oldValueTwo);
+        String value_two = (String) redisTemplate.opsForValue().get("key_two");
+        System.out.println(value_two);
+        Integer key_two1 = redisTemplate.opsForValue().append("key_two", " is superman");
+        System.out.println(key_two1);
+        String value_two_append = (String) redisTemplate.opsForValue().get("key_two");
+        System.out.println(value_two_append);
+```
+
+​		除此之外，Redis还对整数和浮点数的功能，如果字符串是数字，Redis还能支持简单的运算，目前版本只支持加法和减法。
+
+![](image/QQ截图20191127231630.png)
+
+![](image/QQ截图20191127231835.png)
+
+​		值得注意的是：此时键和值得序列化器都是字符串序列化器，所以Redis保存的是字符串，如果采用其他的序列化器，Redis将不会按照原字符串保存，在进行简单运算时会有异常。并且所有的减法，原有值必须是整数。
+
+```java
+public static void main(String[] args)
+    {
+        ApplicationContext applicationContext = new ClassPathXmlApplicationContext("applicationConetxt.xml");
+        RedisTemplate redisTemplate = applicationContext.getBean(RedisTemplate.class);
+        redisTemplate.opsForValue().set("i","9");
+        printCurrValue(redisTemplate,"i");
+ 
+ //因为Redis不支持减法运算，所以需要用此方法转换
+    redisTemplate.getConnectionFactory().getConnection().decr(redisTemplate.getKeySerializer().serialize("i"));
+        printCurrValue(redisTemplate,"i");
+        redisTemplate.getConnectionFactory().getConnection().decrBy(redisTemplate.getKeySerializer().serialize("i"),2);
+        printCurrValue(redisTemplate,"i");
+        redisTemplate.opsForValue().increment("i",2.3);
+        printCurrValue(redisTemplate,"i");
+    }
+
+    public static void printCurrValue(RedisTemplate redisTemplate,String key)
+    {
+        Object o = redisTemplate.opsForValue().get(key);
+        System.out.println(o);
+    }
+```
+
+### 2、哈希
+
+​		哈希结构如同 Java中的 map 一样，一个对象里有许多键值对，特别适合存储对象。
+
+​		在Redis中，hash是一个String类型的field和value的映射表，因为存储的数据实际在Redis内存中都是一个个字符串而已。
+
+![](image/QQ截图20191127234029.png)
+
+​		其中，role_1代表这个hash结构在Redis内存中的key，通过它可以找到这个hash结构，而hash结构由一系列的field和value组成。
+
+![](image/QQ截图20191127234322.png)
+
+​		hash的键值对在内存中是一种无序的状态，hash结构命令：
+
+![](image/QQ截图20191127234437.png)
+
+​		Redis需要通过key索引到对应的hash结构，在通过field来确定使用hash结构的哪个键值对。
+
+​		哈希结构的大小：如果哈希结构是个很大的键值对，那么hkeys，hgetall，hvals等返回所有哈希结构数据的命令，会造成大量数据的读取。
+
+​		对于数字的操作命令hincrby而言，要求存储的也是整数型的字符串，对于hincrbyfloat而言，则要求使用浮点数或者整数，否则命令会失败。
+
+![](image/QQ截图20191127235253.png)
+
+```xml
+<bean id="redisTemplate" class="org.springframework.data.redis.core.RedisTemplate">
+        <property name="connectionFactory" ref="connectionFactory" />
+        <property name="defaultSerializer" ref="stringRedisSerializer" />
+        <property name="keySerializer" ref="stringRedisSerializer" />
+        <property name="valueSerializer" ref="stringRedisSerializer" />
+    </bean>
+```
+
+​		Spring对hash结构的操作中会设计map等其他类的操作，需要明确它的规则，这里只是指定默认的序列化器，如果想为hash结构指定序列化器，可以使用RedisTemplate的hashKeySerializer和hashValueSerializer两个属性，来为hash结构的field和value指定序列化器。
+
+```java
+public static void main(String[] args)
+    {
+        ApplicationContext applicationContext = new ClassPathXmlApplicationContext("applicationConetxt.xml");
+        RedisTemplate redisTemplate = applicationContext.getBean(RedisTemplate.class);
+        String key = "hash";
+        Map<String,String> map = new HashMap<>();
+        map.put("f1","value1");
+        map.put("f2","value2");
+
+        //相当于hmset命令
+        redisTemplate.opsForHash().putAll(key,map);
+
+        //相当于hset命令
+        redisTemplate.opsForHash().put(key,"f3","6");
+        printValueForHash(redisTemplate,key,"f3");
+
+        //相当于hexists key field命令
+        boolean exists = redisTemplate.opsForHash().hasKey(key, "f3");
+        System.out.println(exists);
+
+        //相当于hgetall命令
+        Map keyValueMap = redisTemplate.opsForHash().entries(key);
+
+        //相当于hincrby命令
+        redisTemplate.opsForHash().increment(key,"f3",2);
+        printValueForHash(redisTemplate,key,"f3");
+
+        //相当于hincrbyfloat命令
+        redisTemplate.opsForHash().increment(key,"f3",0.88);
+        printValueForHash(redisTemplate,key,"f3");
+
+        //相当于hvals命令
+        List values = redisTemplate.opsForHash().values(key);
+
+        //相当于hkeys命令
+        Set keys = redisTemplate.opsForHash().keys(key);
+        ArrayList<String> fieldList = new ArrayList<>();
+        fieldList.add("f1");
+        fieldList.add("f2");
+
+        //相当于hmget命令
+        List list = redisTemplate.opsForHash().multiGet(key, keys);
+
+        //相当于hsetnx命令
+        Boolean aBoolean = redisTemplate.opsForHash().putIfAbsent(key, "f4", "value4");
+        System.out.println(aBoolean);
+
+        //相当于hdel命令
+        Long delete = redisTemplate.opsForHash().delete(key, "f1", "f2");
+        System.out.println(delete);
+
+
+    }
+
+    private static void printValueForHash(RedisTemplate redisTemplate,String key,String field)
+    {
+        System.out.println(redisTemplate.opsForHash().get(key,field));
+    }
+```
+
+​		hmset命令：在 Java的API中，是使用map保存多个键值对在先的。
+
+​		hgetall：返回所有的键值对，并保存在一个map对象中。
+
+​		hincrby和hincrbyfloat：都采用increment方法。
+
+​		redisTemplate.opsForHash().values(key)：相当于hvals命令，返回所有的值，保存到List对象中。
+
+​		redisTemplate.opsForHash().keys(key)：相当于hkeys命令，获取所有的键，保存到一个Set对象中。
+
+### 3、链表
+
+​		链表：存储多个字符串，有序，双向，即可以从左到右，也可以从右到左遍历。
+
+​		与  Java 的链表类似，其优势在与插入删除，而非查询。
+
+​		既然是双向，那么操作就有方向的区别：
+
+![](image/QQ截图20191128002031.png)
+
+​		上述命令是线程不安全的。为了克服这个问题，Redis提供了链表的阻塞命令，运行时，会给链表加锁，以保证链表的命令安全性。
+
+![](image/QQ截图20191128003003.png)
+
+![](image/QQ截图20191128003025.png)
+
+![](image/QQ截图20191128003441.png)
+
+```java
+public static void main(String[] args)
+    {
+        ApplicationContext applicationContext = new ClassPathXmlApplicationContext("applicationConetxt.xml");
+        RedisTemplate redisTemplate = applicationContext.getBean(RedisTemplate.class);
+        try
+        {
+            redisTemplate.delete("list");
+            redisTemplate.opsForList().leftPush("list","node3");
+            ArrayList<String> nodeList = new ArrayList<>();
+            for(int i = 2 ; i >= 1 ; i--)
+            {
+                nodeList.add("node" + i);
+            }
+            redisTemplate.opsForList().leftPushAll("list",nodeList);
+            redisTemplate.opsForList().rightPush("list","node4");
+
+            String list = (String) redisTemplate.opsForList().index("list", 0);
+
+            Long size = redisTemplate.opsForList().size("list");
+
+            String lpop = (String) redisTemplate.opsForList().leftPop("list");
+
+            String rpop = (String) redisTemplate.opsForList().rightPop("list");
+
+            //在节点之前插入
+            redisTemplate.getConnectionFactory().getConnection().lInsert("list".getBytes("utf-8"), RedisListCommands.Position.BEFORE,"node2".getBytes("utf-8"),"before_node".getBytes("utf-8"));
+            //在节点之后插入
+            redisTemplate.getConnectionFactory().getConnection().lInsert("list".getBytes("utf-8"), RedisListCommands.Position.AFTER,"node2".getBytes("utf-8"),"after_node".getBytes("utf-8"));
+
+            redisTemplate.opsForList().leftPushIfPresent("list","head");
+            redisTemplate.opsForList().rightPushIfPresent("list","end");
+
+            List list1 = redisTemplate.opsForList().range("list", 0, 10);
+            nodeList.clear();
+            for(int i =1 ; i <= 3 ;  i++)
+            {
+                nodeList.add("node");
+            }
+            redisTemplate.opsForList().leftPushAll("list",nodeList);
+            //从左网友删除至多3个node节点
+            redisTemplate.opsForList().remove("list",3,"node");
+            redisTemplate.opsForList().set("list",0,"new_head_value");
+        }
+        catch (Exception ex)
+        {
+            ex.printStackTrace();
+        }
+
+        printList(redisTemplate,"list");
+    }		
+
+    private static void printList(RedisTemplate redisTemplate,String key)
+    {
+        Long size = redisTemplate.opsForList().size(key);
+        List range = redisTemplate.opsForList().range(key, 0, size);
+        System.out.println(range);
+    }
+```
+
+​		阻塞命令：
+
+```java
+ApplicationContext applicationContext = new ClassPathXmlApplicationContext("applicationConetxt.xml");
+        RedisTemplate redisTemplate = applicationContext.getBean(RedisTemplate.class);
+        ArrayList<String> nodeList = new ArrayList<>();
+        for(int i = 1 ; i <= 5 ; i++)
+        {
+            nodeList.add("node" + i);
+        }
+        redisTemplate.opsForList().leftPushAll("list1",nodeList);
+        redisTemplate.opsForList().leftPop("list1",1, TimeUnit.SECONDS);
+        redisTemplate.opsForList().rightPop("list1",1, TimeUnit.SECONDS);
+        nodeList.clear();
+        for(int i = 1 ; i <= 3 ; i++)
+        {
+            nodeList.add("data" + i);
+        }
+        redisTemplate.opsForList().leftPushAll("list2",nodeList);
+        redisTemplate.opsForList().rightPopAndLeftPush("list1","list2");
+        redisTemplate.opsForList().rightPopAndLeftPush("list1","list2",1,TimeUnit.SECONDS);
+        printList(redisTemplate,"list1");
+        printList(redisTemplate,"list2");
+```
 
