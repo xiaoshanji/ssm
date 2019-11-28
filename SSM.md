@@ -8292,3 +8292,240 @@ ApplicationContext applicationContext = new ClassPathXmlApplicationContext("appl
         printList(redisTemplate,"list2");
 ```
 
+### 4、集合
+
+​		Redis的集合不是一个线性结构，而是一个哈希结构，内部会根据hash银子来存储和查找数据，插入，删除和查找的复杂度都是O(1)。注意事项：
+
+​				1、对于集合而言，每一个元素都是不能重复的，当插入相同记录的时候都会失败。
+
+​				2、集合石无序的。
+
+​				3、集合的每一个元素都是String数据结构类型。
+
+![](image/QQ截图20191128224927.png)
+
+![](image/QQ截图20191128225000.png)
+
+![](image/QQ截图20191128225552.png)
+
+![](image/QQ截图20191128225954.png)
+
+```java
+ApplicationContext applicationContext = new ClassPathXmlApplicationContext("applicationConetxt.xml");
+        RedisTemplate redisTemplate = applicationContext.getBean(RedisTemplate.class);
+        Set set = null;
+        redisTemplate.boundSetOps("set1").add("v1","v2","v3","v4","v5","v6");
+        redisTemplate.boundSetOps("set2").add("v0","v2","v4","v6","v8");
+        redisTemplate.opsForSet().size("set1");
+        set = redisTemplate.opsForSet().difference("set1", "set2");
+
+        set = redisTemplate.opsForSet().intersect("set1","set2");
+
+        Boolean exists = redisTemplate.opsForSet().isMember("set1", "v1");
+
+        set = redisTemplate.opsForSet().members("set1");
+
+        String val = (String)redisTemplate.opsForSet().pop("set1");
+
+        val = (String) redisTemplate.opsForSet().randomMember("set1");
+
+        List list = redisTemplate.opsForSet().randomMembers("set1", 2L);
+
+        redisTemplate.opsForSet().remove("set1","v1");
+        redisTemplate.opsForSet().union("set1","set2");
+        redisTemplate.opsForSet().differenceAndStore("set1","set2","diff_set");
+
+        redisTemplate.opsForSet().intersectAndStore("set1","set2","inter_set");
+
+        redisTemplate.opsForSet().unionAndStore("set1","set2","union_set");
+```
+
+### 5、有序集合
+
+​		有序集合和集合类似，和无序集合的区别在于每一个元素除了只之外，还多了一个分数，分数为浮点数，在 Java中是使用双精度表示的，根据分数，Redis就可以支持对分数从小到大或者从大到小的排序。跟无序集合一样，值不能重复，但是分数可以一样。
+
+![](image/QQ截图20191128231432.png)
+
+![](image/QQ截图20191128231541.png)
+
+​		Spring对Redis有序集合的元素的值和分数的范围和限制进行了封装。
+
+​		TypedTuple，一个内部接口，是ZSetOperations接口的内部接口：
+
+```java
+public interface TypedTuple<V> extends Comparable<ZSetOperations.TypedTuple<V>> {
+        //获取值
+    	V getValue();
+
+    //获取分数
+        Double getScore();
+    }
+```
+
+​		Spring-data-redis提供了一个默认的实现类：DefaultTypedTuple，在默认情况下Spring就会把带有分数的有序集合的值和分数封装到这个类中。
+
+​		Spring不仅对有序集合元素封装，而且对范围也进行了封装，使用RedisZSetCommands下的内部类：Range封装，其有一个静态的range方法，使用它可以生成一个Range对象。
+
+```java
+//设置大于等于min
+public RedisZSetCommands.Range gte(Object min) {
+            Assert.notNull(min, "Min already set for range.");
+            this.min = new RedisZSetCommands.Range.Boundary(min, true);
+            return this;
+        }
+
+		//设置大于min
+        public RedisZSetCommands.Range gt(Object min) {
+            Assert.notNull(min, "Min already set for range.");
+            this.min = new RedisZSetCommands.Range.Boundary(min, false);
+            return this;
+        }
+
+		//设置小于等于max
+        public RedisZSetCommands.Range lte(Object max) {
+            Assert.notNull(max, "Max already set for range.");
+            this.max = new RedisZSetCommands.Range.Boundary(max, true);
+            return this;
+        }
+
+		//设置小于max
+        public RedisZSetCommands.Range lt(Object max) {
+            Assert.notNull(max, "Max already set for range.");
+            this.max = new RedisZSetCommands.Range.Boundary(max, false);
+            return this;
+        }
+```
+
+```java
+ApplicationContext applicationContext = new ClassPathXmlApplicationContext("applicationConetxt.xml");
+        RedisTemplate redisTemplate = applicationContext.getBean(RedisTemplate.class);
+
+        Set<ZSetOperations.TypedTuple> set1 = new HashSet<>();
+        Set<ZSetOperations.TypedTuple> set2 = new HashSet<>();
+        int j = 9;
+        for(int i = 1 ; i <= 9 ; i++ , j--)
+        {
+            Double score1 = Double.valueOf(i);
+            String value1 = "x" + i;
+            Double score2 = Double.valueOf(j);
+            String value2 = j % 2 == 0 ? "y" + j : "x" + j;
+            ZSetOperations.TypedTuple typedTuple = new DefaultTypedTuple(value1,score1);
+            set1.add(typedTuple);
+            ZSetOperations.TypedTuple typedTuples = new DefaultTypedTuple(value2,score2);
+            set2.add(typedTuples);
+        }
+        redisTemplate.opsForZSet().add("zset1",set1);
+        redisTemplate.opsForZSet().add("zset2",set2);
+
+        Long size = redisTemplate.opsForZSet().zCard("zset1");
+
+        size = redisTemplate.opsForZSet().count("zset1",3,6);
+
+        Set set = null;
+        set = redisTemplate.opsForZSet().range("zset1",1,5);
+        printSet(set);
+
+        set = redisTemplate.opsForZSet().rangeWithScores("zset1",0,-1);
+        printTypedTuple(set);
+
+        size = redisTemplate.opsForZSet().intersectAndStore("zset1","zset2","inter_zset");
+
+        RedisZSetCommands.Range range = RedisZSetCommands.Range.range();
+        range.lt("x8");
+        range.gt("x1");
+
+        set = redisTemplate.opsForZSet().rangeByLex("zset1",range);
+        printSet(set);
+
+        range.lte("x8");
+        range.gte("x1");
+
+        set = redisTemplate.opsForZSet().rangeByLex("zset1",range);
+        printSet(set);
+
+        RedisZSetCommands.Limit limit = RedisZSetCommands.Limit.limit();
+        limit.count(4);
+        limit.offset(5);
+        set = redisTemplate.opsForZSet().rangeByLex("zset1",range,limit);
+        printSet(set);
+
+        Long rank = redisTemplate.opsForZSet().rank("zset1", "x4");
+        System.out.println("rank = " + rank);
+
+        size = redisTemplate.opsForZSet().remove("zset1","x5","x6");
+        System.out.println("delete = " + size);
+
+        size = redisTemplate.opsForZSet().removeRange("zset2",1,2);
+        set = redisTemplate.opsForZSet().rangeWithScores("zset2",0 ,-1);
+        printTypedTuple(set);
+
+        size = redisTemplate.opsForZSet().remove("zset2","y5","y3");
+        System.out.println(size);
+
+        Double dbl = redisTemplate.opsForZSet().incrementScore("zset1", "x1", 11);
+
+        redisTemplate.opsForZSet().removeRangeByScore("zset1",1,2);
+
+        set = redisTemplate.opsForZSet().reverseRangeWithScores("zset2",1,10);
+        printTypedTuple(set);
+
+    }
+
+
+    private static void printTypedTuple(Set<ZSetOperations.TypedTuple> set)
+    {
+        if(set == null || set.isEmpty())
+        {
+            return;
+        }
+        Iterator<ZSetOperations.TypedTuple> iterator = set.iterator();
+        while (iterator.hasNext())
+        {
+            ZSetOperations.TypedTuple next = iterator.next();
+            System.out.println("{value= " + next.getValue() + ", score= " + next.getScore() + "}");
+        }
+    }
+
+    private static void printSet(Set set)
+    {
+        if(set == null || set.isEmpty())
+        {
+            return;
+        }
+        Iterator iterator = set.iterator();
+        while (iterator.hasNext())
+        {
+            Object next = iterator.next();
+            System.out.print(next + "\t");
+        }
+    }
+```
+
+### 6、基数——HyperLogLog
+
+​		基数是一种算法。作用是评估大约需要准备多少个存储单元去存储数据，但是存在误差。
+
+![](image/QQ截图20191129000049.png)
+
+![](image/QQ截图20191129000331.png)
+
+```java
+ApplicationContext applicationContext = new ClassPathXmlApplicationContext("applicationConetxt.xml");
+        RedisTemplate redisTemplate = applicationContext.getBean(RedisTemplate.class);
+
+        redisTemplate.opsForHyperLogLog().add("h1","a","b","c","d","a");
+        redisTemplate.opsForHyperLogLog().add("h2","a");
+        redisTemplate.opsForHyperLogLog().add("h2","z");
+
+        Long h1 = redisTemplate.opsForHyperLogLog().size("h1");
+        System.out.println(h1);
+
+        Long h2 = redisTemplate.opsForHyperLogLog().size("h2");
+        System.out.println(h2);
+
+        redisTemplate.opsForHyperLogLog().union("des_key","h1","h2");
+
+        Long des_key = redisTemplate.opsForHyperLogLog().size("des_key");
+        System.out.println(des_key);
+```
+
