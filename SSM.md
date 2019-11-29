@@ -8529,3 +8529,105 @@ ApplicationContext applicationContext = new ClassPathXmlApplicationContext("appl
         System.out.println(des_key);
 ```
 
+## 3、事务
+
+​		为了保证数据的一致性和安全性，Redis提供了事务方案，Redis的事务是使用 MULTI-EXEC的命令组合，使用它提供了两个重要的保证：
+
+​				1、事务是一个被隔离的操作，事务中的方法都会被 Redis 进行序列化并按顺序执行，事务在执行的过程		中不会被其他客户端发生的命令所打断。
+
+​				2、事务是一个原子性的操作，要么全部执行，要么什么都不会执行。
+
+​		使用事务的三个过程：
+
+​				1、开启事务
+
+​				2、命令进入队列
+
+​				3、执行事务
+
+![](image/QQ截图20191129212713.png)
+
+### 1、基础事务
+
+​		Redis中开启事务是multi命令，而执行事务是exec命令。multi到exec命令之间的Redis命令将采取进入队列的形式，直至exec命令的出现，才会一次性发送队列里的命令去执行，而在执行这些命令的时候其他客户端就不能再插入任何命令了。
+
+```java
+ApplicationContext applicationContext = new ClassPathXmlApplicationContext("applicationConetxt.xml");
+        RedisTemplate redisTemplate = applicationContext.getBean(RedisTemplate.class);
+
+        SessionCallback callback = new SessionCallback() {
+            @Override
+            public Object execute(RedisOperations ops) throws DataAccessException {
+                ops.multi();
+                ops.boundValueOps("key1").set("valu1");
+                //此时并会得到返回值，此时所有的命令只是进入了队列，但是未被执行
+                Object key1 = ops.boundValueOps("key1").get();
+                System.out.println("value = " + key1);
+
+                //执行队列的所有命令
+                List exec = ops.exec();
+                String key11 = (String) redisTemplate.opsForValue().get("key1");
+                return key11;
+            }
+        };
+        Object execute = redisTemplate.execute(callback);
+        System.out.println(execute);
+```
+
+​		在执行事务命令的时候，在命令入队列时，Redis会检测事务的**命令是否正确**，如果不正确则会产生错误。无论之前和之后的命令都会被事务所回滚，就变为什么都没有执行。
+
+​		当**命令格式正确**，因为数据结构引起的错误，则该命令执行出现错误，而其之前和之后的命令都会被正常执行。
+
+### 2、监控事物
+
+​		Redis中使用watch命令可以决定事务是执行还是回滚。
+
+​		可以在multi命令之前使用watch命令监控某些键值对，然后使用multi命令开始事务，执行各类对数据结构进行操作的命令，这个时候这些命令就会进入队列。当Redis使用exec命令执行事务的时候，首先会去对比被watch命令所监控的键值对，如果没有发生变化，那么它会执行事务队列中的命令，提交事务；如果发生变化，那么它不会执行任何事物中的命令，而去事务回滚，无论事务是否回滚，Redis都会去取消执行事务前的watch命令。
+
+![](image/QQ截图20191129220620.png)
+
+​		乐观锁（CAS原理）：当一条线程去执行某些业务逻辑，但是这些业务逻辑操作的数据可能被其他线程共享了，这样会引发多线程中数据不一致的情况，为了克服这个问题，首先，在线程开始时读取这些多线程共享的数据，并将其保存到当前线程的副本中，成为旧值。watch命令就是这样的一个功能。然后，开始线程业务逻辑，有multi命令提供这一功能。在执行更新前，比较当前线程副本保存的旧值和当前线程共享的值是否一致，如果不一致，那么该苏剧已经被其他线程操作过，此次更新失败，为了保持一致，线程就不会更新任何值，而将事务回滚；否则就认为它没有被其他线程操作过，执行对应的业务逻辑。
+
+​		ABA问题：上述原理造成的问题。
+
+![](image/QQ截图20191129221737.png)
+
+​				在处理复杂运算时，被线程2修改的X的值可能导致线程1的运算出错，而最后线程2将X的值修改为原来		的A，那么到了线程1匀速结束的时间顺序，将检测X的值是否发生变化，比对发现一致，于是提交事务，然后		再复杂计算的过程中X被线程2修改过了，这会导致线程1的运算出错，在这个过程中，对于线程2而言，X的值		变化为：A->B->A。
+
+​				在Hibernate中，其会对缓存对象加入字段version，每当操作一次该POJO，则version加1，从而保证数		据的一致性。
+
+​		
+
+​		所以：Redis在执行事务的过程中，并不会阻塞其他连接的并发，而只是通过比较watch监控的键值对去保证数据的一致性，所以Redis多个事务完全可以在非阻塞的多线程环境中并发执行，而且Redis的机制是不会产生ABA问题，这样就有利于在保证数据一致的基础上，提高高并发系统的数据读/写性能。
+
+![](image/QQ截图20191129222748.png)
+
+## 4、流水线
+
+​		流水线技术是为了解决网络延迟也产生的长时间的等待。其是一种通信协议。
+
+![](image/QQ截图20191129223150.png)
+
+```java
+ApplicationContext applicationContext = new ClassPathXmlApplicationContext("applicationConetxt.xml");
+        RedisTemplate redisTemplate = applicationContext.getBean(RedisTemplate.class);
+
+        SessionCallback callback = new SessionCallback() {
+            @Override
+            public Object execute(RedisOperations ops) throws DataAccessException {
+                for (int i = 0 ; i < 100000 ; i++)
+                {
+                    int j = i + 1;
+                    ops.boundValueOps("pipeline_key_" + j).set("pipeline_value_" + j);
+                    ops.boundValueOps("pipeline_key_" + j).get();
+                }
+                return null;
+            }
+        };
+        long start = System.currentTimeMillis();
+		//执行Redis的流水线命令
+        List list = redisTemplate.executePipelined(callback);
+        long l = System.currentTimeMillis();
+        System.out.println(l - start);
+```
+
