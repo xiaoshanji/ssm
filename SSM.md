@@ -8631,3 +8631,246 @@ ApplicationContext applicationContext = new ClassPathXmlApplicationContext("appl
         System.out.println(l - start);
 ```
 
+## 5、发布订阅
+
+​		发布消息模式首先需要消息源，也就是要有消息发布出来，当消息发出，订阅者就能收到这个消息进行处理。
+
+![](image/QQ截图20191201193425.png)
+
+![](image/QQ截图20191201195258.png)
+
+​		Spring中的发布订阅模式，接受消息的类，是MessageListener接口的实现类。
+
+​		Redis发布订阅监听类：
+
+```java
+public class RedisMessageListener implements MessageListener
+{
+    @Autowired
+    private RedisTemplate redisTemplate;
+
+    @Override
+    public void onMessage(Message message, byte[] bytes)
+    {
+        byte[] body = message.getBody();
+        String msgBody = (String)redisTemplate.getValueSerializer().deserialize(body);
+        byte[] channel = message.getChannel();
+        String channelStr = (String)redisTemplate.getStringSerializer().deserialize(channel);
+
+        System.out.println(channelStr);
+        String s = new String(bytes);
+        System.out.println(s);
+    }
+}
+```
+
+```xml
+<bean id="redisMessageListener" class="com.shanji.messagelister.RedisMessageListener" />
+```
+
+​		此时Spring中定义了监听类。但是还不能测试，还需要一个监听容器。RedisMessageListenerContainer，它可用于监听Redis的发布订阅消息。
+
+```xml
+<bean id="topicContainer" class="org.springframework.data.redis.listener.RedisMessageListenerContainer" destroy-method="destroy">
+    	<!-- Redis连接工厂 -->
+        <property name="connectionFactory" ref="connectionFactory" />
+        <!-- 连接池，这里只要线程池生存，才能继续监听 -->
+    	<property name="taskExecutor">
+            <bean class="org.springframework.scheduling.concurrent.ThreadPoolTaskScheduler">
+                <property name="poolSize" value="3" />
+            </bean>
+        </property>
+    	<!-- 消息监听map -->
+        <property name="messageListeners">
+            <map>
+                <!-- 配置监听者，key-ref和bean id定义一致 -->
+                <entry key-ref="redisMessageListener">
+                    <!-- 监听类 -->
+                    <bean class="org.springframework.data.redis.listener.ChannelTopic">
+                        <constructor-arg value="chat" />
+                    </bean>
+                </entry>
+            </map>
+        </property>
+    </bean>
+```
+
+## 6、超时命令
+
+​		Redis也有着自己的垃圾回收机制，对于Redis而言，del 命令可以删除一些键值对，与此同时，当内存空间满了之后，其还会按照回收机制去自动回收一些键值对。但是当垃圾进行回收的时候，又有可能执行回收而引发系统停顿，所以要选择适当的回收机制和时间将有利于系统性能的提高。
+
+​		对于Redis而言，可以给对应的键值设置超时。
+
+![](image/QQ截图20191201202209.png)
+
+![](image/QQ截图20191201202639.png)
+
+```java
+ApplicationContext applicationContext = new ClassPathXmlApplicationContext("applicationConetxt.xml");
+        RedisTemplate redisTemplate = applicationContext.getBean(RedisTemplate.class);
+        redisTemplate.execute((RedisOperations ops) -> {
+            ops.boundValueOps("key1").set("valu1");
+            String keyValue = (String) ops.boundValueOps("key1").get();
+            Long key1 = ops.getExpire("key1");
+            System.out.println(key1);
+
+            boolean b = false;
+            b = ops.expire("key1", 120L, TimeUnit.SECONDS);
+            b = ops.persist("key1");
+
+            long l = 0L;
+            l = ops.getExpire("key1");
+
+            long now = System.currentTimeMillis();
+            Date date = new Date();
+            date.setTime(now + 120000);
+            ops.expireAt("key", date);
+            return null;
+        });
+```
+
+​		Redis的key超时不会被其自动回收，它只会标识那些键值对超时了。好处在于：如果一个很大的键值对超时，对其回收需要很长的时间，如果采用超时回收，则可能产生停顿。坏处：超时的键值对会浪费比较多的空间。
+
+​		两种方式回收超时键值对：定时回收和惰性回收
+
+​				1、定时回收：指在确定的某个时间出发一段代码，回收超时的键值对。
+
+​				2、惰性回收：当一个超时的键，被再次用get命令访问时，将出发Redis将其从内存中清空。
+
+## 7、Lua语言
+
+​		在Redis中，执行Lua语言是原子性的，也就是在执行Lua的时候是不会被中断的，具有原子性，这个特性有助于Redis对并发数据一致性的支持。
+
+​		两种运行脚本的方法：
+
+​				1、直接输入一些Lua语言的程序代码。
+
+​				2、将Lua语言编写成文件。
+
+​		一些简单的脚本 可以采用第一种方式，对于有一定逻辑的一般采用第二种方式。而对于采用简单脚本的，Redis支持缓存脚本，只是它会使用SHA-1算法对脚本进行签名，然后把SHA-1标识返回回来，只要通过这个标识运行就行了。
+
+​		命令格式：
+
+![](image/QQ截图20191201210521.png)
+
+![](image/QQ截图20191201211137.png)
+
+​		对于redis.call命令
+
+![](image/QQ截图20191201211301.png)
+
+​		KEYS[1]：代表读取传递给Lua脚本的第一个key参数，而ARGV[1]：代表第一个非key参数。上述只有一个key参数，所以key-num为1。
+
+​		如果需要多次执行同样的一段脚本，可以使用Redis缓存脚本的功能。好处在于，如果脚本很长，从客户端传输可能需要很长的时间，那么使用标识字符串，则只需要传递32为字符串即可。
+
+​		命令：script  load  script。
+
+![](image/QQ截图20191201211844.png)
+
+```java
+ApplicationContext applicationContext = new ClassPathXmlApplicationContext("applicationConetxt.xml");
+        RedisTemplate redisTemplate = applicationContext.getBean(RedisTemplate.class);
+        Jedis jedis = (Jedis) redisTemplate.getConnectionFactory().getConnection().getNativeConnection();
+
+		//执行简单脚本
+        String hello = (String) jedis.eval("return 'hello xiaoshanshan'");
+        System.out.println(hello);
+
+		//执行带参数脚本
+        jedis.eval("redis.call('set',KEYS[1],ARGV[1])",1,"lua-key","lua-value");
+
+        String s = jedis.get("lua-key");
+        System.out.println(s);
+
+		//缓存脚本，返回签名标识
+        String s1 = jedis.scriptLoad("redis.call('set',KEYS[1],ARGV[1])");
+		//通过标识执行脚本
+        jedis.evalsha(s1,1,new String[]{"sha-key","sha-val"});
+
+		//获取执行脚本后的数据
+        String shaval = jedis.get("sha-key");
+        System.out.println(shaval);
+        jedis.close();
+```
+
+​		如果要存储对象，此时考虑使用Spring提供的RedisScript接口，其实现类：DefaultRedisScript
+
+```java
+ApplicationContext applicationContext = new ClassPathXmlApplicationContext("applicationConetxt.xml");
+        RedisTemplate redisTemplate = applicationContext.getBean(RedisTemplate.class);
+		
+		//定义默认脚本封装类
+        DefaultRedisScript<Role> redisScript = new DefaultRedisScript<>();
+
+		//设置脚本
+        redisScript.setScriptText("redis.call('set',KEYS[1],ARGV[1]) return redis.call('get',KEYS[1])");
+
+		//定义操作的key列表
+        ArrayList<String> keyList = new ArrayList<>();
+        keyList.add("role1");
+
+		//需要序列化保存和读取的对象
+        Role role = new Role();
+
+        role.setId(1);
+        role.setRoleName("xiaoshanshan");
+        role.setNote("ceshi");
+
+		//获取标识字符串
+        String sha1 = redisScript.getSha1();
+        System.out.println(sha1);
+		
+		//设置返回结果类型，如果没有这句话，结果返回为空
+        redisScript.setResultType(Role.class);
+
+		//定义序列化器
+        JdkSerializationRedisSerializer jdkSerializationRedisSerializer = new JdkSerializationRedisSerializer();
+
+		//执行脚本，第一个RedisScript接口对象，第二个是参数序列化器，第三个是结果序列化器，第四个是Redis的key列表，最后是参数列表
+        Role execute = (Role) redisTemplate.execute(redisScript, jdkSerializationRedisSerializer, jdkSerializationRedisSerializer, keyList, role);
+        System.out.println(execute);
+```
+
+​		需要存在较多的逻辑。需要使用文件。
+
+![](image/QQ截图20191201214314.png)
+
+![](image/QQ截图20191201214331.png)
+
+​		执行的命令键和参数是使用逗号分隔得，键之间用空格分开。并且逗号前后的空格不能省略。
+
+​		Java中没有办法执行这样的文本脚本，可以考虑使用evalsha命令，因为evalsha可以缓存脚本，返回32为的shal标识。如果使用eval命令去执行文件里的字符串，一旦文件很大，那么就需要通过网络反复传递文件，此时效率不会很高。
+
+```java
+ApplicationContext applicationContext = new ClassPathXmlApplicationContext("applicationConetxt.xml");
+        RedisTemplate redisTemplate = applicationContext.getBean(RedisTemplate.class);
+
+        File file = new File("E:\\test.lua");
+        byte[] bytes = getFileToByte(file);
+
+        Jedis jedis = (Jedis) redisTemplate.getConnectionFactory().getConnection().getNativeConnection();
+
+        byte[] shal = jedis.scriptLoad(bytes);
+
+        Object evalsha = jedis.evalsha(shal, 2, "key1".getBytes(), "key2".getBytes(), "2".getBytes(), "4".getBytes());
+        System.out.println(evalsha);
+```
+
+```txt
+redis.call('set',KEYS[1],ARGV[1])
+redis.call('set',KEYS[2],ARGV[2])
+
+local n1 = tonumber(redis.call('get',KEYS[1]))
+local n2  = tonumber(redis.call('get',KEYS[2]))
+
+if n1 > n2 then
+	return 1
+end
+if n1 == n2 then
+	return 0
+end
+if n1 < n2 then
+	return -1
+end
+```
+
