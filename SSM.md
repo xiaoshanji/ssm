@@ -8985,3 +8985,156 @@ end
 ![](image/QQ截图20191202214737.png)
 
 ​		缺点：必须指明超时的键值对。对所有的键值对进行回收，有可能把正在使用的键值对删掉，增加了存储的不稳定性。
+
+## 10、复制
+
+### 1、读写分离
+
+​		主从架构，大概思路：
+
+​				1、在多台数据服务器中，只有一台主服务器，而主服务器只负责写入数据，不负责让外部程序读取数		据。
+
+​				2、存在多台从服务器，从服务器不写入数据，只负责同步主服务器的数据，并让外部程序读取数据。
+
+​				3、主服务器在写入数据后，即刻将写入数据的命令发送给从服务器，从而使得主从数据同步。
+
+​				4、应用程序可以随机读取一台从服务器的数据，这样就分摊了读数据的压力。
+
+​				5、当从服务器不能工作的时候，整个系统将不受影响；当主服务器不能工作的时候，可以方便地从从服		务器中选举一台来当主服务器。
+
+​		![](image/QQ截图20191204202343.png)
+
+### 2、读写分离配置
+
+​		1、首先明确主机，确定后，关键的两个配置是 dir 和 dbfilename 选项，必须保证这个两个文件是可写的。对于 Redis的默认配置而言，dir 的默认值为 "./"，而对于dbfilename的默认值为 dump.rdb。即，采用 Redis当前目录的 dump.rdb 文件进行同步 。
+
+​		2、明确主机后，还要配置 slaveof 选项。
+
+​					格式： slaveof  server  port
+
+​							server：主机
+
+​							port：端口
+
+​				此时，当从机Redis服务重启时，就会同步对应主机的数据。如果不想让从机继续复制主机的数据了，执行 slaveof  no  one。
+
+​		在实际的Linux环境中，配置文件 redis.conf 中有一个 bind 配置，默认为 127.0.0.1，即只允许本机访问，将其修改为 bind 0.0.0.0，其他的服务器就能访问了。
+
+### 3、读写分离的过程
+
+![](image/QQ截图20191204204151.png)
+
+​		1、无论如何要先保证主服务器的开启，开启主服务器后，从服务器通过命令或者重启配置项可以同步到主服务器。
+
+​		2、当从服务器启动时，读取同步的配置，根据配置决定是否使用当前数据响应客户端，但后发送 SYNC命令。当主服务器接收到同步命令的时候，就会执行 bgsave 命令备份数据，但是主服务器并不会拒绝客户端的读/写，而是将来自客户端的写命令写入缓冲期。从服务器未收到主服务器备份的快照文件的时候，会根据其配置决定使用现有数据响应客户端或者拒绝。
+
+​		3、当 bgsave 命令被主服务器执行完后，开始向从服务器发送备份文件，这个时候从服务器就会丢弃所有现有的数据，开始载入发送的快照文件。
+
+​		4、当主服务器发送完备份文件后，从 服务器就会执行这些写入命令。此时就会把 bgsave 执行之后的缓存区内的写命令也发送给从服务器，从服务器完成备份文件解析，就开始像往常一样，接收命令，等待命令写入。
+
+​		5、缓冲区的命令发送完成后，当主服务器执行一条写命令后，就同时往从服务器发送同步写入命令，从服务器酒喝主服务器保持一致了。而此时当从服务器完成主服务器发送的缓冲区命令后，就开始等待主服务器的命令了。
+
+​		在主服务器同步到从服务器的过程中，需要备份文件。所以在配置的时候一般需要预留一些内存空间给主服务器，用以腾出空间执行备份命令。
+
+![](image/QQ截图20191204205326.png)
+
+## 11、哨兵模式
+
+​		Redis可以存在多台服务器，并且实现了读写分离的功能，哨兵模式是一种特殊的模式，首先Redis提供了哨兵的命令，哨兵是一个独立的进程，作为进程，它会独立运行。原理是哨兵通过发送命令，等待Redis服务器响应，从而监控运行的多个Redis实例。
+
+![](image/QQ截图20191204210111.png)
+
+​		作用：
+
+​				1、通过发送命令，让Redis服务器返回监测其运行状态，包括主服务器和从服务器。
+
+​				2、当哨兵监测到 master 宕机，会自动将 slave切换成 master，然后通过发布订阅模式通知到其他的从		服务器，修改配置文件，让它们切换主机。
+
+​		
+
+​		可以使用多个哨兵来进行多哨兵监控，多个哨兵不仅监控各个Redis服务器，而且哨兵之间相互监控，看看哨兵们是否还活着。
+
+​		故障切换过程：当主服务器宕机，哨兵1先监测到这个结果，当时系统并不会马上进行 failover 操作，而仅仅是哨兵1主观地认为主机已经不可用，这个现象被称为主观下线。当后面的哨兵监测也监测到了主服务器不可用，并且有了一定数据的哨兵认为主服务器不可用，那么哨兵之间就会形成一次投票，投票的结果由一个哨兵发起，进行 failover 操作，在 failover 操作的过程中切换成功后，就会通过发布订阅方式，让各个哨兵把自己监控的服务器实现切换主机，这个过程称为：客观下线。对于客户端而言，一切都是透明的。
+
+![](image/QQ截图20191204211156.png)
+
+### 1、搭建
+
+![](image/QQ截图20191204212342.png)
+
+​		在从服务器的 redis.conf 配置文件中，修改：
+
+![](image/QQ截图20191204212425.png)
+
+​		配置哨兵，三个哨兵分别监控三个服务器：
+
+![](image/QQ截图20191204212523.png)
+
+​		上述配置完后，进入 Redis 的 src 目录：
+
+![](image/QQ截图20191204212716.png)
+
+​		启动顺序：首先启动主服务器，在启动从服务器，最后才启动哨兵进程。
+
+### 2、Java中使用
+
+```xml
+<!-- Redis连接池 -->
+<bean id="poolConfig" class="redis.clients.jedis.JedisPoolConfig" p:maxIdle="50" p:maxTotal="100" p:maxWaitMillis="20000" />
+
+<!-- 连接池配置 -->
+<bean id="connectionFactory" class="org.springframework.data.redis.connection.jedis.JedisConnectionFactory">
+        <constructor-arg name="sentinelConfig" ref="sentinelConfiguration" />
+        <constructor-arg name="poolConfig" ref="poolConfig" />
+        <property name="password" value="179980" />
+    </bean>
+
+<!-- JDK序列化器 -->
+<bean id="jdkSerializationRedisSerializer" class="org.springframework.data.redis.serializer.JdkSerializationRedisSerializer" />
+    
+<!-- string 序列化器 -->
+<bean id="stringRedisSerializer" class="org.springframework.data.redis.serializer.StringRedisSerializer" />
+
+<!-- 配置redisTemplate -->
+    <bean id="redisTemplate" class="org.springframework.data.redis.core.RedisTemplate">
+        <property name="connectionFactory" ref="connectionFactory" />
+        <property name="defaultSerializer" ref="stringRedisSerializer" />
+        <property name="keySerializer" ref="stringRedisSerializer" />
+        <property name="valueSerializer" ref="stringRedisSerializer" />
+    </bean>
+
+<!-- 哨兵配置 -->
+<bean id="sentinelConfiguration" class="org.springframework.data.redis.connection.RedisSentinelConfiguration">
+    <!-- 服务名称 -->
+        <property name="master">
+            <bean class="org.springframework.data.redis.connection.RedisNode">
+                <property name="name" value="stylemaster" />
+            </bean>
+        </property>
+    <!-- 哨兵服务IP和端口 -->
+        <property name="sentinels">
+            <set>
+                <bean class="org.springframework.data.redis.connection.RedisNode">
+                    <constructor-arg name="host" value="192.168.11.128" />
+                    <constructor-arg  name="port" value="26379" />
+                </bean>
+                <bean class="org.springframework.data.redis.connection.RedisNode">
+                    <constructor-arg name="host" value="192.168.11.129" />
+                    <constructor-arg  name="port" value="26379" />
+                </bean>
+                <bean class="org.springframework.data.redis.connection.RedisNode">
+                    <constructor-arg name="host" value="192.168.11.130" />
+                    <constructor-arg  name="port" value="26379" />
+                </bean>
+            </set>
+        </property>
+    </bean>
+```
+
+3、其他配置项：
+
+![](image/QQ截图20191204214416.png)
+
+![](image/QQ截图20191204214433.png)
+
+​		其中 sentinel  down-after-milliseconds 配置项只是一个哨兵在超过其指定额毫秒数依旧没有得到回答消息后，会自己认为主机不可用，对于其他哨兵而言，并不会认为主机不可用。哨兵会记录这个消息，当拥有认为主观下线的哨兵到达  sentiel  monitor 所配置的数量的时候，就会发起一次新的投票，然后切换主机，此时哨兵会重写 Redis 的哨兵配置文件，以适应新场景的需要。
