@@ -9153,3 +9153,33 @@ end
 
 ![](image/QQ截图20191205204238.png)
 
+## 13、使用Spring缓存机制整合Redis
+
+​		在Spring项目中提供了接口CacheManager来定义缓存管理器，这样各个不同缓存就可可以实现它来提供管理器的功能了。而在spring-data-redis.jar包中的实现CacheManager接口的则是RedisCacheManger。
+
+### 1、缓存注解
+
+![](image/QQ截图20191208164639.png)
+
+​		这些注解既可以标注在类上，也可以标注在方法上。标注在类上，对所有的方法都有效，如果标注在方法上，则只是对方法有效。对于查询，考虑用@Cacheable；对于插入和修改，考虑用@CachePut；对于删除，考虑用@CacheEvict。
+
+### 2、@Cacheable和@CachePut
+
+​		属性：
+
+![](image/QQ截图20191208165213.png)
+
+​		value：数组，可以引用多个缓存管理器
+
+​		Spring表达式和注解的约定：
+
+![](image/QQ截图20191208165559.png)
+
+### 3、@CacheEvict
+
+​		这个注解主要是为了移除缓存对应的键值对，主要对于那些删除的操作。
+
+![](image/QQ截图20191208171045.png)
+
+​		如果将beforeInvocation属性设置为false，那么在方法内还是能读取到缓存服务器的数据，即在方法执行后删除缓存。如果设置为true，则会在方法执行前删除缓存。
+
