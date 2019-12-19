@@ -758,13 +758,49 @@ ApplicationContext ctx = new AnnotationConfigApplicationContext(StyleConfig.clas
 
 ​		3、通过@PostConstruct和@PreDestroy修饰方法来指定初始化之后和销毁之前逻辑。
 
-​		4、通过加入后置处理器（实现BeanPostProcessor接口）来指定所有bean初始化之前和之后的逻辑。
+​		4、通过加入后置处理器（实现BeanPostProcessor接口）来指定所有bean初始化之前和之后的逻辑。遍历的到容器中所有的BeanPostProcessor，挨个执行beforInitialization，一旦返回null，就跳出循环，不会执行后面的BeanPostProcessor.postProcessors()。
+
+​		不管用那种方式，都是在 Bean 被实例化并且完成属性赋值之后，才会执行。
+
+##### 属性赋值：
+
+​		@Value：修饰类的字段，为其赋默认值。可以是基本数值，SpEL表达式，以及${}获取配置文件的值
+
+​		@PropertySource：引入配置文件。
+
+​		@Autowired：自动装配，可修饰方法、属性、构造器、参数   ，优先按照类型寻找，如果找到多个，再将属性名作为 id 去容器中查找。
+
+​				修饰方法：@Bean + 方法参数，默认不写@Autowired，在 Spring 容器创建对象时，就会调用其修饰的方法，使用的参数，会从 IoC 容器中获取。@Bean 标注的方法创建对象时，方法参数的值从容器中获取。
+
+​				修饰构造器：构造器的参数也是从 IoC 容器中获取。如果 Bean 只有一个有参构造器，参数的 @Autowired 可以省略，参数位置的组件还是可以从容器中自动获取。 
+
+​				修饰参数：标注的参数从 IoC 容器中获取。
+
+​				@Qualifier：指定装配给定的 id 的对象。其和 @Autowired 默认是一定要装配对应的 Bean，如果没有		找到，会报错。可指定 @Autowired 的属性 required 为 false ，来允许为空。
+
+​				@Primary：修饰的 Bean 在进行依类型自动装配时，会优先使用。也可以继续使用 @Qualifier 来指定		具体装配哪一个 Bean。
+
+​		@Resource：Java 规范中的注解，默认按照属性名进行装配。不支持 @Primary 和 @Autowired 的 reqiured   = false 的功能。
+
+​		@Inject：需要导入 javax.injet 依赖。功能和特性和 @Autowired 一样。但 @Inject 没有属性，所以默认一定要装配成功。
+
+​		自动装配的功能由 AutowiredAnnotationBeanPostProcessor 完成。
 
 
 
+​		使用 Spring 容器底层的组件，只需要实现  xxxAware。比如：获取applicationContext，就可以实现ApplicationContextAware，IoC 容器会回调相应的方法，并将对应的组件实例作为参数。其实现原理是，对应的 xxxAwareProcessor。
 
 
-**14、15集没看**
+
+​		Profile：根据当前环境，动态的激活和切换一系列的 Bean 的功能。
+
+​				@Profile：被标注的组件，在其指定的环境生效时，才会被注册进容器或生效。
+
+​							让其环境生效：
+
+​									1、启动时，指定虚拟机参数：-Dspring.profile.active。
+
+​									2、用代码：首先用用无参数的构造方法创建 IoC 容器，然后用 applicationContext.getEnvironment().setActiveProfile() 方法设置激活的环境，然后注册配置，在刷新容器。
 
 ## 6、创建Bean的方式
 
