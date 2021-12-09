@@ -1,5 +1,3 @@
-#### 
-
 # **SSM(Spring + SpringMVC + Mybatis)**
 
 # 一、Spring
@@ -86,7 +84,7 @@ public class Main
 
 ```java
 String idStr = ...; //解析<bean .../>元素的id属性的到该字符串值
-String classStr = ...; // 解析<bean .../>元素的class属性得到字符串值，所以当指定class属性时必须是					完整类名，不能是抽象类，接口(除非有特殊配置)；
+String classStr = ...; // 解析<bean .../>元素的class属性得到字符串值，所以当指定class属性时必须是完整类名，不能是抽象类，接口(除非有特殊配置)；
 Class clazz = Class.forName(classStr);
 Object obj = clazz.newInstance();
 //container代表Spring容器
@@ -95,7 +93,7 @@ container.put(idStr,obj);
 
 ​		**结论：**
 
-​				在Spring配置文件中配置Bean时，**class属性的值必须是Bean实现类的完整类名(必须带包名)，不能		是接口，不能是抽象类(除非有特殊配置)，否则Spring无法使用反射创建该类的实例**。
+​				在Spring配置文件中配置Bean时，**class属性的值必须是Bean实现类的完整类名(必须带包名)，不能是接口，不能是抽象类(除非有特殊配置)，否则Spring无法使用反射创建该类的实例**。
 
 ​		**<property .../>元素通常用于作为<bean .../>元素的子元素**，它驱动Spring在底层以反射执行一个setter方法，其中**name属性决定执行哪个setter方法，而value或ref决定执行setter方法传入的参数**。如果**传入参数是基本类型及其包装类、String等类型**，则**使用value属性**指定传入参数。以**容器中其他Bean作为传入参数**，则**使用ref属性**指定传入参数。
 
@@ -114,9 +112,9 @@ setter.invoke(obj,paramBean);
 
 ​		通过Spring容器来访问容器中的Bean。ApplicationContext是Spring容器最常用的接口，两个实现类：
 
-​				1）、ClassPathXmlApplicationContext：从类加载路径搜索配置文件，并根据配置文件来创建Spring容					器(常用)。
+​				1）、ClassPathXmlApplicationContext：从类加载路径搜索配置文件，并根据配置文件来创建Spring容器(常用)。
 
-​				2）、FileSystemXmlApplicationContext：从文件系统的相对路径或绝对路径下去搜索配置文件，并根					据配置文件来创建Spring容器。
+​				2）、FileSystemXmlApplicationContext：从文件系统的相对路径或绝对路径下去搜索配置文件，并根据配置文件来创建Spring容器。
 
 ```java
 public class BeanTest
@@ -134,11 +132,11 @@ public class BeanTest
 
 ​		获取Bean对象的两个方法：
 
-​				Object  get(String  id)：根据容器中的Bean的id来获取指定的Bean，获取Bean之后需要进行强制类型转			换。
+​				Object  get(String  id)：根据容器中的Bean的id来获取指定的Bean，获取Bean之后需要进行强制类型转换。
 
-​				T  getBean(String  name,Class<T>  requiredType)：根据容器中的Bean的id来获取指定Bean，但该方			法带一个泛型参数，因此获取Bean之后无须进行强制类型转换。
+​				T  getBean(String  name,Class<T>  requiredType)：根据容器中的Bean的id来获取指定Bean，但该方法带一个泛型参数，因此获取Bean之后无须进行强制类型转换。
 
-​		使用Spring框架之后最大的改变之一是：**程序不再使用new调用构造器创建 Java对象那个，所有的 Java对	象都由Spring容器负责创建**。
+​		使用Spring框架之后最大的改变之一是：**程序不再使用new调用构造器创建 Java对象那个，所有的 Java对象都由Spring容器负责创建**。
 
 ## **2、依赖注入**
 
@@ -148,7 +146,7 @@ public class BeanTest
 
 ​				1）：Spring容器作为超级大工厂，负责创建、管理所有的 Java对象，这些 Java对象被称为Bean。
 
-​				2）：Spring容器管理容器中Bean之间的依赖关系，Spring使用一种被称为“**依赖注入**”的方式管理Bean		之间的依赖关系。
+​				2）：Spring容器管理容器中Bean之间的依赖关系，Spring使用一种被称为“**依赖注入**”的方式管理Bean之间的依赖关系。
 
 ​		使用依赖注入，不仅可以为Bean注入普通的属性值，还可以注入其他Bean的引用。通过这种依赖注入，应用中各种组件不需要以硬编码方式耦合在一起，甚至无须使用工厂模式。
 
@@ -156,9 +154,9 @@ public class BeanTest
 
 ​				传统模式：
 
-​						原始做法：调用者**主动**创建被依赖对象，然后再调用被依赖对象的方法。需要用过“new  被依赖对				象构造器();”的代码创建对象。导致调用者与被依赖对象实现类的硬编码耦合。不利于项目维护。
+​						原始做法：调用者**主动**创建被依赖对象，然后再调用被依赖对象的方法。需要用过“new  被依赖对象构造器();”的代码创建对象。导致调用者与被依赖对象实现类的硬编码耦合。不利于项目维护。
 
-​						简单工厂模式：调用者先找到被依赖对象的工厂，然后**主动通过工厂去获取被依赖对象**，最后再调				用被依赖对象的方法。把握三点：
+​						简单工厂模式：调用者先找到被依赖对象的工厂，然后**主动通过工厂去获取被依赖对象**，最后再调用被依赖对象的方法。把握三点：
 
 ​								1）：调用者面向被依赖对象的接口编程。
 
@@ -166,7 +164,7 @@ public class BeanTest
 
 ​								3）：调用者通过工厂来获得被依赖组件。
 
-​								唯一缺点：调用组件需要主动通过工厂去获取被依赖对象，会带来调用组件与被依赖对象工厂						的耦合。
+​								唯一缺点：调用组件需要主动通过工厂去获取被依赖对象，会带来调用组件与被依赖对象工厂的耦合。
 
 ​		**控制反转（依赖注入）**：Spring之后，调用无须主动获取被依赖对象，调用者只要被动接受Spring容器为调用者的成员变量赋值即可（只要**配置一个<property .../>子元素，Spring就会执行对应的setter方法为调用者的成员变量赋值**）。
 
@@ -586,7 +584,7 @@ public class Main
 ![](image/QQ截图20190618230104.png)
 
 ```xml
-<bean id="person" class="beans.Person" name="styleperson">
+	<bean id="person" class="beans.Person" name="styleperson">
         <property name="axe" ref="xiaoshanshan" />
     </bean>
     <bean id="axe" class="beans.Axe" name="xiaoshanshan" />
@@ -658,7 +656,7 @@ public static void main(String [] args)
 
 ​				2）：**接受设值注入的Bean，则应提供对应的setter方法，并不要求提供对应的getter方法**。
 
-​				3）：**接受构造 注入的Bean，则应提供对应的、带参数的构造函数**
+​				3）：**接受构造注入的Bean，则应提供对应的、带参数的构造函数**
 
 ## 5、使用注解
 
@@ -708,10 +706,10 @@ ApplicationContext ctx = new AnnotationConfigApplicationContext(StyleConfig.clas
 
 ```properties
 @Import：修饰一个Java配置类,用于向当前Java配置类中导入其他Java配置类
-@Scope：用于修饰一个方法，指定该方法对饮得Bean的声明周期
+@Scope：用于修饰一个方法，指定该方法对饮得Bean的生命周期
 @Lazy：用于修饰一个方法，指定该方法对应的Bean是否需要延迟初始化
 @DependsOn：用于修饰一个方法，指定在初始化该方法对应的Bean之前初始化指定的Bean
-@ImportResource：修饰一个Java配置类，用于向当前配置累中导入其他配置文件
+@ImportResource：修饰一个Java配置类，用于向当前配置类中导入其他配置文件
 ```
 
 ### 2）：
@@ -728,15 +726,15 @@ ApplicationContext ctx = new AnnotationConfigApplicationContext(StyleConfig.clas
 
 ​		@ComponentScan：value：指定要扫描的包，excludeFilters：指定排除指定规则的Bean，includeFilters：指定扫描指定只包含的组件，要让其生效，需要指定useDefaultFilters=false，禁用默认的过滤规则。（**type：FilterType.ANNOTATION：按照注解；FilterType.ASSIGNABLE_TYPE：按照类型；FilterType.ASPECTJ：指定ASPECTJ表达式；FilterType.REGEX：按照正则表达式；FilterType.CUSTOM：自定义规则；**）
 
-​					自定义规则：需要一个实现了TypeFilter接口的类。并重写match方法：其中MetadataReader类		型的参数代表当前正在扫描的类的信息，MetadataReaderFactory：用于获取其他类的信息。
+​					自定义规则：需要一个实现了TypeFilter接口的类。并重写match方法：其中MetadataReader类型的参数代表当前正在扫描的类的信息，MetadataReaderFactory：用于获取其他类的信息。
 
 ​		@ComponentScans：指定多个@ComponentScan。		
 
 ​		@Scope：指定Bean的作用域。
 
-​				ConfigurableBeanFactory.SCOPE_PROTOTYPE：prototype。ioc容器启动并不会去调用方法创建对象		放在容器中，每次获取的时候才会调用方法创建对象。每调一次就创建一个对象。
+​				ConfigurableBeanFactory.SCOPE_PROTOTYPE：prototype。ioc容器启动并不会去调用方法创建对象放在容器中，每次获取的时候才会调用方法创建对象。每调一次就创建一个对象。
 
-​				ConfigurableBeanFactory.SCOPE_SINGLETON：singleton。ioc容器启动会调用方法创建对象放到ioc		容器中，以后每次获取就是直接从容器中拿。
+​				ConfigurableBeanFactory.SCOPE_SINGLETON：singleton。ioc容器启动会调用方法创建对象放到ioc容器中，以后每次获取就是直接从容器中拿。
 
 ​				WebApplicationContext.SCOPE_REQUEST：request。
 
@@ -776,9 +774,9 @@ ApplicationContext ctx = new AnnotationConfigApplicationContext(StyleConfig.clas
 
 ​				修饰参数：标注的参数从 IoC 容器中获取。
 
-​				@Qualifier：指定装配给定的 id 的对象。其和 @Autowired 默认是一定要装配对应的 Bean，如果没有		找到，会报错。可指定 @Autowired 的属性 required 为 false ，来允许为空。
+​				@Qualifier：指定装配给定的 id 的对象。其和 @Autowired 默认是一定要装配对应的 Bean，如果没有找到，会报错。可指定 @Autowired 的属性 required 为 false ，来允许为空。
 
-​				@Primary：修饰的 Bean 在进行依类型自动装配时，会优先使用。也可以继续使用 @Qualifier 来指定		具体装配哪一个 Bean。
+​				@Primary：修饰的 Bean 在进行依类型自动装配时，会优先使用。也可以继续使用 @Qualifier 来指定具体装配哪一个 Bean。
 
 ​		@Resource：Java 规范中的注解，默认按照属性名进行装配。不支持 @Primary 和 @Autowired 的 reqiured   = false 的功能。
 
@@ -835,7 +833,7 @@ ApplicationContext ctx = new AnnotationConfigApplicationContext(StyleConfig.clas
 
 ​					1、@EnableAspectJAutoProxy是什么？
 
-​							@Import(AspectJAutoProxyRegistrar.class)：给容器中导入AspectJAutoProxyRegistrar利用					AspectJAutoProxyRegistrar自定义给容器中注册bean；BeanDefinetioninternalAutoProxyCreator=AnnotationAwareAspectJAutoProxyCreator
+​							@Import(AspectJAutoProxyRegistrar.class)：给容器中导入AspectJAutoProxyRegistrar利用AspectJAutoProxyRegistrar自定义给容器中注册bean；BeanDefinetioninternalAutoProxyCreator=AnnotationAwareAspectJAutoProxyCreator
 
 ​							给容器中注册一个AnnotationAwareAspectJAutoProxyCreator；
 
@@ -847,7 +845,7 @@ ApplicationContext ctx = new AnnotationConfigApplicationContext(StyleConfig.clas
 
 ​											->AbstractAdvisorAutoProxyCreator
 
-​													->AbstractAutoProxyCreator   implements 																	SmartInstantiationAwareBeanPostProcessor, BeanFactoryAware关注																	后置处理器（在bean初始化完成前后做事情）、自动装配BeanFactory
+​													->AbstractAutoProxyCreator   implements 																	SmartInstantiationAwareBeanPostProcessor, BeanFactoryAware关注后置处理器（在bean初始化完成前后做事情）、自动装配BeanFactory
 
 
 
@@ -871,7 +869,7 @@ ApplicationContext ctx = new AnnotationConfigApplicationContext(StyleConfig.clas
 
 ​						2）、注册配置类，调用refresh（）刷新容器；
 
-​						3）、registerBeanPostProcessors(beanFactory);注册bean的后置处理器来方便拦截bean的创				建；
+​						3）、registerBeanPostProcessors(beanFactory);注册bean的后置处理器来方便拦截bean的创建；
 
 ​								1）、先获取ioc容器已经定义了的需要创建对象的所有BeanPostProcessor
 
@@ -895,11 +893,11 @@ ApplicationContext ctx = new AnnotationConfigApplicationContext(StyleConfig.clas
 
 ​												1）、invokeAwareMethods()：处理Aware接口的方法回调
 
-​												2）、applyBeanPostProcessorsBeforeInitialization()：应用后置处理器的															postProcessBeforeInitialization（）
+​												2）、applyBeanPostProcessorsBeforeInitialization()：应用后置处理器的postProcessBeforeInitialization()
 
 ​												3）、invokeInitMethods()；执行自定义的初始化方法
 
-​												4）、applyBeanPostProcessorsAfterInitialization()；执行后置处理器的															postProcessAfterInitialization（）；
+​												4）、applyBeanPostProcessorsAfterInitialization()；执行后置处理器的postProcessAfterInitialization()；
 
 ​										4）、BeanPostProcessor(AnnotationAwareAspectJAutoProxyCreator)创建成功；--》													aspectJAdvisorsBuilder
 
@@ -911,7 +909,7 @@ ApplicationContext ctx = new AnnotationConfigApplicationContext(StyleConfig.clas
 
 ​						AnnotationAwareAspectJAutoProxyCreator => InstantiationAwareBeanPostProcessor
 
-​						4）、finishBeanFactoryInitialization(beanFactory);完成BeanFactory初始化工作；创建剩下的单			实例bean
+​						4）、finishBeanFactoryInitialization(beanFactory);完成BeanFactory初始化工作；创建剩下的单实例bean
 
 ​								1）、遍历获取容器中所有的Bean，依次创建对象getBean(beanName);
 
@@ -919,23 +917,23 @@ ApplicationContext ctx = new AnnotationConfigApplicationContext(StyleConfig.clas
 
 ​								2）、创建bean
 
-​										【AnnotationAwareAspectJAutoProxyCreator在所有bean创建之前会有一个拦截，								InstantiationAwareBeanPostProcessor，会调用postProcessBeforeInstantiation()】
+​										【AnnotationAwareAspectJAutoProxyCreator在所有bean创建之前会有一个拦截，InstantiationAwareBeanPostProcessor，会调用postProcessBeforeInstantiation()】
 
-​										1）、先从缓存中获取当前bean，如果能获取到，说明bean是之前被创建过的，直接使								用，否则再创建；
+​										1）、先从缓存中获取当前bean，如果能获取到，说明bean是之前被创建过的，直接使用，否则再创建；
 
 ​												只要创建好的Bean都会被缓存起来
 
 ​										2）、createBean（）;创建bean；
 
-​												AnnotationAwareAspectJAutoProxyCreator 会在任何bean创建之前先尝试返回										bean的实例
+​												AnnotationAwareAspectJAutoProxyCreator 会在任何bean创建之前先尝试返回bean的实例
 
 ​												【BeanPostProcessor是在Bean对象创建完成初始化前后调用的】
 
-​												【InstantiationAwareBeanPostProcessor是在创建Bean实例之前先尝试用后置处理										器返回对象的】
+​												【InstantiationAwareBeanPostProcessor是在创建Bean实例之前先尝试用后置处理器返回对象的】
 
 ​												1）、resolveBeforeInstantiation(beanName, mbdToUse);解析BeforeInstantiation
 
-​														希望后置处理器在此能返回一个代理对象；如果能返回代理对象就使用，如果不												能就继续
+​														希望后置处理器在此能返回一个代理对象；如果能返回代理对象就使用，如果不能就继续
 
 ​														1）、后置处理器先尝试返回对象；
 
@@ -951,7 +949,7 @@ ApplicationContext ctx = new AnnotationConfigApplicationContext(StyleConfig.clas
 
 
 
-​												2）、doCreateBean(beanName, mbdToUse, args);真正的去创建一个bean实例；										和3.6流程一样；
+​												2）、doCreateBean(beanName, mbdToUse, args);真正的去创建一个bean实例；和3.6流程一样；
 
 ​												3）、
 
@@ -959,13 +957,11 @@ ApplicationContext ctx = new AnnotationConfigApplicationContext(StyleConfig.clas
 
 AnnotationAwareAspectJAutoProxyCreator【InstantiationAwareBeanPostProcessor】	的作用：
 
-​		1）、每一个bean创建之前，调用postProcessBeforeInstantiation()；关心MathCalculator和					LogAspect的创建
+​		1）、每一个bean创建之前，调用postProcessBeforeInstantiation()；关心MathCalculator和LogAspect的创建
 
 ​				1）、判断当前bean是否在advisedBeans中（保存了所有需要增强bean）
 
-​				2）、判断当前bean是否是基础类型的Advice、Pointcut、Advisor、AopInfrastructureBean，
-
-​		或者是否是切面（@Aspect）
+​				2）、判断当前bean是否是基础类型的Advice、Pointcut、Advisor、AopInfrastructureBean，或者是否是切面（@Aspect）
 
 ​				3）、是否需要跳过
 
@@ -1254,7 +1250,7 @@ depends-on：通过指定该属性，可以在初始化主调Bean之前，强制
 
 ![](image/QQ截图20190621225409.png)
 
-​		配置FactoryBean与配置普通Bean的定义没有什么区别，但当程序向Spring容器请求过去该Bean时，**容器返回该FactoryBean的产品，而不是返回该FactoryBean本身**。
+​		配置FactoryBean与配置普通Bean的定义没有什么区别，但当程序向Spring容器请求获取该Bean时，**容器返回该FactoryBean的产品，而不是返回该FactoryBean本身**。
 
 ​		Spring在检测容器中的所有Bean时，如果发现某个Bean实现类实现了FactoryBean接口，**Spring容器就会在实例化该Bean，根据<property .../>执行setter方法之后，额外调用该Bean的getObject方法，并将该方法的返回值作为容器中的Bean**。当程序需要获得FactoryBean本身时，并不直接请求Bean  id，而是在Bean  id前增加“&”符号，容器则返回FactoryBean本身，而不是其产品Bean。
 
@@ -1264,7 +1260,7 @@ depends-on：通过指定该属性，可以在初始化主调Bean之前，强制
 
 ​		此接口提供一个setBeanName(String  name)，该方法的name参数就是Bean的id，实现该方法的Bean类可通过该方法来获得部署该Bean的id。这个方法是由Spring容器负责调用的。此时的name参数就是配置该Bean时，指定的id。
 
-## 8、容器中Bean的声明周期
+## 8、容器中Bean的生命周期
 
 ​		Spring可以管理singleton作用域的Bean的生命周期，对于prototype作用域的Bean，Spring容器仅仅负责创建，无法管理其生命周期。
 
@@ -1364,7 +1360,7 @@ public abstract class CollaborationBean
 
 ​				调用那个对象：由PropertyPathFactoryBean得setTargetObject(Object  targetObject)方法指定。
 
-​				调用那个getter方法：由PropertyPathFactoryBean得setPropertyPath(String  propertyPath)方法指		定。
+​				调用那个getter方法：由PropertyPathFactoryBean得setPropertyPath(String  propertyPath)方法指定。
 
 ```xml
 <bean id="amer" class="beans.American">
@@ -2083,9 +2079,9 @@ Persons persons1 = new Persons(1,"山鸡",new Date());
 
 ​		**Bean后处理器必须实现BeanPostProcessor接口**，两个方法：
 
-​				postProcessBeforeInitalization(Object  bean,String  name) throws BeansException：该方法的第一		个参数是系统即将进行后处理的Bean实例，第二个参数是该Bean的配置id。
+​				postProcessBeforeInitalization(Object  bean,String  name) throws BeansException：该方法的第一个参数是系统即将进行后处理的Bean实例，第二个参数是该Bean的配置id。
 
-​				postProcessAfterInitialization(Object  bean,String  name) throws  BeansException：该方法的第一个		参数是系统即将进行后处理的Bean实例，第二个参数是该Bean配置的id。
+​				postProcessAfterInitialization(Object  bean,String  name) throws  BeansException：该方法的第一个参数是系统即将进行后处理的Bean实例，第二个参数是该Bean配置的id。
 
 ​		这两个方法会对容器的中的Bean进行后处理，**会在目标Bean初始化之前，初始化之后被回调**，这两个方法用于对容器中的Bean实例进行增强处理。
 
@@ -2155,7 +2151,7 @@ Resource isr = new ClassPathResource("applicationContext.xml");
 
 ​		**容器后处理器必须实现BeanFactoryPostProcessor接口**，必须实现以下方法：
 
-​				postProcessBeanFactory(ConfigurableListableBeanFactory  beanFactory)：该方法的方法体就是对		Spring 容器进行的处理，这种处理可以对Spring容器进行自定义扩展。
+​				postProcessBeanFactory(ConfigurableListableBeanFactory  beanFactory)：该方法的方法体就是对Spring 容器进行的处理，这种处理可以对Spring容器进行自定义扩展。
 
 ​		与Bean后处理器类似，ApplicationContext也可以自动检测容器中的容器后处理器，并自动注册，但使用BeanFactory作为Spring容器，同样也需要手动获取和注册。
 
@@ -2579,7 +2575,7 @@ public class Main
 
 ​				静态AOP实现：AOP框架在编译阶段对程序进行修改，即实现对目标类的增强，生成静态的AOP代理类	（生成的*.class文件已经被改掉了，需要使用特定的编译器）。AspectJ为代表。
 
-​				动态AOP实现：AOP框架在运行阶段动态生成AOP代理(在内存中以JDK动态代理或cglib动态地生成AOP		代理类)，以实现对目标对象的增强。Spring  AOP为代表。
+​				动态AOP实现：AOP框架在运行阶段动态生成AOP代理(在内存中以JDK动态代理或cglib动态地生成AOP代理类)，以实现对目标对象的增强。Spring  AOP为代表。
 
 ​		
 
@@ -2601,17 +2597,17 @@ public class Main
 
 ​				连接点(Joinpoint)：程序执行过程中明确的点，在Spring  AOP中，连接点总是方法的调用。
 
-​				增强处理(Advice)：AOP框架在特定的切入点执行的增强处理。处理有“around”，“before”，“after”等类		型。
+​				增强处理(Advice)：AOP框架在特定的切入点执行的增强处理。处理有“around”，“before”，“after”等类型。
 
-​				切入点(Pointcut)：可以插入增强处理的连接点，简而言之，当某个连接点满足指定要求时，该连接点将		被添加增强处理，该连接点也就变成了切入点。
+​				切入点(Pointcut)：可以插入增强处理的连接点，简而言之，当某个连接点满足指定要求时，该连接点将被添加增强处理，该连接点也就变成了切入点。
 
 ​				引入：将方法或字段添加到被处理的类中。Spring允许将新的接口引入到任何被处理的对象中。
 
-​				目标对象：被AOP框架进行增强处理的对象，也被称为被增强的对象，如果AOP框架采用的是动态AOP		实现，那么该对象就是一个被代理的对象。
+​				目标对象：被AOP框架进行增强处理的对象，也被称为被增强的对象，如果AOP框架采用的是动态AOP实现，那么该对象就是一个被代理的对象。
 
-​				AOP代理：AOP框架创建的对象，代理就是对目标对象的加强。Spring中的AOP代理可以是JDK动态代		理，也可以是cglib代理，前者为实现接口的目标对象的代理，后者为不实现接口的目标对象的代理。
+​				AOP代理：AOP框架创建的对象，代理就是对目标对象的加强。Spring中的AOP代理可以是JDK动态代理，也可以是cglib代理，前者为实现接口的目标对象的代理，后者为不实现接口的目标对象的代理。
 
-​				织入(Weaving)：将增强处理添加到目标对象中，并创建一个被增强的对象(AOP代理)的过程就是织入。		织入有两种实现方式：编译时增强和运行时增强。**Spring和其他纯 Java  AOP框架一样，在运行时完成织		入**。
+​				织入(Weaving)：将增强处理添加到目标对象中，并创建一个被增强的对象(AOP代理)的过程就是织入。织入有两种实现方式：编译时增强和运行时增强。**Spring和其他纯 Java  AOP框架一样，在运行时完成织		入**。
 
 ​			AOP代理就是由AOP框架动态生成的一个对象，该对象可作为目标对象使用。AOP代理包含了目标对象的全部方法，但**AOP代理中的方法与目标对象的方法存在差异：AOP方法在特定切入点添加了增强处理，并回调目标对象的方法**。
 
@@ -2669,9 +2665,9 @@ public class Main
 
 ​		两个属性：
 
-​				pointcut/value：这两个属性的作用一样，它们都用于指定该切入点对应的切入表达式。当指定了			pointcut属性值后，value属性将会被覆盖。
+​				pointcut/value：这两个属性的作用一样，它们都用于指定该切入点对应的切入表达式。当指定了pointcut属性值后，value属性将会被覆盖。
 
-​				returning：该属性值指定一个形参名，用于表示Advice方法中可定义与此同名的形参，该形参可用于访		问目标方法的返回值，除此之外，在Advice方法中定义该形参(代表目标方法的返回值)时指定的类型，会限制		目标方法返回指定类型的值或没有返回值。
+​				returning：该属性值指定一个形参名，用于表示Advice方法中可定义与此同名的形参，该形参可用于访问目标方法的返回值，除此之外，在Advice方法中定义该形参(代表目标方法的返回值)时指定的类型，会限制目标方法返回指定类型的值或没有返回值。
 
 ![](image/QQ截图20190713213453.png)
 
@@ -2681,9 +2677,9 @@ public class Main
 
 ​		两个属性：
 
-​				pointcut/value：指定该切入点对应的切入表达式，当指定pointcut属性值后，value属性值将会被覆		盖。
+​				pointcut/value：指定该切入点对应的切入表达式，当指定pointcut属性值后，value属性值将会被覆盖。
 
-​				throwing：该属性指定一个形参名。该形参可用于访问目标方法抛出的异常，定义该形参时指定的类		型，会限制目标方法必须抛出指定类型的异常。
+​				throwing：该属性指定一个形参名。该形参可用于访问目标方法抛出的异常，定义该形参时指定的类型，会限制目标方法必须抛出指定类型的异常。
 
 ![](image/QQ截图20190713214145.png)
 
@@ -2709,7 +2705,7 @@ public class Main
 
 ![](image/QQ截图20190713223247.png)
 
-​		进入连接点，高优先级将先被织入(Before，优先级高的限制性)，退出时，高优先级的最后被织入。(After，高优先级的后执行)。
+​		进入连接点，高优先级将先被织入(Before，优先级高的先执行)，退出时，高优先级的最后被织入。(After，高优先级的后执行)。
 
 ​		指定优先级：
 
@@ -2717,7 +2713,7 @@ public class Main
 
 ​				2、使用@Order修饰切面类，value值越小，优先级越高。
 
-​		同一个切面类里的两个相同类型的增强处理在同一个连接点被织入时，以随即的顺序来织入这两个增强处理。
+​		同一个切面类里的两个相同类型的增强处理在同一个连接点被织入时，以随机的顺序来织入这两个增强处理。
 
 ![](image/QQ截图20190713224024.png)
 
@@ -2795,13 +2791,13 @@ public class Main
 
 ​				pointcut：该属性指定一个切入表达式，Spring将在匹配该表达式的连接点时织入该增强处理。
 
-​				pointcut-ref：该属性指定一个已经存在的切入点名称，通常pointcut和pointcut-ref两个属性只需使用		其中之一。
+​				pointcut-ref：该属性指定一个已经存在的切入点名称，通常pointcut和pointcut-ref两个属性只需使用其中之一。
 
 ​				method：该属性指定一个方法名，指定将切面的该方法转换为增强处理。
 
-​				throwing：该属性只对<ater-throwing .../>元素有效，用于指定一个形参名，AfterThrowing增强处理方		法可通过该形参访问目标方法所抛出的异常。
+​				throwing：该属性只对<ater-throwing .../>元素有效，用于指定一个形参名，AfterThrowing增强处理方法可通过该形参访问目标方法所抛出的异常。
 
-​				returning：该属性只对<after-returning .../>元素有效，用于指定一个形参名，AfterReturning增强处理		方法可通过该形参访问目标方法的返回值。
+​				returning：该属性只对<after-returning .../>元素有效，用于指定一个形参名，AfterReturning增强处理方法可通过该形参访问目标方法的返回值。
 
 ```xml
 <context:component-scan base-package="annotation" />
@@ -2828,7 +2824,7 @@ public class Main
 
 ​		然后进行下面两步：
 
-​				1、在Spring配置文件中添加<cache:annotation-driven  cache-manager=""  />，该元素指定Spring根		据注解来启用Bean级别或者方法级别的缓存。默认值为cacheManager，即如果将容器中缓存管理器的ID设		为cacheManager，则可省略<cache:annotation-driven  .../>的cache-manager属性。
+​				1、在Spring配置文件中添加<cache:annotation-driven  cache-manager=""  />，该元素指定Spring根据注解来启用Bean级别或者方法级别的缓存。默认值为cacheManager，即如果将容器中缓存管理器的ID设为cacheManager，则可省略<cache:annotation-driven  .../>的cache-manager属性。
 
 ​				2、针对不同的缓存实现配置对应的缓存管理器。
 
@@ -2962,9 +2958,9 @@ public class Main
 
 ​				事务隔离：当前事务和其他事物的隔离程度。
 
-​				事务传播：通常，在事务中执行的代码都会在当前事务中运行。但是，如果一个事务上下文已经存在，		有几个选项可指定该事务性方法的执行行为。
+​				事务传播：通常，在事务中执行的代码都会在当前事务中运行。但是，如果一个事务上下文已经存在，有几个选项可指定该事务性方法的执行行为。
 
-​				事务超时：事务在超时前能运行多久，也就是事务的最长持续时间。如果事务一直没有被提交或回滚，		将在超出该时间后，系统自动回滚事务。
+​				事务超时：事务在超时前能运行多久，也就是事务的最长持续时间。如果事务一直没有被提交或回滚，将在超出该时间后，系统自动回滚事务。
 
 ​				只读状态：只读事务不修改任何数据，在某些情况下，只读事务是非常有用的优化。
 
@@ -2972,7 +2968,7 @@ public class Main
 
 ![](image/QQ截图20190716175444.png)
 
-​		Spring具体的事务管理由PlatformTransactionManager的不同实现类来完成。Spring容器中配置PlatformTransactionManager  Bean时，必须针对不同的环境提供不同的实现类。
+​		Spring具体的事务管理由PlatformTransactionManager的不同实现类来完成。Spring容器中配置PlatformTransactionManagerBean时，必须针对不同的环境提供不同的实现类。
 
 ​		采用不同的持久层访问环境的配置文件：
 
@@ -2996,9 +2992,9 @@ public class Main
 
 ​		Spring的两种事务管理方式：
 
-​				编程式事务管理：即使使用Spring的编程式事务，程序也可直接获取容器中的transactionManager  		Bean，该Bean总是PlantformTransactionManager的实例，所以可以通过该接口提供的三个方法来开始事		务，提交事务和回滚事务。
+​				编程式事务管理：即使使用Spring的编程式事务，程序也可直接获取容器中的transactionManagerBean，该Bean总是PlantformTransactionManager的实例，所以可以通过该接口提供的三个方法来开始事务，提交事务和回滚事务。
 
-​				声明式事务：无须在 Java程序中书写任何事物操作代码，而是通过在XML文件中为业务组件配置事务代		理（AOP代理的一种），AOP为事务代理所织入的增强处理也由Spring提供，在目标方法执行之前，织入开		始事务，在目标方法执行之后，织入结束事务。
+​				声明式事务：无须在 Java程序中书写任何事物操作代码，而是通过在XML文件中为业务组件配置事务代理（AOP代理的一种），AOP为事务代理所织入的增强处理也由Spring提供，在目标方法执行之前，织入开始事务，在目标方法执行之后，织入结束事务。
 
 ​		
 
@@ -3034,7 +3030,7 @@ public class Main
 
 ### 17.3、使用@Transactional
 
-​		@Transactional注解，既可以修饰Spring  Bean类，也可用于修饰Bean类中的某个方法。修饰类，事务将对整个Bean类其作用，修饰方法，只对该方法其作用。
+​		@Transactional注解，既可以修饰Spring  Bean类，也可用于修饰Bean类中的某个方法。修饰类，事务将对整个Bean类起作用，修饰方法，只对该方法其作用。
 
 ​		属性：
 
@@ -5693,7 +5689,7 @@ select col1,col2,col3 from tableName ....
 
 ​		作用：
 
-​				定义映射规则，级联的更新，定制类型转换器等。但现有版本，只支持resultMap查询，不支持更新或者		保存。
+​				定义映射规则，级联的更新，定制类型转换器等。但现有版本，只支持resultMap查询，不支持更新或者保存。
 
 ```xml
 <resultMap id="" type="">
@@ -5841,6 +5837,16 @@ select col1,col2,col3 from tableName ....
 
 ![。](image/QQ截图20190905101859.png)
 
+
+
+### 注意
+
+​		在使用`resultMap`进行类型转换时，不能出现字段无法找到对应实体属性的情况，在这种情况下，会报错。而在使用`resultType`的 情况下，就算字段没有找
+
+到对应的实体属性，其也不会报错。
+
+
+
 ## 20、缓存
 
 ​		一级缓存是在SqlSession上的缓存，二级缓存是在SqlSessionFactory上的缓存。默认情况下，会开启一级缓存，一级缓存不需要POJO对象可序列化。
@@ -5965,7 +5971,7 @@ select count(id) from role where role_name like concat('%',#{roleName},'%')
 
 ![](image/QQ截图20190910104620.png)
 
-​				trim表示去掉一些特殊的字符串，prefix代表的是语句的前缀，prefixOverrides代表的是需要去掉哪种		字符串。
+​				trim表示去掉一些特殊的字符串，prefix代表的是语句的前缀，prefixOverrides代表的是需要去掉哪种字符串。
 
 ​		set元素：
 
@@ -6516,6 +6522,391 @@ public class StylePlugin implements Interceptor
         </plugin>
     </plugins>
 ```
+
+# 逆向工程
+
+​		通过数据库的表，生成出对应的实体类，mapper接口，mapper.xml 文件。
+
+依赖
+
+```xml
+<dependency>
+    <groupId>org.mybatis.generator</groupId>
+    <artifactId>mybatis-generator-core</artifactId>
+    <version>1.3.7</version>
+</dependency>
+```
+
+编写配置文件
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE generatorConfiguration
+        PUBLIC "-//mybatis.org//DTD MyBatis Generator Configuration 1.0//EN"
+        "http://mybatis.org/dtd/mybatis-generator-config_1_0.dtd">
+<generatorConfiguration>
+    
+    <!-- 用来指定外部的属性元素，最多配置一个  -->
+    <properties resource="classpath:database.properties" />
+    
+    <!-- 用于指定驱动的路径 -->
+    <classPathEntry location=""/>
+    
+    <!-- context 是逆向工程的主要配置信息 -->
+    <!-- id：起个名字 -->
+    <!-- targetRuntime：设置生成的文件适用于那个 mybatis 版本 -->
+    <context id="default" targetRuntime="MyBatis3">
+        <!--optional,指在创建class时，对注释进行控制-->
+        <commentGenerator>
+            <property name="addRemarkComments" value="true"/>
+            <!-- 是否去除自动生成的注释 true：是 ： false:否 -->
+            <property name="suppressAllComments" value="true"/>
+        </commentGenerator>
+        <!--jdbc的数据库连接 wg_insert 为数据库名字-->
+        <jdbcConnection driverClass="com.mysql.jdbc.Driver"
+                        connectionURL="jdbc:mysql://localhost:3306/ssm?useUnicode=true"
+                        userId="root"
+                        password="179980">
+        </jdbcConnection>
+        <!--非必须，类型处理器，在数据库类型和java类型之间的转换控制-->
+        <javaTypeResolver>
+            <!-- 默认情况下数据库中的 decimal，bigInt 在 Java 对应是 sql 下的 BigDecimal 类 -->
+            <!-- 不是 double 和 long 类型 -->
+            <!-- 使用常用的基本类型代替 sql 包下的引用类型 -->
+            <property name="forceBigDecimals" value="false"/>
+        </javaTypeResolver>
+        <!-- targetPackage：生成的实体类所在的包 -->
+        <!-- targetProject：生成的实体类所在的硬盘位置 -->
+        <javaModelGenerator targetPackage="com.***pot.pojo"
+                            targetProject="src/main/java">
+            <!-- 是否允许子包 -->
+            <property name="enableSubPackages" value="false"/>
+            <!-- 是否对modal添加构造函数 -->
+            <property name="constructorBased" value="true"/>
+            <!-- 是否清理从数据库中查询出的字符串左右两边的空白字符 -->
+            <property name="trimStrings" value="true"/>
+            <!-- 建立modal对象是否不可改变 即生成的modal对象不会有setter方法，只有构造方法 -->
+            <property name="immutable" value="false"/>
+        </javaModelGenerator>
+        <!-- targetPackage 和 targetProject：生成的 mapper 文件的包和位置 -->
+        <sqlMapGenerator targetPackage="mapper"
+                         targetProject="src/main/resources">
+            <!-- 针对数据库的一个配置，是否把 schema 作为字包名 -->
+            <property name="enableSubPackages" value="false"/>
+        </sqlMapGenerator>
+        <!-- targetPackage 和 targetProject：生成的 interface 文件的包和位置 -->
+        <javaClientGenerator type="XMLMAPPER"
+                             targetPackage="com.****ot.mapper" targetProject="src/main/java">
+            <!-- 针对 oracle 数据库的一个配置，是否把 schema 作为字包名 -->
+            <property name="enableSubPackages" value="false"/>
+        </javaClientGenerator>
+        <!-- tableName是数据库中的表名，domainObjectName是生成的JAVA模型名，后面的参数不用改，要生成更多的表就在下面继续加table标签 -->
+        <!--1-->
+        <table tableName="role" domainObjectName="Role"
+               enableCountByExample="false" enableUpdateByExample="false"
+               enableDeleteByExample="false" enableSelectByExample="false"
+               selectByExampleQueryId="false">
+        </table>
+    </context>
+</generatorConfiguration>
+```
+
+生成
+
+```java
+		List<String> warnings = new ArrayList<String>();
+        boolean overwrite = true;
+        File configFile = new File("src/main/resource/generatorConfig.xml");
+        ConfigurationParser cp = new ConfigurationParser(warnings);
+        Configuration config = cp.parseConfiguration(configFile);
+        DefaultShellCallback callback = new DefaultShellCallback(overwrite);
+        MyBatisGenerator myBatisGenerator = new MyBatisGenerator(config, callback, warnings);
+        myBatisGenerator.generate(null);
+```
+
+context标签：
+
+​		defaultModelType：取值：
+
+​					conditional：默认值，如果一个表的主键只有一个字段，那么不会为该字段生成单独的实体类，而是会将该字段合并到基本实体类中。
+
+​					flag：该模型只为每张表生成一个实体类，这个实体类包含表中的所有字段。
+
+​					hierarchical：如果表有主键，那么该模型会产生一个单独的主键实体类，如果表还有BLOB字段，则会为表生成一个包含所有BLOB字段的单独的实体		类，然后为所有其他字段另外生成一个单独的实体类。
+
+​		targetRuntime：此属性用于指定生成的代码的运行时环境。
+
+​					MyBatis3：默认值
+
+​					MyBatis3Simple：这种情况不会生成与Example相关的方法。
+
+​		introspectedColumnImpl：该参数可以指定扩展org.mybatis.generator.api.Introspected Column类的实现类。
+
+
+
+property标签：
+
+​		当SQL中有数据库关键字时，使用分隔符括住关键字，可以避免数据库产生错误。
+
+​		autoDelimitKeywords：自动给关键字添加分隔符。
+
+​		beginningDelimiter：配置前置分隔符
+
+​		endingDelimiter：配置后置分隔符。
+
+​		javaFileEncoding：设置要使用的 Java 文件的编码，默认使用当前运行环境的编码。
+
+```xml
+		<property name="autoDelimitKeywords" value="true"/>
+        <property name="beginningDelimiter" value="`"/>
+        <property name="endingDelimiter" value="`"/>
+```
+
+
+
+plugin标签：
+
+​		用来定义一个插件，用于扩展或修改通过生成器生成的代码。将按照配置中的配置顺序执行。
+
+​		缓存插件：此插件可以在生成的SQL XML 映射文件中增加一个cache标签，只有当targetRuntime为MyBatis3，该插件才有效。
+
+```xml
+		<plugin type="org.mybatis.generator.plugins.CachePlugin">
+            <property name="cache_eviction" value="LRU"/>
+            <property name="cache_size" value="1024"/>
+        </plugin>
+```
+
+​		除了缓存插件外，还默认包含了序列化差价，RowBounds插件，ToString插件等。
+
+
+
+commentGenerator标签：
+
+​		此标签有一个可选属性 type，指定用户的实现类，该类要实现 org.mybatis.generator.api.CommentGenerator接口，而且必须有一个默认空的构造方法。type 属性接收的默认的特殊值 DEFAULT，使用默认的实现类 org.mybatis.generator.internal.DefaultCommentGenerator。
+
+​		默认的实现类中提供了三个可选属性，通过 property属性进行配置
+
+​				suppressAllComments：阻止生成注释，默认为 falst。
+
+​				suppressDate：阻止生成的注释包含时间戳，默认为 false。
+
+​				addRemarkComments：注释是否添加数据库表的备注信息，默认为 false。
+
+
+
+jdbcConnection标签：
+
+​		此标签用于指定要连接的数据库信息。如果JDBC驱动不在 classpath下，就要通过 classpathEntry 标签引入 jar 包。
+
+​		driverClass：访问数据库的 JDBC 驱动程序的完全限定类名。
+
+​		connectionURL：访问数据库的 JDBC 链接 URL。
+
+​		userId：访问数据库的用户 ID。
+
+​		password：访问数据库的密码。
+
+​		此外，还可以添加多个 property 子标签，配置的属性值都会添加到 JDBC 驱动的属性中。（使用 property 标签的 name 属性反射赋值）。
+
+
+
+javaTypeResolver标签：
+
+​		指定 JDBC 类型和 Java 类型如何转换。
+
+​		forceBigDecimals：控制是否强制将 DECIMAL 和 NUMERIC 类型的 JDBC 字段转换为 Java 类型的 BigDecimal ，默认为 false。
+
+
+
+javaModelGenerator标签：
+
+​		控制生成的实体类，根据 context 标签中配置的 defaultModelType 属性值的不同，一个表可能会对应生成多个不同的实体类。
+
+​		targetPackage：生成实体类存放的报名，一般都是放在该包下，实际还会受到其他配置的影响。
+
+​		targetProject：指定目标项目路径，可以使用相对路劲或绝对路径。
+
+​		通过 property 子标签可以配置的属性
+
+​				constructorBased：该属性只对 MyBatis3 有效，如果为 true 就会使用构造方法入参，如果为 false 就会使用 setter方式。默认为 false。
+
+​				enableSubPackages：如果为 true。会根据 catalog 和schema 来生成子包。如果为 false 就会直接使用 targetPackage 属性。默认为 false。
+
+​				immutable：用来配置实体类属性是否可变。如果设置为 true，那么 constructorBased 不管设置成什么。都会使用构造方法入参，并且不会生成 setter 		方法，如果为 false ，实体类属性就可以改变，默认为 false。
+
+​				rootClass：设置所有实体类的基类。如果设置，则需要使用类的全限定名称。并且，如果能够加载 rootClass ，那么不会覆盖和父类中完全匹配的属		性。
+
+​				trimStrings：判断是否对数据库查询结果进行 trim 操作，默认值为 false。如果为 true 则，生成代码如下：
+
+```java
+public void setRoleName(String roleName) 
+{
+        this.roleName = roleName == null ? null : roleName.trim();
+}
+```
+
+ 
+
+sqlMapGenerator标签：
+
+​		用于配置 SQL 映射生成器（mapper.xml）的属性。
+
+​		如果 targetRuntime 设置为 MyBatis3 ，则只有当 javaClientGenerator 配置需要 XML 时，该标签才必须配置一个，如果没有配置 javaClientGenerator：
+
+​				如果指定了一个 sqlMapGenerator，那么将只生成 XML 的SQL映射文件和实体类。
+
+​				如果没有指定 sqlMapGenerator，那么将只生成实体类。
+
+​		targetPackage：生成SQL映射文件存放的报名。
+
+​		targetProject：指定目标项目路径，可以使用相对路径或绝对路径。
+
+​		可以通过 property 子标签配置 eanbleSubPackages，如果为 true，会根据 catalog 和schema 来生成子包，如果为 false 就会直接用 targetPackage 属性，默认为 false。
+
+
+
+javaClientGenerator标签：
+
+​		配置 Java 客户端生成 （mapper 接口）的属性。
+
+​		type：用于选择客户端代码生成器，可以自定义实现，需要继承 AbstractJavaClientGenerator 类，必须有一个默认空的构造方法。提供了一下预设的代码生成器，首先根据 context 的 targetRuntime 分成两类：
+
+​				MyBatis3：
+
+​						ANNOTATEDMAPPER：基于注解的 Mapper 接口，不会有对应的 XML 映射文件。
+
+​						MIXEDMAPPER：XML 和注解的混合形式。
+
+​				MyBatis3Simple：
+
+​						ANNOTATEDMAPPER：基于注解的 Mapper 接口，不会有对应的XML映射文件。
+
+​						XMLMAPPER：所有的方法都在XML中，接口调用依赖XML文件。
+
+​		targetPackage：生成Mapper接口存放的包名。
+
+​		targetProject：指定目标项目路径。
+
+​		implementationPackage：如果指定该属性，Mapper接口的实现类就会生成在这个属性指定的包中。
+
+
+
+table标签：
+
+​		拥有配置需要通过生辰的数据库的表，只有在其中配置过的表，才能生成最终的代码。
+
+​		必选属性 tableName：指定要生成的表名，可以使用通配符匹配多个表。如果需要匹配全部表：
+
+```xml
+<table tableName="%" />
+```
+
+​		schema：数据库的schema，可以使用 SQL 通配符匹配，如果设置了改制，生成的 SQL 的表名会变成 schame.tableName 的形式。
+
+​		catalog：数据库的 catalog，如果设置了该值，生成 SQL 的表名会变成 catalog.tableName 的形式。
+
+​		alias：如果指定，这个值会用在生成的 select查询SQL表的别名和列名上。
+
+​		domainObjectName：生成对象的基本名称。如果没有指定，会自动根据表明来生成名称。
+
+​		enableXXX：XXX代表多种 SQL 方法，该属性用来指定是否生成对应的 XXX 语句。
+
+​		selectByPrimaryKeyQueryId：DBA跟踪工具中会用到。
+
+​		selectByExampleQueryId：DBA跟踪工具中会用到。
+
+​		modelType：和 context 的 defaultModelType 含义一样，这里可以针对表配置，会覆盖 context 的 defaultModelType。
+
+​		escapeWildCards：查询列是否对 schema 和表名中的 SQL 通配符 进行转义。对于某些驱动，当 schema 或表名中包含 SQL 通配符时，转义是必须的。有一些驱动则需要将下划线进行转义。
+
+​		delimitIdentifiers：是否给标识符增加分隔符。默认为 false，当 catalog、schema、或tableName 中包含空白时，默认为 true。
+
+​		delimitAllcolumns：是否对所有列添加分隔符，默认为 false。
+
+table 下的子标签：
+
+property：
+
+​		constructorBased：和 javaModelGenerator 中的属性含义一样。
+
+​		ignoreQualifiersAtRuntime：生成的 SQL 中的表名将不会包含 schema 和 catalog 前缀。
+
+​		immutable：和 javaModelGenerator 中的属性含义一样。
+
+​		modelOnly：配置是否值生成实体类，如果设置为 true ，就不会有 Mapper 接口，同时还会覆盖属性中的 enableXXX 方法，并且不会生成任何 CRUD 方法。如果配置了 sqlMapGenerator，并且 modelOnly 为 true ，那么 XML映射文件中只有实体对象的映射标签（resultMap）。
+
+​		rootClass：和 javaModelGenerator 中的属性含义一样。
+
+​		rootInterface：和 javaModelGenerator 中的属性含义一样。
+
+​		runtimeCatalog：运行时的 catalog ，当生成表和运行环境表的 catalog 不一样时，可以使用该属性进行配置。
+
+​		runtimeSchema：运行时的 schema，当生成表和运行环境表的 schema 不一样时，可以使用该属性进行配置。
+
+​		runtimeTableName：运行时的 tableName，当生成表和运行环境表的 tableName 不一样时，可以使用该属性进行配置。
+
+​		selectAllOrderByClause：该属性值会追加到 selectAll 方法后的 SQL 中，直接与 order by 拼接后添加到 SQL 末尾。
+
+​		useActualColumnNames：如果设置为 true，那么会使用从数据库元数据获取的列名作为生成的实体对象的属性。如果为 false，将会尝试将返回的名称转换为驼峰实行。在这两种情况下，可以通过 columnOverride 标签显示指定，此时将会忽略该属性。
+
+​		useColumnIndexes：如果为 true，生成resultMaps 时会使用列的索引，而不是结果中列名的顺序。
+
+​		useCompoundPropertyName：如果为 true ，生成属性名的时候会将列名和列备注连接起来。
+
+
+
+generatedKey（0或1个）：指定自动生成主键的属性。如果指定这个标签，生成的 insert 的 SQL 映射文件中插入一个 selctKey 标签。
+
+​		column：生成列的列名。
+
+​		sqlStatement：返回新值的 SQL 语句，如果这是一个 identity 列，则可以使用其中一个预定义的特殊值（Cloudscape、DB2、DB2_MF、Derby、HSQLDB、Informix、MySQL、SQL  Server、SYBASE、JDBC：使用这个值时，MyBatis会使用 JDBC 标准接口来获取值，这是一个独立于数据库获取标识列中的值的方法）
+
+​		identity：当设置为 true 时，该列会被标记为 identity 列，并且 selectKey 标签会被插入到 insert后面，如果为 false，selectKey 会被插入到 insert之前。即使 type 属性指定为 post ，仍然需要将 identity 列设置为 true，这会作为从插入列表中删除该列的标志。该属性默认值为 false。
+
+​		type：type = post 且 identity = true 时，生成的 selectKey 中的 order = AFTER。type = pre 时， identity只能为 false，生成的 selectKey 中 order = before。自动增长的列只有插入到数据库后才能获取ID，所以是 after，使用序列时，只有先获取序列之后才能插入数据库，所以是before。
+
+
+
+columnRenamingRule：最多配置一个，在生成列之前对列进行重命名。
+
+​		searchString：定义将要被替换的字符串对策正则表达式。
+
+​		replaceString：替换搜索字符串列每一个匹配项的字符串。如果没有指定，就是用空字符串。
+
+
+
+columnOverride：将某些默认计算的属性值更改为指定的值。可以配置多个。
+
+​		column：重写的列名
+
+​		property：要使用的 Java 属性的名称。如果没有指定，会根据列名生成。
+
+​		javaType：列的属性值为完全限定的 Java 类型。如果需要，可以覆盖由 JavaTypeResolver计算出的类型。
+
+​		jdbcType：列的 JDBC 类型
+
+​		typeHandler：根据用户定义的需要用来处理列的类型处理器。必须是一个继承自 TypeHandler 接口的全限定的类名。如果没有指定或者是空白，会用默认的类型处理器来处理类型。
+
+​		delimitedColumnName：是否应在生成的 SQL 的列名称上增加分隔符。如果列名中包含空格，会自动添加分隔符。只有当列名需要被强制为一个合适的名字或者列名是数据库中的保留字时，才是必要的。
+
+
+
+ignoreColumn：用来屏蔽不需要生成的列。
+
+​		column：要忽略的列名。
+
+​		delimitedColumnName：标识匹配列名的时候是否区分大小写。
+
+
+
+​		
+
+
+
+​		
+
+
 
 # 四、整合Spring、MyBatis
 
@@ -8191,6 +8582,207 @@ Locale：${pageContext.response.locale}
 </html>
 ```
 
+# SSM
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<beans xmlns="http://www.springframework.org/schema/beans"
+       xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+       xmlns:context="http://www.springframework.org/schema/context"
+       xmlns:tx="http://www.springframework.org/schema/tx" xmlns:p="http://www.springframework.org/schema/p"
+       xmlns:mvc="http://www.springframework.org/schema/mvc" xmlns:c="http://www.springframework.org/schema/c"
+       xmlns:cache="http://www.springframework.org/schema/cache"
+       xsi:schemaLocation="http://www.springframework.org/schema/beans http://www.springframework.org/schema/beans/spring-beans.xsd http://www.springframework.org/schema/context http://www.springframework.org/schema/context/spring-context.xsd http://www.springframework.org/schema/cache http://www.springframework.org/schema/cache/spring-cache.xsd http://www.springframework.org/schema/task http://www.springframework.org/schema/task/spring-task.xsd http://www.springframework.org/schema/tx http://www.springframework.org/schema/tx/spring-tx.xsd http://www.springframework.org/schema/mvc http://www.springframework.org/schema/mvc/spring-mvc.xsd">
+
+    <context:property-placeholder location="classpath:database.properties" />
+    <context:annotation-config />
+    <mvc:annotation-driven />
+
+
+    <context:component-scan base-package="com.shanji.*" />
+    <bean id="viewResolver" class="org.springframework.web.servlet.view.InternalResourceViewResolver" p:prefix="/" p:suffix=".jsp" />
+
+    <mvc:interceptors>
+        <mvc:interceptor>
+            <mvc:mapping path="/**/**"/>
+            <bean class="org.springframework.web.servlet.i18n.LocaleChangeInterceptor">
+                <property name="paramName" value="language" />
+            </bean>
+        </mvc:interceptor>
+    </mvc:interceptors>
+    <mvc:annotation-driven>
+        <mvc:message-converters register-defaults="true">
+            <bean class="org.springframework.http.converter.StringHttpMessageConverter">
+                <constructor-arg value="UTF-8" />
+            </bean>
+        </mvc:message-converters>
+    </mvc:annotation-driven>
+
+    <bean id="dataSource" class="com.alibaba.druid.pool.DruidDataSource" destroy-method="clone">
+            <property name="username" value="${database.username}" />
+            <property name="password" value="${database.password}" />
+            <property name="driverClassName" value="${database.driver}" />
+            <property name="url" value="${database.url}" />
+            <property name="filters" value="${database.filters}"/>
+
+            <!-- 最大并发连接数 -->
+            <property name="maxActive" value="${database.maxActive}"/>
+
+            <!-- 初始化连接数量 -->
+            <property name="initialSize" value="${database.initialSize}"/>
+
+            <!-- 配置获取连接等待超时的时间 -->
+            <property name="maxWait" value="${database.maxWait}"/>
+
+            <!-- 最小空闲连接数 -->
+            <property name="minIdle" value="${database.minIdle}"/>
+
+            <!-- 最大空闲连接数 -->
+            <property name="maxIdle" value="${database.maxIdle}"/>
+
+            <!-- 配置间隔多久才进行一次检测，检测需要关闭的空闲连接，单位是毫秒 -->
+            <property name="timeBetweenEvictionRunsMillis" value="${database.timeBetweenEvictionRunsMillis}"/>
+
+            <!-- 配置一个连接在池中最小生存的时间，单位是毫秒 -->
+            <property name="minEvictableIdleTimeMillis" value="${database.minEvictableIdleTimeMillis}"/>
+
+            <property name="validationQuery" value="${database.validationQuery}"/>
+            <property name="testWhileIdle" value="${database.testWhileIdle}"/>
+            <property name="testOnBorrow" value="${database.testOnBorrow}"/>
+            <property name="testOnReturn" value="${database.testOnReturn}"/>
+            <property name="maxOpenPreparedStatements" value="${database.maxOpenPreparedStatements}"/>
+
+            <!-- 超过时间限制是否回收 -->
+            <property name="removeAbandoned" value="${database.removeAbandoned}"/>
+
+            <!-- 1800 秒，也就是 30 分钟 -->
+            <property name="removeAbandonedTimeout" value="${database.removeAbandonedTimeout}"/>
+
+            <!-- 关闭 abanded 连接时输出错误日志 -->
+            <property name="logAbandoned" value="${database.logAbandoned}"/>
+    </bean>
+
+    <bean id="sqlSessionFactory" class="org.mybatis.spring.SqlSessionFactoryBean">
+        <property name="dataSource" ref="dataSource" />
+        <property name="mapperLocations" value="classpath*:com/shanji/**/*.xml" />
+    </bean>
+
+
+    <bean id="transactionManager" class="org.springframework.jdbc.datasource.DataSourceTransactionManager">
+        <property name="dataSource" ref="dataSource" />
+    </bean>
+
+    <tx:annotation-driven transaction-manager="transactionManager" />
+
+    <bean id="sqlSessionTemplate" class="org.mybatis.spring.SqlSessionTemplate">
+        <constructor-arg ref="sqlSessionFactory" />
+    </bean>
+
+    <bean class="org.mybatis.spring.mapper.MapperScannerConfigurer">
+        <property name="basePackage" value="com.shanji" />
+        <property name="sqlSessionFactoryBeanName" value="sqlSessionFactory" />
+        <property name="annotationClass" value="org.springframework.stereotype.Repository" />
+    </bean>
+
+    <bean id="multipartResolver" class="org.springframework.web.multipart.support.StandardServletMultipartResolver" />
+
+</beans>
+```
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+
+<web-app version="3.0"
+        xmlns="http://java.sun.com/xml/ns/javaee"
+        xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+        xsi:schemaLocation="http://java.sun.com/xml/ns/javaee
+        http://java.sun.com/xml/ns/javaee/web-app_3_0.xsd">
+  <display-name>Archetype Created Web Application</display-name>
+  
+  <context-param>
+      <param-name>contextConfigLocation</param-name>
+      <param-value>classpath:applicationConetxt.xml</param-value>
+    </context-param>
+
+    <!-- 加载log4j的配置文件log4j.properties -->
+    <context-param>
+      <param-name>log4jConfigLocation</param-name>
+      <param-value>classpath:log4j2.properties</param-value>
+    </context-param>
+
+    <!-- 设定刷新日志配置文件的时间间隔，这里设置为10s -->
+    <context-param>
+      <param-name>log4jRefreshInterval</param-name>
+      <param-value>10000</param-value>
+    </context-param>
+
+
+    <filter>
+      <filter-name>encodingFilter</filter-name>
+      <filter-class>org.springframework.web.filter.CharacterEncodingFilter</filter-class>
+      <init-param>
+        <param-name>encoding</param-name>
+        <param-value>UTF-8</param-value>
+      </init-param>
+      <init-param>
+        <param-name>forceEncoding</param-name>
+        <param-value>true</param-value>
+      </init-param>
+    </filter>
+    <filter-mapping>
+      <filter-name>encodingFilter</filter-name>
+      <url-pattern>*.do</url-pattern>
+    </filter-mapping>
+
+
+
+    <!-- 加载Spring框架中的log4j监听器Log4jConfigListener -->
+    <listener>
+      <listener-class>
+        org.springframework.web.util.Log4jConfigListener
+      </listener-class>
+    </listener>
+
+    <!--<listener>
+      <listener-class>org.springframework.web.context.ContextLoaderListener</listener-class>
+    </listener>-->
+    <servlet>
+      <servlet-name>dispatcher</servlet-name>
+      <servlet-class>org.springframework.web.servlet.DispatcherServlet</servlet-class>
+      <init-param>
+        <param-name>contextConfigLocation</param-name>
+        <param-value>classpath:applicationConetxt.xml</param-value>
+      </init-param>
+      <load-on-startup>2</load-on-startup>
+      <multipart-config>
+        <location>E:\upload\mybatisspring</location>
+        <max-file-size>5242880</max-file-size>
+        <max-request-size>10485760</max-request-size>
+        <file-size-threshold>0</file-size-threshold>
+      </multipart-config>
+    </servlet>
+    <servlet>
+      <servlet-name>DruidStatView</servlet-name>
+      <servlet-class>com.alibaba.druid.support.http.StatViewServlet</servlet-class>
+    </servlet>
+
+    <servlet-mapping>
+      <servlet-name>dispatcher</servlet-name>
+      <url-pattern>*.do</url-pattern>
+    </servlet-mapping>
+
+    <servlet-mapping>
+      <servlet-name>DruidStatView</servlet-name>
+      <url-pattern>/druid/*</url-pattern>
+    </servlet-mapping>
+    <welcome-file-list>
+      <welcome-file>/qrcode.jsp</welcome-file>
+    </welcome-file-list>
+</web-app>
+```
+
+
+
 # 六、Redis
 
 ​		一般而言Redis在 Java  Web应用中存在两个主要的场景：
@@ -8630,6 +9222,22 @@ ApplicationContext applicationContext = new ClassPathXmlApplicationContext("appl
         printList(redisTemplate,"list1");
         printList(redisTemplate,"list2");
 ```
+
+​		链表的底层并不是一个简单的`LinkedList`，而是一个被称为快速链表的结构，当元素较少的情况，会使用一块连续的内存存储，这个结构被称为`ZipList`，
+
+它将所有元素彼此紧挨着一起存储。当元素比较多的时候才会改成快速链表，因为普通的链表需要附加的指针空间太大，会浪费空间，加重内存的碎片化，所有
+
+`Redis`将链表和`ZipList`结合起来组成快速链表，也就是将多个`ZipList`使用双向指针串起来使用。
+
+![](image/QQ截图20211209161322.png)
+
+
+
+
+
+
+
+
 
 ### 4、集合
 
@@ -9522,6 +10130,36 @@ end
 
 ​		如果将beforeInvocation属性设置为false，那么在方法内还是能读取到缓存服务器的数据，即在方法执行后删除缓存。如果设置为true，则会在方法执行前删除缓存。
 
+
+
+## 分布式锁
+
+​		分布式锁本质上要实现的目标就是在`Redis`中占一个坑，当另一个线程来占坑时，发现坑里有值时，只能放弃或者稍后重试。
+
+​		在`Redis 2.8`版本之后，通常使用`set`指令的扩展参数来实现分布式锁，即设值和过期时间是原子性的：
+
+```shell
+set id true ex 5 nx
+
+del id
+```
+
+​		上面的方式存在一定的问题，即不能解决超时的问题。如果在加锁和释放锁之间的逻辑执行需要的时间很长，超出了锁的超时限制，锁就会被提前释放，此时
+
+会出现并发问题。
+
+​		为了解决这个问题，通常要求分布式锁不能用于较长时间的任务。
+
+
+
+
+
+
+
+
+
+
+
 # 七、高并发
 
 ​		负载均衡的功能：
@@ -9577,4 +10215,176 @@ select id,user_id as uesrId,amount,send_date as sendDate,total,unit_amount as un
 ​				1、按时间戳充入，也就是在一定时间内，不成功的会循环到成功为止，直至超过		时间戳，不成功才会退出，返回失败。
 
 ​				2、按次数。
+
+# JWT
+
+## 1、认证流程
+
+**传统的session认证**：
+
+​		http协议本身是一种无状态的协议，而这就意味着如果用户向我们的应用提供了用户名和密码来进行用户认证，那么下一次请求时，用户还要再一次进行用户认证才行，因为根据http协议，我们并不能知道是哪个用户发出的请求，所以为了让我们的应用能识别是哪个用户发出的请求，我们只能在服务器存储一份用户登录的信息，这份登录信息会在响应时传递给浏览器，告诉其保存为cookie，以便下次请求时发送给我们的应用，这样我们的应用就能识别请求来自哪个用户了,这就是传统的基于session认证。
+
+**弊端**：
+
+​		session：每个用户经过我们的应用认证之后，我们的应用都要在服务端做一次记录，以方便用户下次请求的鉴别，通常而言session都是保存在内存中，而随着认证用户的增多，服务端的开销会明显增大。
+
+​		扩展性： 用户认证之后，服务端做认证记录，如果认证的记录被保存在内存中的话，这意味着用户下次请求还必须要请求在这台服务器上,这样才能拿到授权的资源，这样在分布式的应用上，相应的限制了负载均衡器的能力。这也意味着限制了应用的扩展能力。
+
+​		CSRF：因为是基于cookie来进行用户识别的， cookie如果被截获，用户就会很容易受到跨站请求伪造的攻击。
+
+
+
+![](image/QQ截图20201010144117.png)
+
+**JWT认证过程**：
+
+​		JWT： (JSON Web Token)，一个开放标准(RFC 7519)，它定义了一种紧凑且自包含的方式，以JSON对象的形式在各方之间安全地传输信息。可以验证和信任
+
+该信息，因为它是数字签名的。JWTs可以使用秘密(使用HMAC算法)或使用RSA或ECDSA的公钥/私钥对签名。
+
+**流程：**
+
+​		首先，前端通过Web表单将自己的用户名和密码发送到后端的接口。这一过程一般是一个HTTP POST请求。建议的方式是通过SSL加密的传输(https协议)从而
+
+避免敏感信息被嗅探。
+
+​		后端核对用户名和密码成功后，将用户的id等其他信息作为JWT Payload(负载)，将其与头部分别进行Base64编码拼接后签名，形成一个JWT。形成的JWT就是
+
+一个形同xxx.xxx.xxx的字符串。
+
+​		后端将JWT字符串作为登录成功的返回结果返回给前端。前端可以将返回的结果保存在localStorage或sessionStorage上，退出登录时前端删除保存的JWT即
+
+可。
+		前端在每次请求时将JWT放入HTTP Header中的Authorization位。(解决XSS和XSRF问题)
+
+​		后端检查是否存在，如存在验证JWT的有效性。例如，检查签名是否正确，检查Token是否过期;检查Token的接收方是否是自己(可选)。
+
+​		验证通过后后端使用JWT中包含的用户信息进行其他逻辑操作，返回相应结果。
+
+
+
+## 2、结构
+
+组成：
+
+​		1、标头（Header）：由两部分组成，令牌的类型和所使用的的签名算法。然后使用 Base64（编码方式，可以被还原，并不是加密过程） 编码组成 JWT 结构的第一部分。
+
+```json
+{
+    "alg" : "HS256",
+    "typ" : "JWT"
+}
+```
+
+​		2、有效荷载（Payload）：其中包含声明。声明是有关实体和其他数据的声明。同样会使用 Base 64 编码组成 JWT 的第二部分。此部分不应该包含敏感数据。
+
+```json
+{
+    "sub" : "123456789",
+    "name" : "xiaoshanshan",
+    "admin" : true
+}
+```
+
+​		3、签名（Signature）：需要使用编码后的 header 和 payload 以及我们提供的一个密钥，然后使用 header 中指定的签名算法进行签名。作用是保证 JWT 没有被篡改过。 
+
+​		**通常表示如下：xxx.yyy.zzz（Header.Payload.Signature）**
+
+
+
+## 3、生成token
+
+```xml
+	<dependency>
+      <groupId>com.auth0</groupId>
+      <artifactId>java-jwt</artifactId>
+      <version>3.10.3</version>
+    </dependency>
+```
+
+```java
+		String secret = "@xiaoshanshan";  //密钥
+
+        String id = UUID.randomUUID().toString();
+
+        Calendar instance = Calendar.getInstance();
+        instance.add(Calendar.SECOND,30);
+
+        Map<String, Object> head = new HashMap<>();
+        String token = JWT.create()
+                .withHeader(head) // header
+                .withClaim("id", id) // payload
+                .withClaim("name","xiaoshanshan")
+                .withExpiresAt(instance.getTime()) //过期时间
+                .sign(Algorithm.HMAC256(secret)); //signature
+
+        System.out.println(token);
+
+
+eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJuYW1lIjoieGlhb3NoYW5zaGFuIiwiaWQiOiJhNTNlNmViYS0yYWZlLTQxYTQtYWRjZC1mZjBmYjQ4YzQ1MzciLCJleHAiOjE2MDI0MjM1MzR9.3rQUXsSNFttC6L50bWyxVg1_GFMb8siNkJja6nP9ERI
+```
+
+## 4、验证、解析
+
+```java
+		// 先验签，在解码
+		JWTVerifier build = JWT.require(Algorithm.HMAC256(secret)).build();
+        DecodedJWT verify = build.verify(token);
+        System.out.println(verify.getClaim("id").asString()); // 获取payload信息，存的 xx 类型，这里就要调用 asxx 方法，否则会返回 null
+        System.out.println(verify.getClaim("name").asString());
+		System.out.println(verify.getExpiresAt()); // 获取过期时间
+```
+
+​		常见异常：
+
+​				1、SignatureVerificationException：签名不一致异常
+
+​				2、TokenExpiredException：令牌过期异常
+
+​				3、AlgorithmMismatchException：算法不匹配异常
+
+​				4、InvalidClaimException：失效的payload异常
+
+```java
+public class JWTUtil
+{
+    private static final String SECRET = "@xiaoshanshan";
+
+    public static String getToken(Map<String,String> map)
+    {
+        JWTCreator.Builder builder = JWT.create();
+        map.forEach((k,v)->
+        {
+            builder.withClaim(k,v);
+        });
+
+        Calendar calendar = Calendar.getInstance();
+        calendar.add(Calendar.DATE,7);
+
+        builder.withExpiresAt(calendar.getTime());
+        String token = builder.sign(Algorithm.HMAC256(SECRET));
+        return token;
+    }
+
+    public static DecodedJWT verify(String token)
+    {
+        JWTVerifier build = JWT.require(Algorithm.HMAC256(SECRET)).build();
+        return build.verify(token);
+    }
+}
+```
+
+
+
+  
+
+
+
+
+
+
+
+
+
+
 
