@@ -10152,6 +10152,272 @@ del id
 
 
 
+## 队列
+
+​		`Redis`的`list`数据结构可以作为异步消息队列使用，用`rpush`和`lpush`操作入队列，用`lpop`和`rpop`操作出队列。但这个消息队列并不是专业的消息队列，
+
+没有`ack`保证，不适合对消息的可靠性有极高要求的场景。
+
+​		它可以支持多个生产者和多个消费者并发进出消息，每个消费者拿到的消息都是不用的列表元素。
+
+​		在消费消息时，客户端通常是使用循环读取，在队列为空时，循环依然会继续执行，这不仅会拉高客户端的`CPU`消耗，`Redis`的`QPS`也会被拉高。可以在循
+
+环中使线程睡眠来解决，但是消息的延迟会增大。还可以`blpop`和`brpop`来替换上面的`lpop`和`rpop`来进行出队列操作。使用这两个指令时，如果队列中没有消息
+
+时，则会进入阻塞状态，等有数据之后会被唤醒，相比起在循环中睡眠，这种方式消息的延迟几乎为`0`。此时，如果线程阻塞，`Redis`会主动断开连接，以减少闲
+
+置资源占用，此时`blpop`和`brpop`会抛出异常，此时客户端需要有重连机制。
+
+
+
+### 实现队列的方式
+
+#### List
+
+​		这种方式是最简单的方式，利用`list`的特性，可以使用阻塞指令来避免`CPU`空转的问题。属于**拉模型**。
+
+​		存在的问题：
+
+​				1、不支持重复消费：即一个消息被拉取后，就会从`list`中删除，无法被其他消费者再次消费，即不支持多个消费者消费同一批数据。
+
+​				2、消息丢失：消费者在拉取消息后，因为某些原因异常宕机，则这条消息就丢失了。
+
+​				3、消息积压：如果消费者消费的速度赶不上生产者生产的速度，则`list`中的消息会越来越多，造成内存的急剧增长。
+
+
+
+#### 发布订阅
+
+​		这种方式解决了上面的重复消费问题，支持多个生产者或消费者处理消息。属于**推模型**。
+
+​		发布订阅模式在实现时非常简单，它没有基于任何数据类型，也没有做任何的数据存储，它只是单纯地为生产者、消费者建立数据转发通道，把符合规则的数
+
+据，从一端转发到另一端。在整个过程中，没有任何的数据存储，一切都是实时转发的。
+
+​				消息丢失：如果消费者异常下线，重现上线后，只能接收到新的消息，在下线期间生产者发布的消息会丢失。如果使用这种方式：**消费者必须先订阅队**
+
+​		**列，生产者才能发布消息，否则消息会丢失**。并且因为整个过程不进行任何的数据存储，所以在`Redis`宕机后，数据 也会丢失。
+
+​				消息积压：每个消费者订阅一个队列时，`Redis`都会在`Server`上给这个消费者在分配一个缓冲区，这个缓冲区其实就是一块内存。当生产者发布消息
+
+​		时，`Redis`先把消息写到对应消费者的缓冲区中。之后，消费者不断地从缓冲区读取消息，处理消息。这个缓冲区其实是有上限的`(`可配置`)`，如果消费者
+
+​		拉取消息很慢，就会造成生产者发布到缓冲区的消息开始积压，缓冲区内存持续增长。如果超过了缓冲区配置的上限，此时，`Redis`就会强制把这个消费者
+
+​		踢下线这时消费者就会消费失败，也会丢失数据。
+
+
+
+#### Stream
+
+​		这种方式，可以很好的解决消息丢失的问题，在生产者发布消息时，会生成一个消息的唯一`ID`，除第一次拉取消息时，其余的拉取操作都需要传入上一次拉
+
+取的消息的`ID`。同时支持发布`/`订阅模式，即多个消费者可以消费同一批数据。
+
+​		除了拉取消息时用到了消息`ID`，为了保证重新消费，也要用到这个消息`ID`。当一组消费者处理完消息后，需要执行`XACK`命令告知`Redis`，这时`Redis`就会
+
+把这条消息标记为处理完成。如果没有收到`XACK`命令，则`Redis`会保留这条消息。
+
+​		`Stream`是新增加的数据类型，它与其它数据类型一样，每个写操作，也都会写入到`RDB`和`AOF`中，只需要配置好持久化策略，这样的话，就算`Redis`宕机重
+
+启，`Stream`中的数据也可以从`RDB`或`AOF`中恢复回来。
+
+​		当消息队列发生消息堆积时，一般只有`2`个解决方案：
+
+​				生产者限流：避免消费者处理不及时，导致持续积压。
+
+​				丢弃消息：中间件丢弃旧消息，只保留固定长度的新消息。
+
+​		而`Redis`在实现`Stream`时，采用了第`2`个方案。在发布消息时，你可以指定队列的最大长度，防止队列积压导致内存爆炸。当队列长度超过上限后，旧消息
+
+会被删除，只保留固定长度的新消息。此时也会存在消息丢失的情况。
+
+
+
+​		`Redis`在以下场景下，都会导致数据丢失：
+
+​				`AOF`持久化配置为每秒写盘，但这个写盘过程是异步的，`Redis`宕机时会存在数据丢失的可能。
+
+​				主从复制也是异步的，主从切换时，也存在丢失数据的可能`(`从库还未同步完成主库发来的数据，就被提成主库`)`。
+
+​		基于以上原因，**`Redis`本身的无法保证严格的数据完整性**。
+
+​				
+
+​				
+
+
+
+
+
+
+
+
+
+### 延迟队列
+
+​		延迟队列可以通过`Redis`的`zset`来实现，将消息序列化成一个字符串作为`zset`的`value`，消息的到期时间作为`score`，然后用多个线程轮询`zset`获取到期
+
+的任务进行处理。由于有多个线程，所以需要考虑并发争抢任务，确保任务不会被多次执行。`Redis`的`zrem`方法是争抢任务的关键，它的返回值决定了有没有抢
+
+到任务。
+
+```java
+public class RedisDelayingQueue<T> {
+    static class TaskItem<T>{
+        private String id;
+        private T msg;
+
+        public String getId() {
+            return id;
+        }
+
+        public void setId(String id) {
+            this.id = id;
+        }
+
+        public T getMsg() {
+            return msg;
+        }
+
+        public void setMsg(T msg) {
+            this.msg = msg;
+        }
+    }
+
+    private Jedis jedis;
+    private String queueKey;
+
+    public RedisDelayingQueue(Jedis jedis,String queueKey){
+        this.jedis = jedis;
+        this.queueKey = queueKey;
+    }
+
+    public void delay(T msg) throws Exception{
+
+        TaskItem<T> task = new TaskItem<>();
+        task.setId(UUID.randomUUID().toString());
+        task.setMsg(msg);
+
+        String s = JsonUtil.ToJsonStr(task);
+        jedis.zadd(queueKey, System.currentTimeMillis() + 5000,s);
+    }
+
+    public void loop() throws Exception{
+        while (!Thread.interrupted()){
+            List<String> values = jedis.zrangeByScore(queueKey, 0, System.currentTimeMillis(), 0, 1);
+
+            if(values.isEmpty()){
+                try {
+                    TimeUnit.MILLISECONDS.sleep(500);
+                }
+                catch (InterruptedException e){
+                    break;
+                }
+                continue;
+            }
+
+            String s = values.iterator().next();
+            if(jedis.zrem(queueKey,s) > 0){
+                TaskItem<T> task = (TaskItem<T>)JsonUtil.ToEntity(s, TaskItem.class);
+                this.handleMsg(task.getMsg());
+            }
+        }
+    }
+
+    public void handleMsg(T msg){
+        System.out.println(msg);
+    }
+
+
+    public static void main(String[] args) throws Exception{
+        Jedis jedis = new Jedis("127.0.0.1",6379);
+        jedis.auth("");
+
+        RedisDelayingQueue<String> queue = new RedisDelayingQueue<>(jedis,"q-xiaoshanshan");
+        Thread producer = new Thread(){
+            @Override
+            public void run(){
+                for(int i = 0 ; i < 10 ; i++){
+                    try {
+                        queue.delay("codehole" + i);
+                    }
+                    catch (Exception e){
+                        e.printStackTrace();
+                    }
+                }
+            }
+        };
+
+        Thread consumer = new Thread(){
+            @Override
+            public void run(){
+                try {
+                    queue.loop();
+                }
+                catch (Exception e){
+                    e.printStackTrace();
+                }
+            }
+        };
+
+        producer.start();
+        consumer.start();
+
+        try {
+            producer.join();
+            TimeUnit.MILLISECONDS.sleep(6000);
+            consumer.interrupt();
+            consumer.join();
+        }
+        catch (Exception e){
+        }
+    }
+}
+```
+
+​		上面的实现方式中，同一个任务可能被多个线程获取后在使用`zerm`进行争抢，没有抢到的线程就浪费了一次机会，可以使用`lua scripting`来优化，将
+
+`zrangebyscore`和`zerm`一同挪到服务端进行原子话操作。
+
+
+
+
+
+
+
+​		
+
+## 位图
+
+​		位图的最小单位是`bit`，每个`bit`的取值只能是`0`或`1`。`Redis`中的位图并不是特殊的数据结构，它的内容其实是普通的字符串，即`byte`数组。可以使用
+
+`get/set`来设置整个位图的内容，也可以使用`getbit/setbit`等将`byte`数组看成位数组来处理。
+
+​		`Redis`的位数组时自动扩充的，如果设置了某个便宜位置超出了现有的内容范围，就会自动将位数组进行零扩容。
+
+​		`Redis`提供了位图统计指令`bitcount`和位图查找指令`bitpos`。`bitcount`用来统计指定范围内的`1`的个数，`bitpos`用来查找指定范围内出现的第一个`0`或
+
+`1`。但这个范围是以字节为单位，即必须是`8`的倍数。
+
+​		`getbit/setbit`指定位的值都是单个位的，即一个只能指定或查询一个`bit`，如果一次想操作多个`bit`，可以使用`bitfield`指令，其有三个子指令：
+
+​				`get`：从指定位开始连续读取多个`bit`，可以设置读取结果的格式`(`有符号数或无符号数`)`。
+
+​				`set`：从指定位开始将连续多个`bit`设置为指定值。
+
+​				`incrby`：对指定范围的位进行自增操作。此操作可能会出现溢出。其提供了溢出子指令`overflow`，可以指定溢出行为，但`overflow`只会影响接下来的
+
+​		第一条指令，后序指令的溢出策略会变成默认值：
+
+​						`wrap`：默认行为，即将溢出的符号位丢弃。
+
+​						`fail`：报错，不执行。
+
+​						`sat`：保留在最大或最小值。
+
+
+
 
 
 
