@@ -9289,7 +9289,7 @@ ApplicationContext applicationContext = new ClassPathXmlApplicationContext("appl
 
 ### 5、有序集合
 
-​		有序集合和集合类似，和无序集合的区别在于每一个元素除了只之外，还多了一个分数，分数为浮点数，在 Java中是使用双精度表示的，根据分数，Redis就可以支持对分数从小到大或者从大到小的排序。跟无序集合一样，值不能重复，但是分数可以一样。
+​		有序集合和集合类似，和无序集合的区别在于每一个元素除了值之外，还多了一个分数，分数为浮点数，在 Java中是使用双精度表示的，根据分数，Redis就可以支持对分数从小到大或者从大到小的排序。跟无序集合一样，值不能重复，但是分数可以一样。
 
 ![](image/QQ截图20191128231432.png)
 
@@ -9581,7 +9581,7 @@ ApplicationContext applicationContext = new ClassPathXmlApplicationContext("appl
 
 ​		当**命令格式正确**，因为数据结构引起的错误，则该命令执行出现错误，而其之前和之后的命令都会被正常执行。
 
-### 2、监控事物
+### 2、监控事务
 
 ​		Redis中使用watch命令可以决定事务是执行还是回滚。
 
@@ -10475,6 +10475,136 @@ public class RedisDelayingQueue<T> {
 
 
 
+
+
+
+## 限流
+
+​		限流的目的是控制用户行为，避免垃圾请求。系统要限定用户的某个行为在规定的时间只能允许发生`N`此。
+
+
+
+### 简单限流
+
+​		使用一个利用`zset`实现一个滑动时间窗口，只保留窗口之内的数据，窗口之外的数据都可以删除。每一个行为都作为`zset`中的一个`key`保存下来，同一个
+
+用户的同一种行为用一个`zset`记录。
+
+![](image/QQ截图20211214162125.png)
+
+```java
+public class SimpleRateLimiter {
+    private Jedis jedis;
+
+    public SimpleRateLimiter(Jedis jedis){
+        this.jedis = jedis;
+    }
+
+    public boolean isActionAllowed(String userId,String actionKey,int period,int maxCount){
+        String key = String.format("hist:%s:%s", userId, actionKey); // 生成 zset 的 key 
+        long nowTs = System.currentTimeMillis();
+
+        Transaction transaction = jedis.multi();
+        transaction.zadd(key,nowTs,"" + nowTs); // 第二个参数为 zset 的 score ，最后一个参数为 zset 的value
+        transaction.zremrangeByScore(key,0,nowTs - period * 1000); // 移除 0 ~ nowTs - period * 1000 之间的元素，即只保留限制时间内的元素
+        Response<Long> count = transaction.zcard(key); // 获取移除后，元素的个数
+        transaction.expire(key,period + 1); // 设置键的过期时间，即如果限制时间内，没有收到相同的请求，则删除对应的 zset ，以
+        transaction.exec();
+        return count.get() <= maxCount;
+    }
+}
+```
+
+
+
+### 漏斗限流
+
+​		漏斗中已使用的空间代表用户已经进行的行为，剩余空间代表当前行为可以持续进行的数量，漏斗的流水速度代表着系统允许该行为的最大频率。
+
+​		单击版：
+
+```java
+public class FunnelRateLimiter {
+
+    private Map<String,Funnel> funnels = new HashMap<>();
+
+    public boolean isActionAllowed(String userId,String actionKey,int capacity,float leakingRate){
+        String key = String.format("%s:%s", userId, actionKey);
+        Funnel funnel = funnels.get(key);
+        if(funnel == null){
+            funnel = new Funnel(capacity,leakingRate);
+            funnels.put(key,funnel);
+        }
+        return funnel.watering(1);
+    }
+
+
+
+    static class Funnel{
+        private int capacity;
+        private float leakingRate;
+        private int leftQuota;
+        private long leakingTs;
+
+        public Funnel(int capacity,float leakingRate){
+            this.capacity = capacity; // 漏斗的容量
+            this.leakingRate = leakingRate; // 漏水速度
+            this.leftQuota = capacity; // 剩余空间
+            this.leakingTs = System.currentTimeMillis(); // 漏水时间
+        }
+
+        void makeSpace(){
+            long nowTs = System.currentTimeMillis();
+            long deltaTs = nowTs - leakingTs; // 距离上一次漏水的时间
+            int deltaQuota = (int)(deltaTs * leakingRate); // 计算相邻行为发生之间腾出的空间
+			
+            // 间隔时间太长，整数数字过大溢出，即水漏完了
+            if(deltaQuota < 0){
+                this.leftQuota = capacity;
+                this.leakingTs = nowTs;
+                return ;
+            }
+
+            // 腾出空间太小，最下单位是 1，即距离上一次行为发生时间很短
+            if(deltaQuota < 1){
+                return ;
+            }
+
+            this.leftQuota += deltaQuota;
+            this.leakingTs = nowTs;
+
+            if(this.leftQuota > this.capacity){
+                this.leftQuota = this.capacity;
+            }
+        }
+
+        boolean watering(int quota){
+            makeSpace();
+            if(this.leftQuota >= quota){
+                this.leftQuota -= quota;
+                return  true;
+            }
+            return false;
+        }
+
+    }
+}
+```
+
+​		分布式版：
+
+​		`Redis 4.0`提供了一个限流`Redis`模块：`Rdis-Cell`，该模块使用了漏斗算法，并提供饿了原子的限流指令，该模块只有一条指令`cl.throttle`：
+
+```shell
+cl.throttle xiaoshanshan:reply 15 30 60 1 # 整个指令的意思是允许某行为的频率为：每 60s 最多 30 次，漏斗的初始容量为 15，最后一个参数代表使用的空间
+
+#返回值有 5 个：
+#第一个：是否被允许：0 表示允许，1 表示拒绝
+#第二个：漏斗的容量。
+#第三个：漏斗剩余空间。
+#第四个：如果被拒绝，需要多长时间后重试。单位为秒
+#第五个：多长时间后，漏斗完全空出来
+```
 
 
 
