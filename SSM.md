@@ -4,9 +4,13 @@
 
 ## **1、核心理论：**
 
-​		Spring核心容器就是一个超级大工厂，所有的对象(包括数据源、Hibernate  SessionFactory等基础性资源)都会被当成Spring核心容器管理的对象————Spring把容器中的一切对象统称为Bean。
+​		`Spring`核心容器就是一个超级大工厂，所有的对象`(`包括数据源、`Hibernate  SessionFactory`等基础性资源`)`都会被当成`Spring`核心容器管理的对象。
 
-​		所谓的Bean，与Java Bean不同，Java  Bean必须遵守一些特定的规范，而**Spring对Bean没有任何要求**，只要**是一个Java类，Spring就可以管理该Java类，并把它当成Bean处理**。(一切 Java对象都是Bean)。
+`Spring`把容器中的一切对象统称为`Bean`。
+
+​		所谓的`Bean`，与`Java Bean`不同，`Java  Bean`必须遵守一些特定的规范，而**Spring对Bean没有任何要求**，只要**是一个Java类，Spring就可以管理该Java**
+
+**类，并把它当成Bean处理**。`(`一切`Java`对象都是`Bean)`。
 
 ```java
 public class Axe
@@ -59,26 +63,18 @@ public class Main
 ```
 
 ```xml
-<dependency>
-      <groupId>org.springframework</groupId>
-      <artifactId>spring-core</artifactId>
-      <version>5.1.8.RELEASE</version>
-    </dependency>
     <dependency>
       <groupId>org.springframework</groupId>
       <artifactId>spring-context</artifactId>
-      <version>5.1.8.RELEASE</version>
-    </dependency>
-    <dependency>
-      <groupId>org.springframework</groupId>
-      <artifactId>spring-beans</artifactId>
       <version>5.1.8.RELEASE</version>
     </dependency>
 ```
 
 #### 1.1、基于xml来管理容器中的Bean：
 
-​		根元素<beans .../>，包含多个<bean .../>元素，每个<bean .../>元素定义一个Bean。<bean .../>元素默认驱动Spring在底层调用无参数的构造器创建对象。
+​		根元素`<beans .../>`，包含多个`<bean .../>`元素，每个`<bean .../>`元素定义一个`Bean`。`<bean .../>`元素默认驱动`Spring`在底层调用无参数的构造器
+
+创建对象。
 
 ​		解析时会执行类似如下的过程：
 
@@ -93,9 +89,15 @@ container.put(idStr,obj);
 
 ​		**结论：**
 
-​				在Spring配置文件中配置Bean时，**class属性的值必须是Bean实现类的完整类名(必须带包名)，不能是接口，不能是抽象类(除非有特殊配置)，否则Spring无法使用反射创建该类的实例**。
+​				在`Spring`配置文件中配置`Bean`时，**class属性的值必须是Bean实现类的完整类名(必须带包名)，不能是接口，不能是抽象类(除非有特殊配置)，否则**
 
-​		**<property .../>元素通常用于作为<bean .../>元素的子元素**，它驱动Spring在底层以反射执行一个setter方法，其中**name属性决定执行哪个setter方法，而value或ref决定执行setter方法传入的参数**。如果**传入参数是基本类型及其包装类、String等类型**，则**使用value属性**指定传入参数。以**容器中其他Bean作为传入参数**，则**使用ref属性**指定传入参数。
+​		**Spring无法使用反射创建该类的实例**。
+
+​		**<property .../>元素通常用于作为<bean .../>元素的子元素**，它驱动`Spring`在底层以反射执行一个`setter`方法，其中**name属性决定执行哪个setter方法，而**
+
+**value或ref决定执行setter方法传入的参数**。如果**传入参数是基本类型及其包装类、String等类型**，则**使用value属性**指定传入参数。以**容器中其他Bean作为传**
+
+**入参数**，则**使用ref属性**指定传入参数。
 
 ​		此时会执行类似如下的代码：
 
@@ -297,22 +299,26 @@ public class Chinese implements Person
 
 ### 3.1、Spring容器
 
-​		两个核心接口：BeanFactory和ApplicationContext。其中ApplicationContext是BeanFactory的子接口。
+​		两个核心接口：`BeanFactory`和`ApplicationContext`。其中`ApplicationContext`是`BeanFactory`的子接口。
 
 ![](image/QQ截图20190618003405.png)
 
-​		BeanFactory负责配置、创建、管理Bean，它有一个子接口：ApplicationContext，因此也被称为Spring上下文。
+​		`BeanFactory`负责配置、创建、管理`Bean`，它有一个子接口：`ApplicationContext`，因此也被称为`Spring`上下文。
 
 ![](image/QQ截图20190617225243.png)
 
 ![](image/QQ截图20190618003607.png)
 
-​	创建Spring容器的实例时，必须提供Spring容器管理的Bean的详细配置信息，Spring的配置信息通常采用xml配置文件来配置，因此，创建BeanFactory实例时，应该提供XML配置文件作为参数，XML配置文件通常使用Resource对象传入。Resource接口是Spring提供的资源访问接口，通过该接口，Spring能以简单、透明的方式访问磁盘、类路径以及网络上的资源。
+​	创建`Spring`容器的实例时，必须提供`Spring`容器管理的`Bean`的详细配置信息，`Spring`的配置信息通常采用`xml`配置文件来配置，因此，创建`BeanFactory`
 
-​		获取BeanFactory：
+实例时，应该提供`XML`配置文件作为参数，`XML`配置文件通常使用`Resource`对象传入。`Resource`接口是`Spring`提供的资源访问接口，通过该接口，`Spring`能以
+
+简单、透明的方式访问磁盘、类路径以及网络上的资源。
+
+​		获取`BeanFactory`：
 
 ```java
-private static Resource isr;
+	private static Resource isr;
     private static DefaultListableBeanFactory beanFactory = new DefaultListableBeanFactory();
 
     /**
@@ -338,13 +344,23 @@ private static Resource isr;
     }
 ```
 
+
+
+
+
+
+
+
+
 ### 3.2、使用ApplicationContext
 
-​		除了提供BeanFactory所支持的全部功能外，ApplicationContext还有如下功能：
+​		除了提供`BeanFactory`所支持的全部功能外，`ApplicationContext`还有如下功能：
 
 ![](image/QQ截图20190617232124.png)
 
-​		当系统创建ApplicationContext容器时，默认会预初始化所有的  singleton  Bean。包括调用构造器创建Bean的实例，并根据<property  .../>元素执行setter方法。所以系统前期创建ApplicationContext时将有较大的系统开销。
+​		当系统创建`ApplicationContext`容器时，默认会预初始化所有的`singleton Bean`。包括调用构造器创建`Bean`的实例，并根据`<property  .../>`元素执行
+
+`setter`方法。所以系统前期创建`ApplicationContext`时将有较大的系统开销。
 
 ```java
 package beans;
@@ -401,9 +417,11 @@ public class Main
 
 ![](image/QQ截图20190617233131.png)
 
-​		如果不想Spring容器预初始化  singleton  Bean，可以为<bean  .../>指定**lazy-init="true"**。此时，只有使用Spring容器的getBean方法时，Bean才会进行初始化。
+​		如果不想`Spring`容器预初始化`singleton  Bean`，可以为`<bean  .../>`指定**lazy-init="true"**。此时，只有使用`Spring`容器的`getBean`方法时，`Bean`才会进
 
-​		Bean的初始化：分三步
+行初始化。
+
+​		`Bean`的初始化：分三步
 
 ![](image/QQ截图20190618004034.png)
 
@@ -3271,6 +3289,569 @@ WebApplicationContextUtils.getWebApplicationContext(servletContext);
 ```xml
 
 ```
+
+
+
+## 源码
+
+### 容器的基本实现
+
+#### 两个重要类
+
+##### DefaultListableBeanFactory
+
+​		`DefaultListableBeanFactory`是整个`bean`加载的核心部分，是`Spring`注册及加载`bean`的默认实现，`DefaultListableBeanFactory`继承了
+
+`AbstractAutowireCapableBeanFactory`并实现了`ConfigurableListableBeanFactory`以及`BeanDefinitionRegistry`接口。
+
+![](image/QQ截图20220111094611.png)
+
+|                类名                |                             描述                             |
+| :--------------------------------: | :----------------------------------------------------------: |
+|           AliasRegistry            |               定义对`alias`的简单增删改等操作                |
+|        SimpleAliasRegistry         | 主要使用`map`作为`alias`的缓存，并对接口`AliasRegistry`进行实现 |
+|       SingletonBeanRegistry        |                    定义对单例的注册及获取                    |
+|            BeanFactory             |               定义获取`bean`及`bean`的各种属性               |
+|    DefaultSingletonBeanRegistry    |          对接口`SingletonBeanRegistry`各函数的实现           |
+|      HierarchicalBeanFactory       | 继承`BeanFactory`，也就是在`BeanFactory`定义的功能的基础上增加了对`parentFactory`的支持 |
+|       BeanDefinitionRegistry       |            定义对`BeanDefinition`的各种增删改操作            |
+|     FactoryBeanRegistrySupport     | 在`DefaultSingletonBeanRegistry`基础上增加了对`FactoryBean`的特殊处理功能 |
+|      ConfigurableBeanFactory       |                 提供配置`Factory`的各种方法                  |
+|        ListableBeanFactory         |               根据各种条件获取`bean`的配置清单               |
+|        AbstractBeanFactory         | 综合`FactoryBeanRegistrySupport`和`ConfigurableBeanFactory`的功能 |
+|     AutowireCapableBeanFactory     |   提供创建`bean`、自动注入、初始化以及应用`bean`的后处理器   |
+| AbstractAutowireCapableBeanFactory | 综合`AbstractBeanFactory`并对接口`AutowireCapableBeanFactory`进行实现 |
+|  ConfigurableListableBeanFactory   |         `BeanFactory`配置清单，指定忽略类型及接口等          |
+|     DefaultListableBeanFactory     |         综合上面所有功能，主要是对`bean`注册后的处理         |
+
+​		`XmlBeanFactory`对`DefaultListableBeanFactory`类进行了扩展，主要用于从`XML`文档中读取`BeanDefinition`，对于注册及获取`bean`都是使用从父类
+
+`DefaultListableBeanFactory`继承的方法去实现，而唯独与父类不同的个性化实现就是增加了`XmlBeanDefinitionReader`类型的`reader`属性。在`XmlBeanFactory`
+
+中主要使用`reader`属性对资源文件进行读取和注册。
+
+
+
+##### XmlBeanDefinitionReader
+
+​		`XmlBeanDefinitionReader`负责操作`XML`配置文件，包括资源文件读取、解析及注册等。
+
+![](image/QQ截图20220111102623.png)
+
+|             类名             |                             描述                             |
+| :--------------------------: | :----------------------------------------------------------: |
+|        ResourceLoader        | 定义资源加载器，主要应用于根据给定的资源文件地址返回对应的`Resource` |
+|     BeanDefinitionReader     |    主要定义资源文件读取并转换为`BeanDefinition`的各个功能    |
+|      EnvironmentCapable      |                  定义获取`Environment`方法                   |
+|        DocumentLoader        |          定义从资源文件加载到转换为`Document`的功能          |
+| AbstractBeanDefinitionReader | 对`EnvironmentCapable`、`BeanDefinitionReader`类定义的功能进行实现 |
+| BeanDefinitionDocumentReader |         定义读取`Document`并注册`BeanDefinition`功能         |
+| BeanDefinitionParserDelegate |                 定义解析`Element`的各种方法                  |
+
+​		处理流程：
+
+​				1、通过继承自`AbstractBeanDefinitionReader`中的方法，来使用`ResourLoader`将资源文件路径转换为对应的`Resource`文件。
+
+​				2、通过`DocumentLoader`对`Resource`文件进行转换，将`Resource`文件转换为`Document`文件。
+
+​				3、通过实现接口`BeanDefinitionDocumentReader`的`DefaultBeanDefinitionDocumentReader`类对`Document`进行解析，并使用
+
+​		`BeanDefinitionParserDelegate`对`Element`进行解析。
+
+
+
+#### XmlBeanFactory
+
+```java
+BeanFactory factory = new XmlBeanFactory(new ClassPathResource("applicationContext.xml"));
+```
+
+​		在`Java`中，将不同来源的资源抽象成``URL`，通过注册不同的`handler(URLStreamHandler)`来处理不同来源的资源的读取逻辑，一般`handler`的类型使用不同
+
+前缀来识别，然而`URL`没有默认定义相对`Classpath`或`ServletContext`等资源的`handler`，`Spring`对其内部使用到的资源实现了自己的抽象结构：`Resource`接
+
+口封装底层资源。
+
+```java
+public interface InputStreamSource {
+	InputStream getInputStream() throws IOException;
+}
+
+public interface Resource extends InputStreamSource {
+	boolean exists();
+	default boolean isReadable() {
+		return true;
+	}
+	default boolean isOpen() {
+		return false;
+	}
+	default boolean isFile() {
+		return false;
+	}
+	URL getURL() throws IOException;
+	URI getURI() throws IOException;
+	File getFile() throws IOException;
+	default ReadableByteChannel readableChannel() throws IOException {
+		return Channels.newChannel(getInputStream());
+	}
+	long contentLength() throws IOException;
+	long lastModified() throws IOException;
+	Resource createRelative(String relativePath) throws IOException;
+	String getFilename();
+	String getDescription();
+}
+```
+
+​		对不同来源的资源文件都有相应的`Resource`实现：
+
+![](image/QQ截图20220111134406.png)
+
+​		当通过`Resource`相关类完成了对配置文件进行封装后配置文件的读取工作就全权交给`XmlBeanDefinitionReader`来处理了：
+
+```java
+//BeanFactory factory = new XmlBeanFactory(new ClassPathResource("applicationContext.xml"));
+public class XmlBeanFactory extends DefaultListableBeanFactory {
+
+	private final XmlBeanDefinitionReader reader = new XmlBeanDefinitionReader(this);
+
+	public XmlBeanFactory(Resource resource) throws BeansException {
+		this(resource, null);
+	}
+
+	public XmlBeanFactory(Resource resource, BeanFactory parentBeanFactory) throws BeansException {
+		/*
+		public AbstractAutowireCapableBeanFactory() {
+			super();
+			// ignoreDependencyInterface:忽略给定接口的自动装配功能
+			ignoreDependencyInterface(BeanNameAware.class); // BeanNameAware：注入 bean 对应的 name
+			ignoreDependencyInterface(BeanFactoryAware.class); // BeanFactoryAware：注入 BeanFactory
+			ignoreDependencyInterface(BeanClassLoaderAware.class); // BeanClassLoaderAware：注入 bean 对应的类加载器
+		} 
+		*/
+        super(parentBeanFactory); 
+	    this.reader.loadBeanDefinitions(resource); // 此时将工作交给 XmlBeanDefinitionReader 来完成
+	}
+}
+```
+
+![](image/QQ截图20220111135325.png)
+
+​		整个过程：
+
+​				1、封装资源文件。当进入`XmLBeanDefinitionReader`后首先对参数`Resource`使用`EncodedResource`类进行封装。`EncodedResource`主要用于对资源文件
+
+​		进行编码处理。
+
+```java
+public class EncodedResource implements InputStreamSource {
+    ...
+	public Reader getReader() throws IOException {
+		if (this.charset != null) {
+			return new InputStreamReader(this.resource.getInputStream(), this.charset);
+		}
+		else if (this.encoding != null) {
+			return new InputStreamReader(this.resource.getInputStream(), this.encoding);
+		}
+		else {
+			return new InputStreamReader(this.resource.getInputStream());
+		}
+	}
+    ...
+}
+```
+
+​				2、获取输入流。从`Resource`中获取对应的`InputStream`并构造`InputSource`。
+
+​				3、通过构造的`InputSource`实例和`Resource`实例继续调用函数`doLoadBeanDefinitions`。
+
+```java
+public int loadBeanDefinitions(EncodedResource encodedResource) throws BeanDefinitionStoreException {
+		Assert.notNull(encodedResource, "EncodedResource must not be null");
+		if (logger.isInfoEnabled()) {
+			logger.info("Loading XML bean definitions from " + encodedResource);
+		}
+		
+    	// 通过属性来记录已经加载的资源
+		Set<EncodedResource> currentResources = this.resourcesCurrentlyBeingLoaded.get();
+		if (currentResources == null) {
+			currentResources = new HashSet<>(4);
+			this.resourcesCurrentlyBeingLoaded.set(currentResources);
+		}
+		if (!currentResources.add(encodedResource)) {
+			throw new BeanDefinitionStoreException(
+					"Detected cyclic loading of " + encodedResource + " - check your import definitions!");
+		}
+		try {
+             // 从 encodedResource 中获取 inputStream
+			InputStream inputStream = encodedResource.getResource().getInputStream();
+			try {
+                  // InputSource 来源于 org.xml.sax，并不来自于 Spring
+				InputSource inputSource = new InputSource(inputStream);
+				if (encodedResource.getEncoding() != null) {
+					inputSource.setEncoding(encodedResource.getEncoding());
+				}
+                  // 真正的处理部分
+				return doLoadBeanDefinitions(inputSource, encodedResource.getResource());
+			}
+			finally {
+				inputStream.close();
+			}
+		}
+		catch (IOException ex) {
+			throw new BeanDefinitionStoreException(
+					"IOException parsing XML document from " + encodedResource.getResource(), ex);
+		}
+		finally {
+			currentResources.remove(encodedResource);
+			if (currentResources.isEmpty()) {
+				this.resourcesCurrentlyBeingLoaded.remove();
+			}
+		}
+	}
+```
+
+```java
+protected Document doLoadDocument(InputSource inputSource, Resource resource) throws Exception {
+	return this.documentLoader.loadDocument(inputSource, getEntityResolver(), this.errorHandler,
+                                            getValidationModeForResource(resource), isNamespaceAware());
+}
+
+protected int doLoadBeanDefinitions(InputSource inputSource, Resource resource) throws BeanDefinitionStoreException {
+		try {
+             /**
+
+             */
+			Document doc = doLoadDocument(inputSource, resource);
+			return registerBeanDefinitions(doc, resource);
+		}
+		catch (BeanDefinitionStoreException ex) {
+			throw ex;
+		}
+		catch (SAXParseException ex) {
+			throw new XmlBeanDefinitionStoreException(resource.getDescription(),
+					"Line " + ex.getLineNumber() + " in XML document from " + resource + " is invalid", ex);
+		}
+		catch (SAXException ex) {
+			throw new XmlBeanDefinitionStoreException(resource.getDescription(),
+					"XML document from " + resource + " is invalid", ex);
+		}
+		catch (ParserConfigurationException ex) {
+			throw new BeanDefinitionStoreException(resource.getDescription(),
+					"Parser configuration exception parsing XML from " + resource, ex);
+		}
+		catch (IOException ex) {
+			throw new BeanDefinitionStoreException(resource.getDescription(),
+					"IOException parsing XML document from " + resource, ex);
+		}
+		catch (Throwable ex) {
+			throw new BeanDefinitionStoreException(resource.getDescription(),
+					"Unexpected exception parsing XML document from " + resource, ex);
+		}
+	}
+```
+
+​		`doLoadBeanDefinitions`，忽略其中的异常处理，整个逻辑做了三件事情：
+
+​				1、获取对`XML`文件的验证模式。
+
+​				2、加载`XML`文件，并得到对应的`Document`。
+
+​				3、根据返回的`Document`注册`Bean`信息。
+
+
+
+#### XML的校验模式
+
+​		`XML`文件的验证模式保证了`XML`文件的正确性，而比较常用的验证模式有两种：`DTD`和`XSD`。
+
+​		`DTD`即文档类型定义，是一种`XML`约束模式语言，是`XML`文件的验证机制，属于`XML`文件组成的一部分。`DTD`是一种保证`XML`文档格式正确的有效方法，可
+
+以通过比较`XML`文档和`DTD`文件来看文档是否符合规范，元素和标签使用是否正确。一个`DTD`文档包含：元素的定义规则，元素间关系的定义规则，元素可使用的
+
+属性，可使用的实体或符号规则。要使用`DTD`验证模式的时候需要在XML文件的头部声明：
+
+```xml
+<!DOCTYPE beans PUGLIC "-//Spring//DTD BEAN 2.0//EN" "http://www.Springframework.org/dtd/Spring-beans-2.0.dtd">
+```
+
+​		`XML Schema`语言就是`XSD`。`XML Schema`描述了`XML`文档的结构。可以用一个指定的`XML Schema`来验证某个`XML`文档，以检查该`XML`文档是否符合其要求。
+
+文档设计者可以通过`XML Schema`指定`XML`文档所允许的结构和内容，并可据此检查`XML`文档是否是有效的。`XML Schema`本身是`XML`文档，它符合`XML`语法结构。
+
+可以用通用的`XML`解析器解析它。在使用`XML Schema`文档对`XML`实例文档进行检验，除了要声明名称空间外，还必须指定该名称空间所对应的`XML Schema`文档的
+
+存储位置。通过`schemaLocation`属性来指定名称空间所对应的`XML Schema`文档的存储位置，它包含两个部分，一部分是名称空间的`URI`，另一部分就是该名称空
+
+间所标识的`XML Schema`文件位置或`URL`地址：
+
+```xml
+<beans xmlns="http://www.springframework.org/schema/beans"
+       xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+       xsi:schemaLocation="http://www.springframework.org/schema/beans http://www.springframework.org/schema/beans/spring-beans.xsd">
+</beans>
+```
+
+```java
+protected int getValidationModeForResource(Resource resource) {
+		int validationModeToUse = getValidationMode();
+    	// 手动指定了验证模式则使用指定的验证模式，通过调用 XmlBeanDefinitionReader#setValidationMode 方法来设置
+		if (validationModeToUse != VALIDATION_AUTO) {
+			return validationModeToUse;
+		}
+    	 // 未指定则自动检测
+		int detectedMode = detectValidationMode(resource);
+		if (detectedMode != VALIDATION_AUTO) {
+			return detectedMode;
+		}
+		return VALIDATION_XSD;
+}
+```
+
+```java
+protected int detectValidationMode(Resource resource) {
+		if (resource.isOpen()) {
+			throw new BeanDefinitionStoreException(
+					"Passed-in Resource [" + resource + "] contains an open stream: " +
+					"cannot determine validation mode automatically. Either pass in a Resource " +
+					"that is able to create fresh streams, or explicitly specify the validationMode " +
+					"on your XmlBeanDefinitionReader instance.");
+		}
+
+		InputStream inputStream;
+		try {
+			inputStream = resource.getInputStream();
+		}
+		catch (IOException ex) {
+			throw new BeanDefinitionStoreException(
+					"Unable to determine validation mode for [" + resource + "]: cannot open InputStream. " +
+					"Did you attempt to load directly from a SAX InputSource without specifying the " +
+					"validationMode on your XmlBeanDefinitionReader instance?", ex);
+		}
+
+		try {
+			return this.validationModeDetector.detectValidationMode(inputStream);
+		}
+		catch (IOException ex) {
+			throw new BeanDefinitionStoreException("Unable to determine validation mode for [" +
+					resource + "]: an error occurred whilst reading from the InputStream.", ex);
+		}
+}
+```
+
+```java
+// XmlValidationModeDetector 类
+public int detectValidationMode(InputStream inputStream) throws IOException {
+		// Peek into the file to look for DOCTYPE.
+		BufferedReader reader = new BufferedReader(new InputStreamReader(inputStream));
+		try {
+			boolean isDtdValidated = false;
+			String content;
+			while ((content = reader.readLine()) != null) {
+				content = consumeCommentTokens(content);
+                 // 读取到的行是空或者是注释则跳过
+				if (this.inComment || !StringUtils.hasText(content)) {
+					continue;
+				}
+				if (hasDoctype(content)) {
+					isDtdValidated = true;
+					break;
+				}
+                 // 读取到 < 开始符号，验证模式一定会在开始符号之前
+				if (hasOpeningTag(content)) {
+					// End of meaningful data...
+					break;
+				}
+			}
+			return (isDtdValidated ? VALIDATION_DTD : VALIDATION_XSD);
+		}
+		catch (CharConversionException ex) {
+			// Choked on some character encoding...
+			// Leave the decision up to the caller.
+			return VALIDATION_AUTO;
+		}
+		finally {
+			reader.close();
+		}
+}
+```
+
+​		`Spring`用来检测验证模式的办法就是判断是否包含`DOCTYPE`，如果包含就是`DTD`，否则就是`XSD`。
+
+
+
+#### 获取Document
+
+​		经过了验证模式准备的步骤就可以进行`Document`加载了，`XmlBeanFactoryReader`类委托给了`DocumentLoader`去执行，真正调用的是
+
+`DefaultDocumentLoader`：
+
+```java
+public Document loadDocument(InputSource inputSource, EntityResolver entityResolver,
+			ErrorHandler errorHandler, int validationMode, boolean namespaceAware) throws Exception {
+
+		DocumentBuilderFactory factory = createDocumentBuilderFactory(validationMode, namespaceAware);
+		if (logger.isDebugEnabled()) {
+			logger.debug("Using JAXP provider [" + factory.getClass().getName() + "]");
+		}
+		DocumentBuilder builder = createDocumentBuilder(factory, entityResolver, errorHandler);
+		return builder.parse(inputSource);
+}
+```
+
+​		通过`SAX`解析`XML`文档，首先创建`DocumentBuilderFactory`，再通过`DocumentBuilderFactory`创建`DocumentBuilder`，进而解析`inputSource`来返回
+
+`Document`对象。
+
+​		`EntityResolver`的作用是项目本身就可以提供一个如何寻找`DTD`声明的方法，即由程序来实现寻找`DTD`声明的过程。`Spring`中通过`getEntityResolver()`
+
+方法对`EntityResolver`的获取，`Spring`中使用`DelegatingEntityResolver`类为`EntityResolver`的实现类：
+
+```java
+public class DelegatingEntityResolver implements EntityResolver {
+	...
+    /**
+     XSD：
+    	<beans xmlns="http://www.springframework.org/schema/beans"
+		       xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+		       xsi:schemaLocation="http://www.springframework.org/schema/beans http://www.springframework.org/schema/beans/spring-beans.xsd">
+		</beans>
+		publicId：null
+		systemId：http://www.springframework.org/schema/beans/spring-beans.xsd
+	
+	
+	 DTD:
+	 	<!DOCTYPE beans PUGLIC "-//Spring//DTD BEAN 2.0//EN" "http://www.Springframework.org/dtd/Spring-beans-2.0.dtd">
+	 	publicId：-//Spring//DTD BEAN 2.0//EN
+	 	systemId：http://www.Springframework.org/dtd/Spring-beans-2.0.dtd
+    */
+	public InputSource resolveEntity(@Nullable String publicId, @Nullable String systemId)
+			throws SAXException, IOException {
+
+		if (systemId != null) {
+			if (systemId.endsWith(DTD_SUFFIX)) {
+                 // BeansDtdResolver
+				return this.dtdResolver.resolveEntity(publicId, systemId);
+			}
+			else if (systemId.endsWith(XSD_SUFFIX)) {
+                  // PluggableSchemaResolver
+				return this.schemaResolver.resolveEntity(publicId, systemId);
+			}
+		}
+
+		// Fall back to the parser's default behavior.
+		return null;
+	}
+    ...
+}
+```
+
+​		加载`DTD`类型的`BeansDtdResolver`的`resolveEntity`是直接截取`systemId`最后的`xx.dtd`然后去当前路径下寻找，而加载`XSD`类型的
+
+`PluggableSchemaResolver`类的`resolveEntity`是默认到`META-INF/Spring.schemas`文件中找到`systemid`所对应的`XSD`文件并加载。
+
+
+
+#### 解析注册BeanDefinitions
+
+​		文件转换为`Document`后，就将进行提取及注册`bean`。
+
+```java
+public int registerBeanDefinitions(Document doc, Resource resource) throws BeanDefinitionStoreException {
+         // 使用 DefaultBeanDefinitionDocumentReader 实例化 BeanDefinitionDocumentReader
+		BeanDefinitionDocumentReader documentReader = createBeanDefinitionDocumentReader();
+    	// 在实例化 BeanDefinitionReader 时会将 BeanDefinitionRegistry传入，默认使用继承自DefaultListableBeanFactory的子类
+        // 记录统计前 BeanDefinition的加载个数
+		int countBefore = getRegistry().getBeanDefinitionCount();
+    	// 加载及注册 bean
+		documentReader.registerBeanDefinitions(doc, createReaderContext(resource));
+    	// 记录本次加载的 BeanDefinition 个数
+		return getRegistry().getBeanDefinitionCount() - countBefore;
+}
+```
+
+```java
+// DefaultBeanDefinitionDocumentReader 类
+public void registerBeanDefinitions(Document doc, XmlReaderContext readerContext) {
+		this.readerContext = readerContext;
+		logger.debug("Loading bean definitions");
+		Element root = doc.getDocumentElement(); // 提取 root
+		doRegisterBeanDefinitions(root);
+}
+
+protected void doRegisterBeanDefinitions(Element root) {
+		BeanDefinitionParserDelegate parent = this.delegate;
+		this.delegate = createDelegate(getReaderContext(), root, parent);
+
+    	// 处理 beans 标签的 profile 属性
+		if (this.delegate.isDefaultNamespace(root)) {
+			String profileSpec = root.getAttribute(PROFILE_ATTRIBUTE);
+			if (StringUtils.hasText(profileSpec)) {
+				String[] specifiedProfiles = StringUtils.tokenizeToStringArray(
+						profileSpec, BeanDefinitionParserDelegate.MULTI_VALUE_ATTRIBUTE_DELIMITERS);
+				if (!getReaderContext().getEnvironment().acceptsProfiles(specifiedProfiles)) {
+					if (logger.isInfoEnabled()) {
+						logger.info("Skipped XML bean definition file due to specified profiles [" + profileSpec +
+								"] not matching: " + getReaderContext().getResource());
+					}
+					return;
+				}
+			}
+		}
+
+		preProcessXml(root); // 模板设计模式，解析前处理，留给子类实现
+		parseBeanDefinitions(root, this.delegate);
+		postProcessXml(root); // 模板设计模式，解析后处理，留给子类实现
+
+		this.delegate = parent;
+}
+
+protected void parseBeanDefinitions(Element root, BeanDefinitionParserDelegate delegate) {
+    	// 处理 beans 标签
+		if (delegate.isDefaultNamespace(root)) {
+			NodeList nl = root.getChildNodes();
+			for (int i = 0; i < nl.getLength(); i++) {
+				Node node = nl.item(i);
+				if (node instanceof Element) {
+					Element ele = (Element) node;
+					if (delegate.isDefaultNamespace(ele)) {
+                          // 处理 bean 标签
+						parseDefaultElement(ele, delegate);
+					}
+					else {
+                          // 处理 bean 标签
+						delegate.parseCustomElement(ele);
+					}
+				}
+			}
+		}
+		else {
+             // 处理 bean 标签
+			delegate.parseCustomElement(root);
+		}
+}
+```
+
+​		对于根节点或者子节点如果是默认命名空间的话则采用`parseDefaultElement`方法进行解析，否则使用`delegate.parseCustomElement`方法对自定义命名空间
+
+进行解析。而判断是否默认命名空间还是自定义命名空间的办法其实是使用`node.getNamespaceURI()`获取命名空间，并与`Spring`中固定的命名空间
+
+`http:/www.springframework.org/schema/beans`进行比对。如果一致则认为是默认，否则就认为是自定义。
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 # 二、设计模式
 
