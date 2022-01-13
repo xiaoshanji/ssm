@@ -4619,11 +4619,477 @@ public void parseQualifierElement(Element ele, AbstractBeanDefinition bd) {
 }
 ```
 
+​		到此，`XML`文档就转换成了`GenericBeanDefinition`，`XML`中所有的配置都可以在`GenericBeanDefinition`找到对应的属性。但大部分通用的属性还是在
+
+`AbstractBeanDefinition`中：
+
+```java
+public abstract class AbstractBeanDefinition extends BeanMetadataAttributeAccessor implements BeanDefinition, Cloneable {
+
+	// bean 的作用范围
+	private String scope = SCOPE_DEFAULT;
+	// 是否是抽象
+	private boolean abstractFlag = false;
+	// 是否延迟加载
+	private boolean lazyInit = false;
+	// 自动注入模式，对应属性 autowire
+	private int autowireMode = AUTOWIRE_NO;
+	// 依赖检查，3.0 之后弃用了这个属性
+	private int dependencyCheck = DEPENDENCY_CHECK_NONE;
+	
+	// 表示一个 bean 的实例化依赖另一个 bean 先实例化，对应属性 depend-on
+	private String[] dependsOn;
+	// 如果设置为 false ，容器在查找自动装配对象时，将不考虑该 bean ，即它不会被考虑作为其他 bean 自动装配的候选者，但该 bean 本身还是可以使用自动装配来注入其他 bean 的。对应属性 autowire-candidate
+	private boolean autowireCandidate = true;
+	// 自动装配时，当出现多个候选者时，将作为首选者，对应属性 primary
+	private boolean primary = false;
+	// 用于记录 Qualifier 对应子元素 qualifier
+	private final Map<String, AutowireCandidateQualifier> qualifiers = new LinkedHashMap<>();
+
+	@Nullable
+	private Supplier<?> instanceSupplier;
+	// 允许访问非公开的构造器和方法，程序设置
+	private boolean nonPublicAccessAllowed = true;
+    
+	private boolean lenientConstructorResolution = true;
+
+	// 对应属性 factory-bean
+	private String factoryBeanName;
+
+	// 对应属性 factory-method
+	private String factoryMethodName;
+
+	// 记录构造函数注入属性，对应属性 constructor-arg
+	private ConstructorArgumentValues constructorArgumentValues;
+
+	// 普通属性集合
+	private MutablePropertyValues propertyValues;
+	// 方法重写的持有者，记录 lookup-method、replaced-method 元素
+	private MethodOverrides methodOverrides = new MethodOverrides();
+
+	// 初始化方法，对应属性 init-method
+	private String initMethodName;
+
+	// 销毁方法，对应属性 destory-method
+	private String destroyMethodName;
+	// 是否执行 init-method ，程序设置
+	private boolean enforceInitMethod = true;
+	// 是否执行 destory-method ,程序设置
+	private boolean enforceDestroyMethod = true;
+	// 是否是用户定义的而不是应用程序本身定义的，创建 AOP 时为 true，程序设置
+	private boolean synthetic = false;
+	// 定义这个 bean 的应用, APPLICATION:用户，INFRASTRUCTURE:完全内部使用，与用户无关，SUPPORT:某些复杂配置的一部分，程序设置
+	private int role = BeanDefinition.ROLE_APPLICATION;
+
+	// bean 的描述信息
+	private String description;
+	// 这个 bean 定义的资源
+	private Resource resource;
+    ...
+}
+```
+
+​		`bean`默认标签的解析与提取到此就结束了，但如果其中的子元素使用自定义的配置，这个配置并不是`bean`的形式出现，而是以属性的方式：
+
+```java
+// DefaultBeanDefinitionDocumentReader 类
+protected void processBeanDefinition(Element ele, BeanDefinitionParserDelegate delegate) {
+		BeanDefinitionHolder bdHolder = delegate.parseBeanDefinitionElement(ele);
+		if (bdHolder != null) {
+			bdHolder = delegate.decorateBeanDefinitionIfRequired(ele, bdHolder); // 解析自定义子元素
+			try {
+				// Register the final decorated instance.
+				BeanDefinitionReaderUtils.registerBeanDefinition(bdHolder, getReaderContext().getRegistry());
+			}
+			catch (BeanDefinitionStoreException ex) {
+				getReaderContext().error("Failed to register bean definition with name '" +
+						bdHolder.getBeanName() + "'", ele, ex);
+			}
+			// Send registration event.
+			getReaderContext().fireComponentRegistered(new BeanComponentDefinition(bdHolder));
+		}
+}
+```
+
+```java
+// BeanDefinitionParserDelegate 类
+public BeanDefinitionHolder decorateBeanDefinitionIfRequired(Element ele, BeanDefinitionHolder originalDef) {
+		return decorateBeanDefinitionIfRequired(ele, originalDef, null); // 第三个属性是父 bean，当对某个嵌套配置进行解析时传递，传递这个参数作用时使用其 scope 属性，以备子类在没有配置 scope 时默认使用父类的属性
+}
+
+public BeanDefinitionHolder decorateBeanDefinitionIfRequired(
+			Element ele, BeanDefinitionHolder originalDef, @Nullable BeanDefinition containingBd) {
+
+		BeanDefinitionHolder finalDefinition = originalDef;
+
+		// Decorate based on custom attributes first.
+		NamedNodeMap attributes = ele.getAttributes();
+    	// 遍历所有属性，检查是否有适用于修饰的属性
+		for (int i = 0; i < attributes.getLength(); i++) {
+			Node node = attributes.item(i);
+			finalDefinition = decorateIfRequired(node, finalDefinition, containingBd);
+		}
+
+		// Decorate based on custom nested elements.
+		NodeList children = ele.getChildNodes();
+    	// 遍历所有子节点，检查是否有适用于修饰的子元素
+		for (int i = 0; i < children.getLength(); i++) {
+			Node node = children.item(i);
+			if (node.getNodeType() == Node.ELEMENT_NODE) {
+				finalDefinition = decorateIfRequired(node, finalDefinition, containingBd);
+			}
+		}
+		return finalDefinition;
+}
+
+/**
+	默认标签的处理直接略过，只对自定义的标签或者说对 bean 的自定义属性感兴趣。在方法中实现了寻找自定义标签并根据自定义标签寻找命名空间处理器，并进行进一步的解析。
+*/
+public BeanDefinitionHolder decorateIfRequired(
+			Node node, BeanDefinitionHolder originalDef, @Nullable BeanDefinition containingBd) {
+		// 获取自定义标签的命名空间
+		String namespaceUri = getNamespaceURI(node);
+    	// 对于非默认标签进行修饰
+		if (namespaceUri != null && !isDefaultNamespace(namespaceUri)) {
+            // 根据命名空间找到对应的处理器
+			NamespaceHandler handler = this.readerContext.getNamespaceHandlerResolver().resolve(namespaceUri);
+			if (handler != null) {
+                // 进行修饰
+				BeanDefinitionHolder decorated =
+						handler.decorate(node, originalDef, new ParserContext(this.readerContext, this, containingBd));
+				if (decorated != null) {
+					return decorated;
+				}
+			}
+			else if (namespaceUri.startsWith("http://www.springframework.org/")) {
+				error("Unable to locate Spring NamespaceHandler for XML schema namespace [" + namespaceUri + "]", node);
+			}
+			else {
+				// A custom namespace, not to be handled by Spring - maybe "xml:...".
+				if (logger.isDebugEnabled()) {
+					logger.debug("No Spring NamespaceHandler found for XML schema namespace [" + namespaceUri + "]");
+				}
+			}
+		}
+		return originalDef;
+}
+
+public String getNamespaceURI(Node node) {
+		return node.getNamespaceURI();
+}
+
+public boolean isDefaultNamespace(@Nullable String namespaceUri) {
+    	// BEANS_NAMESPACE_URI = "http://www.springframework.org/schema/beans";
+		return (!StringUtils.hasLength(namespaceUri) || BEANS_NAMESPACE_URI.equals(namespaceUri));
+}
+```
+
+​		到此，配置文件所有的解析都已经完成，下面进入注册`BeanDefinition`：
+
+```java
+// DefaultBeanDefinitionDocumentReader 类
+protected void processBeanDefinition(Element ele, BeanDefinitionParserDelegate delegate) {
+		BeanDefinitionHolder bdHolder = delegate.parseBeanDefinitionElement(ele);
+		if (bdHolder != null) {
+			bdHolder = delegate.decorateBeanDefinitionIfRequired(ele, bdHolder);
+			try {
+				// Register the final decorated instance.
+				BeanDefinitionReaderUtils.registerBeanDefinition(bdHolder, getReaderContext().getRegistry()); // 注册
+			}
+			catch (BeanDefinitionStoreException ex) {
+				getReaderContext().error("Failed to register bean definition with name '" +
+						bdHolder.getBeanName() + "'", ele, ex);
+			}
+			// Send registration event.
+			getReaderContext().fireComponentRegistered(new BeanComponentDefinition(bdHolder)); // 通知监听器解析和注册完成，目前 Spring 对此事件未做处理
+		}
+}
+```
+
+```java
+// BeanDefinitionReaderUtils 类
+public static void registerBeanDefinition(
+			BeanDefinitionHolder definitionHolder, BeanDefinitionRegistry registry)
+			throws BeanDefinitionStoreException {
+
+		// Register bean definition under primary name.
+    	// 使用 beanName 做唯一标识注册
+		String beanName = definitionHolder.getBeanName();
+		registry.registerBeanDefinition(beanName, definitionHolder.getBeanDefinition()); // 通过 beanName 注册
+
+		// Register aliases for bean name, if any.
+    	// 注册所有别名
+		String[] aliases = definitionHolder.getAliases();
+		if (aliases != null) {
+			for (String alias : aliases) {
+				registry.registerAlias(beanName, alias); // 通过别名注册
+			}
+		}
+}
+```
+
+​		`BeanDefinition`的注册，分为了两部分：
+
+​				1、通过`beanName`注册：
+
+```java
+// DefaultListableBeanFactory 类
+public void registerBeanDefinition(String beanName, BeanDefinition beanDefinition)
+			throws BeanDefinitionStoreException {
+
+		Assert.hasText(beanName, "Bean name must not be empty");
+		Assert.notNull(beanDefinition, "BeanDefinition must not be null");
+
+		if (beanDefinition instanceof AbstractBeanDefinition) {
+			try {
+                /**
+                	注册前的最后一次校验，主要是对于 AbstractBeanDefinition 中的 MethodOverrides 属性校验。
+                	校验 MethodOverrides 是否与工厂方法并存或者 MethodOverrides 对应的方法根本不存在
+                */
+				((AbstractBeanDefinition) beanDefinition).validate();
+			}
+			catch (BeanDefinitionValidationException ex) {
+				throw new BeanDefinitionStoreException(beanDefinition.getResourceDescription(), beanName,
+						"Validation of bean definition failed", ex);
+			}
+		}
+
+		BeanDefinition existingDefinition = this.beanDefinitionMap.get(beanName);
+    	// 处理已经注册过的 beanName 情况
+		if (existingDefinition != null) {
+			if (!isAllowBeanDefinitionOverriding()) {
+				throw new BeanDefinitionStoreException(beanDefinition.getResourceDescription(), beanName,
+						"Cannot register bean definition [" + beanDefinition + "] for bean '" + beanName +
+						"': There is already [" + existingDefinition + "] bound.");
+			}
+			else if (existingDefinition.getRole() < beanDefinition.getRole()) {
+				// e.g. was ROLE_APPLICATION, now overriding with ROLE_SUPPORT or ROLE_INFRASTRUCTURE
+				if (logger.isWarnEnabled()) {
+					logger.warn("Overriding user-defined bean definition for bean '" + beanName +
+							"' with a framework-generated bean definition: replacing [" +
+							existingDefinition + "] with [" + beanDefinition + "]");
+				}
+			}
+			else if (!beanDefinition.equals(existingDefinition)) {
+				if (logger.isInfoEnabled()) {
+					logger.info("Overriding bean definition for bean '" + beanName +
+							"' with a different definition: replacing [" + existingDefinition +
+							"] with [" + beanDefinition + "]");
+				}
+			}
+			else {
+				if (logger.isDebugEnabled()) {
+					logger.debug("Overriding bean definition for bean '" + beanName +
+							"' with an equivalent definition: replacing [" + existingDefinition +
+							"] with [" + beanDefinition + "]");
+				}
+			}
+			this.beanDefinitionMap.put(beanName, beanDefinition);
+		}
+		else {
+			if (hasBeanCreationStarted()) {
+				// Cannot modify startup-time collection elements anymore (for stable iteration)
+                // beanDefinitionMap 是全局变量，可能存在并发问题
+				synchronized (this.beanDefinitionMap) {
+					this.beanDefinitionMap.put(beanName, beanDefinition);
+					List<String> updatedDefinitions = new ArrayList<>(this.beanDefinitionNames.size() + 1);
+					updatedDefinitions.addAll(this.beanDefinitionNames);
+					updatedDefinitions.add(beanName);
+					this.beanDefinitionNames = updatedDefinitions;
+					if (this.manualSingletonNames.contains(beanName)) {
+						Set<String> updatedSingletons = new LinkedHashSet<>(this.manualSingletonNames);
+						updatedSingletons.remove(beanName);
+						this.manualSingletonNames = updatedSingletons;
+					}
+				}
+			}
+			else {
+				// Still in startup registration phase
+                // 注册 beanDefinition 
+				this.beanDefinitionMap.put(beanName, beanDefinition);
+                // 记录 beanName
+				this.beanDefinitionNames.add(beanName);
+				this.manualSingletonNames.remove(beanName);
+			}
+			this.frozenBeanDefinitionNames = null;
+		}
+
+		if (existingDefinition != null || containsSingleton(beanName)) {
+            // 重置所有 beanName 对应的缓存
+			resetBeanDefinition(beanName);
+		}
+}
+```
+
+​		2、通过别名注册：
+
+```java
+// SimpleAliasRegistry 类
+public void registerAlias(String name, String alias) {
+		Assert.hasText(name, "'name' must not be empty");
+		Assert.hasText(alias, "'alias' must not be empty");
+		synchronized (this.aliasMap) {
+            // 如果 alias 与 beanName 相同，则不记录，并删除对应的 alias
+			if (alias.equals(name)) {
+				this.aliasMap.remove(alias);
+				if (logger.isDebugEnabled()) {
+					logger.debug("Alias definition '" + alias + "' ignored since it points to same name");
+				}
+			}
+			else {
+				String registeredName = this.aliasMap.get(alias);
+				if (registeredName != null) {
+					if (registeredName.equals(name)) {
+						// An existing alias - no need to re-register
+						return;
+					}
+                    // 如果 alias 不允许被覆盖，则抛出异常
+					if (!allowAliasOverriding()) {
+						throw new IllegalStateException("Cannot define alias '" + alias + "' for name '" +
+								name + "': It is already registered for name '" + registeredName + "'.");
+					}
+					if (logger.isInfoEnabled()) {
+						logger.info("Overriding alias '" + alias + "' definition for registered name '" +
+								registeredName + "' with new target name '" + name + "'");
+					}
+				}
+                // 当 A -> B 存在时，若再次出现 A -> C -> B 时抛出异常
+				checkForAliasCircle(name, alias);
+				this.aliasMap.put(alias, name);
+                // 注册 alias
+				if (logger.isDebugEnabled()) {
+					logger.debug("Alias definition '" + alias + "' registered for name '" + name + "'");
+				}
+			}
+		}
+}
+```
 
 
 
+##### alias标签
+
+​		`alias`标签的作用和`bean`标签中的`name`属性是一样的。
+
+```java
+// DefaultBeanDefinitionDocumentReader 类
+protected void processAliasRegistration(Element ele) {
+    	// 获取 beanName
+		String name = ele.getAttribute(NAME_ATTRIBUTE);
+    	// 获取 alias
+		String alias = ele.getAttribute(ALIAS_ATTRIBUTE);
+		boolean valid = true;
+		if (!StringUtils.hasText(name)) {
+			getReaderContext().error("Name must not be empty", ele);
+			valid = false;
+		}
+		if (!StringUtils.hasText(alias)) {
+			getReaderContext().error("Alias must not be empty", ele);
+			valid = false;
+		}
+		if (valid) {
+			try {
+                // 注册 alias
+				getReaderContext().getRegistry().registerAlias(name, alias);
+			}
+			catch (Exception ex) {
+				getReaderContext().error("Failed to register alias '" + alias +
+						"' for bean with name '" + name + "'", ele, ex);
+			}
+            // 别名注册后通知监听器做处理
+			getReaderContext().fireAliasRegistered(name, alias, extractSource(ele));
+		}
+}
+```
 
 
+
+##### import标签
+
+​		如果将所有的配置都配置在一个文件中，文件会极其庞大，难以维护。可以将其拆开放置在不同的位置，然后在主配置文件中通过`import`标签引入。
+
+```java
+protected void importBeanDefinitionResource(Element ele) {
+    	// 获取 resource 属性
+		String location = ele.getAttribute(RESOURCE_ATTRIBUTE);
+		if (!StringUtils.hasText(location)) {
+			getReaderContext().error("Resource location must not be empty", ele);
+			return;
+		}
+
+		// Resolve system properties: e.g. "${user.dir}"
+    	// 解析系统属性
+		location = getReaderContext().getEnvironment().resolveRequiredPlaceholders(location);
+
+		Set<Resource> actualResources = new LinkedHashSet<>(4);
+
+		// Discover whether the location is an absolute or relative URI
+    	// 判断 location 是绝对 URI 还是相对 URI
+		boolean absoluteLocation = false;
+		try {
+			absoluteLocation = ResourcePatternUtils.isUrl(location) || ResourceUtils.toURI(location).isAbsolute();
+		}
+		catch (URISyntaxException ex) {
+			// cannot convert to an URI, considering the location relative
+			// unless it is the well-known Spring prefix "classpath*:"
+		}
+
+		// Absolute or relative?
+    	// 绝对 URI 直接根据地址加载对应的配置文件
+		if (absoluteLocation) {
+			try {
+				int importCount = getReaderContext().getReader().loadBeanDefinitions(location, actualResources);
+				if (logger.isDebugEnabled()) {
+					logger.debug("Imported " + importCount + " bean definitions from URL location [" + location + "]");
+				}
+			}
+			catch (BeanDefinitionStoreException ex) {
+				getReaderContext().error(
+						"Failed to import bean definitions from URL location [" + location + "]", ele, ex);
+			}
+		}
+		else {
+			// No URL -> considering resource location as relative to the current file.
+            // 相对 URI 则根据相对地址计算出绝对地址
+			try {
+				int importCount;
+                /**
+                	尝试使用 Resource 的子类进行解析
+                */
+				Resource relativeResource = getReaderContext().getResource().createRelative(location);
+				if (relativeResource.exists()) {
+					importCount = getReaderContext().getReader().loadBeanDefinitions(relativeResource);
+					actualResources.add(relativeResource);
+				}
+				else {
+                    // 如果解析不成功，则使用默认的解析器 ResourcePatternResolver 进行解析
+					String baseLocation = getReaderContext().getResource().getURL().toString();
+					importCount = getReaderContext().getReader().loadBeanDefinitions(
+							StringUtils.applyRelativePath(baseLocation, location), actualResources);
+				}
+				if (logger.isDebugEnabled()) {
+					logger.debug("Imported " + importCount + " bean definitions from relative location [" + location + "]");
+				}
+			}
+			catch (IOException ex) {
+				getReaderContext().error("Failed to resolve current resource location", ele, ex);
+			}
+			catch (BeanDefinitionStoreException ex) {
+				getReaderContext().error("Failed to import bean definitions from relative location [" + location + "]",
+						ele, ex);
+			}
+		}
+    	// 解析后进行监听器激活处理
+		Resource[] actResArray = actualResources.toArray(new Resource[0]);
+		getReaderContext().fireImportProcessed(location, actResArray, extractSource(ele));
+}
+```
+
+
+
+##### 嵌入式beans
+
+​		对于嵌入式`beans`标签来讲，与单独的配置文件并没有太大的差别，即递归调用`beans`的解析过程。
 
 
 
