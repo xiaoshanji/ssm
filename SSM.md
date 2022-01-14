@@ -5093,6 +5093,231 @@ protected void importBeanDefinitionResource(Element ele) {
 
 
 
+#### 自定义标签
+
+​		当需要在`Spring`中配置较复杂的配置时，仅仅使用`Spring`提供的配置是远远不够的。`Spring`提供了可扩展`Schema`的支持`(`前提是要把`Spring`的`Core`包
+
+加入项目中`)`：
+
+​				1、创建一个需要扩展的组件。
+
+​				2、定义一个`XSD`文件描述组件内容。
+
+​				3、创建一个文件，实现`BeanDefinitionParser`接口，用来解析`XSD`文件中的定义和组件定义。
+
+​				4、创建一个`Handler`文件，扩展自`NamespaceHandlerSupport`，目的是将组件注册到`Spring`容器。
+
+​				5、编写`Spring.handlers`和`Spring.schemas`文件。
+
+
+
+```java
+// DefaultBeanDefinitionDocumentReader 类
+protected void parseBeanDefinitions(Element root, BeanDefinitionParserDelegate delegate) {
+		if (delegate.isDefaultNamespace(root)) {
+			NodeList nl = root.getChildNodes();
+			for (int i = 0; i < nl.getLength(); i++) {
+				Node node = nl.item(i);
+				if (node instanceof Element) {
+					Element ele = (Element) node;
+					if (delegate.isDefaultNamespace(ele)) {
+						parseDefaultElement(ele, delegate);
+					}
+					else {
+						delegate.parseCustomElement(ele); // 解析自定义标签
+					}
+				}
+			}
+		}
+		else {
+			delegate.parseCustomElement(root); // 解析自定义标签
+		}
+}
+
+```
+
+```java
+// BeanDefinitionParserDelegate 类
+public BeanDefinition parseCustomElement(Element ele) {
+		return parseCustomElement(ele, null);
+}
+
+public BeanDefinition parseCustomElement(Element ele, @Nullable BeanDefinition containingBd) {
+    	// 获取对应的命名空间
+		String namespaceUri = getNamespaceURI(ele);
+		if (namespaceUri == null) {
+			return null;
+		}
+    	// 根据命名空间定位对应的 NamespaceHandler
+		NamespaceHandler handler = this.readerContext.getNamespaceHandlerResolver().resolve(namespaceUri);
+		if (handler == null) {
+			error("Unable to locate Spring NamespaceHandler for XML schema namespace [" + namespaceUri + "]", ele);
+			return null;
+		}
+    	// 调用自定义的 NamespaceHandler 进行解析
+		return handler.parse(ele, new ParserContext(this.readerContext, this, containingBd));
+}
+```
+
+​		在获取自定义标签处理器时，`readerContext`初始化的时候其属性`namespaceHandlerResolver`已经被初始化为了`DefaultNamespaceHandlerResolver`的实例：
+
+```java
+// DefaultNamespaceHandlerResolver 类
+public NamespaceHandler resolve(String namespaceUri) {
+    	// 获取已经配置的 handler 映射
+		Map<String, Object> handlerMappings = getHandlerMappings();
+    	// 根据命名空间找到对应的信息
+		Object handlerOrClassName = handlerMappings.get(namespaceUri);
+		if (handlerOrClassName == null) {
+			return null;
+		}
+		else if (handlerOrClassName instanceof NamespaceHandler) {
+            // 已经做过解析的情况，直接从缓存读取
+			return (NamespaceHandler) handlerOrClassName;
+		}
+		else {
+            // 没有做过解析，则返回类路径
+			String className = (String) handlerOrClassName;
+			try {
+                // 使用反射转化为类
+				Class<?> handlerClass = ClassUtils.forName(className, this.classLoader);
+				if (!NamespaceHandler.class.isAssignableFrom(handlerClass)) {
+					throw new FatalBeanException("Class [" + className + "] for namespace [" + namespaceUri +
+							"] does not implement the [" + NamespaceHandler.class.getName() + "] interface");
+				}
+                // 初始化
+				NamespaceHandler namespaceHandler = (NamespaceHandler) BeanUtils.instantiateClass(handlerClass);
+                // 调用自定义 NamespaceHandler 的初始化方法
+				namespaceHandler.init();
+                // 记录到缓存
+				handlerMappings.put(namespaceUri, namespaceHandler);
+				return namespaceHandler;
+			}
+			catch (ClassNotFoundException ex) {
+				throw new FatalBeanException("Could not find NamespaceHandler class [" + className +
+						"] for namespace [" + namespaceUri + "]", ex);
+			}
+			catch (LinkageError err) {
+				throw new FatalBeanException("Unresolvable class definition for NamespaceHandler class [" +
+						className + "] for namespace [" + namespaceUri + "]", err);
+			}
+		}
+}
+```
+
+​		得到了解析器以及要分析的元素后，`Spring`就可以将解析工作委托给自定义解析器去解析了：
+
+```java
+return handler.parse(ele, new ParserContext(this.readerContext, this, containingBd));
+```
+
+​		但通常实现的自定义命名空间处理器中并没有实现`parse`方法，所以这个方法是父类中的实现：
+
+```java
+// NamespaceHandlerSupport
+public BeanDefinition parse(Element element, ParserContext parserContext) {
+    	// 寻找解析器
+		BeanDefinitionParser parser = findParserForElement(element, parserContext);
+    	// 解析元素
+		return (parser != null ? parser.parse(element, parserContext) : null);
+}
+```
+
+```java
+private BeanDefinitionParser findParserForElement(Element element, ParserContext parserContext) {
+    	// 获取元素名称
+		String localName = parserContext.getDelegate().getLocalName(element);
+    	// 找到对应的解析器
+		BeanDefinitionParser parser = this.parsers.get(localName);
+		if (parser == null) {
+			parserContext.getReaderContext().fatal(
+					"Cannot locate BeanDefinitionParser for element [" + localName + "]", element);
+		}
+		return parser;
+}
+```
+
+```java
+// AbstractBeanDefinitionParser 类
+public final BeanDefinition parse(Element element, ParserContext parserContext) {
+		AbstractBeanDefinition definition = parseInternal(element, parserContext);
+		if (definition != null && !parserContext.isNested()) {
+			try {
+				String id = resolveId(element, definition, parserContext);
+				if (!StringUtils.hasText(id)) {
+					parserContext.getReaderContext().error(
+							"Id is required for element '" + parserContext.getDelegate().getLocalName(element)
+									+ "' when used as a top-level tag", element);
+				}
+				String[] aliases = null;
+				if (shouldParseNameAsAliases()) {
+					String name = element.getAttribute(NAME_ATTRIBUTE);
+					if (StringUtils.hasLength(name)) {
+						aliases = StringUtils.trimArrayElements(StringUtils.commaDelimitedListToStringArray(name));
+					}
+				}
+                // 将 AbstractBeanDefinition 转换为 BeanDefinitionHolder 并注册
+				BeanDefinitionHolder holder = new BeanDefinitionHolder(definition, id, aliases);
+				registerBeanDefinition(holder, parserContext.getRegistry());
+				if (shouldFireEvents()) {
+                    // 通知监听器进行处理
+					BeanComponentDefinition componentDefinition = new BeanComponentDefinition(holder);
+					postProcessComponentDefinition(componentDefinition);
+					parserContext.registerComponent(componentDefinition);
+				}
+			}
+			catch (BeanDefinitionStoreException ex) {
+				String msg = ex.getMessage();
+				parserContext.getReaderContext().error((msg != null ? msg : ex.toString()), element);
+				return null;
+			}
+		}
+		return definition;
+}
+```
+
+```java
+// AbstractSingleBeanDefinitionParser 类
+protected final AbstractBeanDefinition parseInternal(Element element, ParserContext parserContext) {
+		BeanDefinitionBuilder builder = BeanDefinitionBuilder.genericBeanDefinition();
+		String parentName = getParentName(element);
+		if (parentName != null) {
+			builder.getRawBeanDefinition().setParentName(parentName);
+		}
+    	// 获取自定义标签中的 class 此时会调用自定义解析器
+		Class<?> beanClass = getBeanClass(element);
+		if (beanClass != null) {
+			builder.getRawBeanDefinition().setBeanClass(beanClass);
+		}
+		else {
+            // 若子类没有重写 getBeanClass ，则尝试调用子类的 getBeanClassName 方法
+			String beanClassName = getBeanClassName(element);
+			if (beanClassName != null) {
+				builder.getRawBeanDefinition().setBeanClassName(beanClassName);
+			}
+		}
+		builder.getRawBeanDefinition().setSource(parserContext.extractSource(element));
+		BeanDefinition containingBd = parserContext.getContainingBeanDefinition();
+		if (containingBd != null) {
+			// Inner bean definition must receive same scope as containing bean.
+            // 若存在父类则使用父类的 scope 属性
+			builder.setScope(containingBd.getScope());
+		}
+		if (parserContext.isDefaultLazyInit()) {
+			// Default-lazy-init applies to custom bean definitions as well.
+            // 配置延迟加载
+			builder.setLazyInit(true);
+		}
+    	// 调用子类的 doParse 方法
+		doParse(element, parserContext, builder);
+		return builder.getBeanDefinition();
+}
+```
+
+
+
+
+
 
 
 # 二、设计模式
