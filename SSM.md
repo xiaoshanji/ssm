@@ -5811,7 +5811,238 @@ protected void addSingleton(String beanName, Object singletonObject) {
 
 
 
+#### 准备创建bean
 
+```java
+// AbstractAutowireCapableBeanFactory 类
+protected Object createBean(String beanName, RootBeanDefinition mbd, @Nullable Object[] args) throws BeanCreationException {
+        if (this.logger.isTraceEnabled()) {
+            this.logger.trace("Creating instance of bean '" + beanName + "'");
+        }
+
+        RootBeanDefinition mbdToUse = mbd;
+    	// 锁定 class ，根据设置的 class 属性或者根据 className 来解析 Class
+        Class<?> resolvedClass = this.resolveBeanClass(mbd, beanName, new Class[0]);
+        if (resolvedClass != null && !mbd.hasBeanClass() && mbd.getBeanClassName() != null) {
+            mbdToUse = new RootBeanDefinition(mbd);
+            mbdToUse.setBeanClass(resolvedClass);
+        }
+
+        try {
+            // 验证及准备覆盖的方法
+            mbdToUse.prepareMethodOverrides();
+        } catch (BeanDefinitionValidationException var9) {
+            throw new BeanDefinitionStoreException(mbdToUse.getResourceDescription(), beanName, "Validation of method overrides failed", var9);
+        }
+
+        Object beanInstance;
+        try {
+            // 给 BeanPostProcessors 一个机会来返回代理来替代真正的实例
+            beanInstance = this.resolveBeforeInstantiation(beanName, mbdToUse);
+            // 短路判断，AOP 的前置通知基于此
+            if (beanInstance != null) {
+                return beanInstance;
+            }
+        } catch (Throwable var10) {
+            throw new BeanCreationException(mbdToUse.getResourceDescription(), beanName, "BeanPostProcessor before instantiation of bean failed", var10);
+        }
+
+        try {
+            beanInstance = this.doCreateBean(beanName, mbdToUse, args);
+            if (this.logger.isTraceEnabled()) {
+                this.logger.trace("Finished creating instance of bean '" + beanName + "'");
+            }
+
+            return beanInstance;
+        } catch (ImplicitlyAppearedSingletonException | BeanCreationException var7) {
+            throw var7;
+        } catch (Throwable var8) {
+            throw new BeanCreationException(mbdToUse.getResourceDescription(), beanName, "Unexpected exception during bean creation", var8);
+        }
+}
+
+
+protected Object createBean(String beanName, RootBeanDefinition mbd, @Nullable Object[] args)
+			throws BeanCreationException {
+
+		if (logger.isTraceEnabled()) {
+			logger.trace("Creating instance of bean '" + beanName + "'");
+		}
+		RootBeanDefinition mbdToUse = mbd;
+
+    	// 锁定 class ，根据设置的 class 属性或者根据 className 来解析 Class
+		Class<?> resolvedClass = resolveBeanClass(mbd, beanName);
+		if (resolvedClass != null && !mbd.hasBeanClass() && mbd.getBeanClassName() != null) {
+			mbdToUse = new RootBeanDefinition(mbd);
+			mbdToUse.setBeanClass(resolvedClass);
+		}
+
+		// Prepare method overrides.
+		try {
+            // 验证及准备覆盖的方法
+			mbdToUse.prepareMethodOverrides();
+		}
+		catch (BeanDefinitionValidationException ex) {
+			throw new BeanDefinitionStoreException(mbdToUse.getResourceDescription(),
+					beanName, "Validation of method overrides failed", ex);
+		}
+
+		try {
+			// Give BeanPostProcessors a chance to return a proxy instead of the target bean instance.
+            // 给 BeanPostProcessors 一个机会来返回代理来替代真正的实例
+			Object bean = resolveBeforeInstantiation(beanName, mbdToUse);
+            // 短路判断，AOP 的前置通知基于此
+			if (bean != null) {
+				return bean;
+			}
+		}
+		catch (Throwable ex) {
+			throw new BeanCreationException(mbdToUse.getResourceDescription(), beanName,
+					"BeanPostProcessor before instantiation of bean failed", ex);
+		}
+
+		try {
+			Object beanInstance = doCreateBean(beanName, mbdToUse, args);
+			if (logger.isTraceEnabled()) {
+				logger.trace("Finished creating instance of bean '" + beanName + "'");
+			}
+			return beanInstance;
+		}
+		catch (BeanCreationException | ImplicitlyAppearedSingletonException ex) {
+			throw ex;
+		}
+		catch (Throwable ex) {
+			throw new BeanCreationException(
+					mbdToUse.getResourceDescription(), beanName, "Unexpected exception during bean creation", ex);
+		}
+}
+```
+
+
+
+##### 处理override属性
+
+​		`Spring`配置中是存在`lookup-method`和`replace-method`，这两个配置的加载其实就是将配置统一存放在`BeanDefinition`中的`methodOverrides`属性里。
+
+```java
+// AbstractBeanDefinition 类
+public void prepareMethodOverrides() throws BeanDefinitionValidationException {
+        if (this.hasMethodOverrides()) {
+            this.getMethodOverrides().getOverrides().forEach(this::prepareMethodOverride);
+        }
+
+}
+protected void prepareMethodOverride(MethodOverride mo) throws BeanDefinitionValidationException {
+    	// 获取对应类中对应方法名的个数
+        int count = ClassUtils.getMethodCountForName(this.getBeanClass(), mo.getMethodName());
+        if (count == 0) {
+            throw new BeanDefinitionValidationException("Invalid method override: no method with name '" + mo.getMethodName() + "' on class [" + this.getBeanClassName() + "]");
+        } else {
+            if (count == 1) {
+                // 标记 MethodOverride 暂未被覆盖，避免参数类型检查的开销
+                mo.setOverloaded(false);
+            }
+
+        }
+}
+```
+
+
+
+##### 前置处理
+
+```java
+// AbstractAutowireCapableBeanFactory 类
+protected Object resolveBeforeInstantiation(String beanName, RootBeanDefinition mbd) {
+        Object bean = null;
+    	// 尚未被解析
+        if (!Boolean.FALSE.equals(mbd.beforeInstantiationResolved)) {
+            if (!mbd.isSynthetic() && this.hasInstantiationAwareBeanPostProcessors()) {
+                Class<?> targetType = this.determineTargetType(beanName, mbd);
+                if (targetType != null) {
+                    // 对后处理器中的所有 InstantiationAwareBeanPostProcessor 类型的后处理器进行 postProcessBeforeInstantiation 方法调用
+                    bean = this.applyBeanPostProcessorsBeforeInstantiation(targetType, beanName);
+                    if (bean != null) {
+                        // BeanPostProcessor 的 postProcessAfterInitialization 方法的调用
+                        bean = this.applyBeanPostProcessorsAfterInitialization(bean, beanName);
+                    }
+                }
+            }
+
+            mbd.beforeInstantiationResolved = bean != null;
+        }
+
+        return bean;
+}
+
+public Object applyBeanPostProcessorsBeforeInitialization(Object existingBean, String beanName)
+			throws BeansException {
+
+		Object result = existingBean;
+		for (BeanPostProcessor processor : getBeanPostProcessors()) {
+			Object current = processor.postProcessBeforeInitialization(result, beanName);
+			if (current == null) {
+				return result;
+			}
+			result = current;
+		}
+		return result;
+}
+
+public Object applyBeanPostProcessorsAfterInitialization(Object existingBean, String beanName)
+			throws BeansException {
+
+		Object result = existingBean;
+		for (BeanPostProcessor processor : getBeanPostProcessors()) {
+			Object current = processor.postProcessAfterInitialization(result, beanName);
+			if (current == null) {
+				return result;
+			}
+			result = current;
+		}
+		return result;
+}
+```
+
+
+
+#### 循环依赖
+
+​		1、构造器循环依赖
+
+​				表示通过构造器注入构成的循环依赖，此依赖是无法解决的，只能抛出`BeanCurrentlyInCreationException`异常表示循环依赖。`Spring`容器将每一个正
+
+​		在创建的`bean`标识符放在一个`"`当前创建`bean`池`"`中，`bean`标识符在创建过程中将一直保持在这个池中，因此如果在创建`bean`过程中发现自己已经在池
+
+​		里时，将抛出`BeanCurrentlyInCreationException`异常表示循环依赖；而对于创建完毕的`bean`将从池中清除掉。
+
+​		2、`setter`循环依赖
+
+​				表示通过`setter`注入方式构成的循环依赖。对于`setter`注入造成的依赖是通过`Spring`容器提前暴露刚完成构造器注入但未完成其他步骤的`bean`来完
+
+​		成的，而且只能解决单例作用域的`bean`循环依赖。通过提前暴露一个单例工厂方法，从而使其他`bean`能引用到该`bean`。
+
+```java
+// AbstractAutowireCapableBeanFactory 类
+protected Object doCreateBean(final String beanName, final RootBeanDefinition mbd, final @Nullable Object[] args)
+			throws BeanCreationException {
+		...
+		if (earlySingletonExposure) {
+			if (logger.isTraceEnabled()) {
+				logger.trace("Eagerly caching bean '" + beanName +
+						"' to allow for resolving potential circular references");
+			}
+			addSingletonFactory(beanName, () -> getEarlyBeanReference(beanName, mbd, bean)); // 暴露单例工厂
+		}
+		...
+}
+```
+
+​		3、`prototype`范围的依赖处理
+
+​				对于`prototype`作用域`bean`，`Spring`容器无法完成依赖注入，因为`Spring`容器不进行缓存`prototype`作用域的`bean`，因此无法提前暴露一个创建中
+
+​		的`bean`。
 
 
 
