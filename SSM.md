@@ -6176,7 +6176,7 @@ protected Object doCreateBean(final String beanName, final RootBeanDefinition mb
 ##### 创建 bean 的实例
 
 ```java
-// AbstractAutowireCapableBeanFactory 类
+                                                                      -// AbstractAutowireCapableBeanFactory 类
 protected BeanWrapper createBeanInstance(String beanName, RootBeanDefinition mbd, @Nullable Object[] args) {
 		// Make sure bean class is actually resolved at this point.
     	// 解析 class
@@ -7163,6 +7163,302 @@ protected void registerDisposableBeanIfNecessary(String beanName, Object bean, R
 		}
 }
 ```
+
+
+
+### ApplicationContext
+
+​		`ApplicationContext`和`BeanFacotry`两者都是用于加载`Bean`的，但是相比之下，`ApplicationContext`提供了更多的扩展功能，简单一点说：
+
+`ApplicationContext`包含`BeanFactory`的所有功能。
+
+```java
+public class ClassPathXmlApplicationContext extends AbstractXmlApplicationContext {
+    @Nullable
+    private Resource[] configResources;
+    
+    public ClassPathXmlApplicationContext(String configLocation) throws BeansException {
+        this(new String[]{configLocation}, true, (ApplicationContext)null);
+    }
+
+    public ClassPathXmlApplicationContext(
+			String[] configLocations, boolean refresh, @Nullable ApplicationContext parent)
+			throws BeansException {
+
+		super(parent);
+        // 设置配置路径
+		setConfigLocations(configLocations);
+		if (refresh) {
+			refresh();
+		}
+	}
+    ...
+}
+```
+
+```java
+// AbstractRefreshableConfigApplicationContext 类
+public void setConfigLocations(@Nullable String... locations) {
+		if (locations != null) {
+			Assert.noNullElements(locations, "Config locations must not be null");
+			this.configLocations = new String[locations.length];
+			for (int i = 0; i < locations.length; i++) {
+				this.configLocations[i] = resolvePath(locations[i]).trim(); // 解析给定路径
+			}
+		}
+		else {
+			this.configLocations = null;
+		}
+}
+```
+
+```java
+// AbstractApplicationContext 类
+// 这个函数几乎包含了 ApplicationContext 提供的全部功能
+public void refresh() throws BeansException, IllegalStateException {
+		synchronized (this.startupShutdownMonitor) {
+			// Prepare this context for refreshing.
+            // 准备刷新上下文环境，对系统属性或者环境变量进行准备及验证。
+			prepareRefresh();
+
+			// Tell the subclass to refresh the internal bean factory.
+            // 初始化BeanFactory，并进行 XML 文件读取，复用 BeanFactory 中的配置文件读取解析及其他功能，经过这一步之后，已经包含了 BeanFactory 所提		供的功能
+			ConfigurableListableBeanFactory beanFactory = obtainFreshBeanFactory();
+
+			// Prepare the bean factory for use in this context.
+            // 对 BeanFactory 进行各种功能填充，@Qualifier 与 @Autowired 在这一步骤中增加的支持
+			prepareBeanFactory(beanFactory);
+
+			try {
+				// Allows post-processing of the bean factory in context subclasses.
+                // 子类覆盖方法做额外的处理
+				postProcessBeanFactory(beanFactory);
+
+				// Invoke factory processors registered as beans in the context.
+                // 激活各种 BeanFactory 处理器
+				invokeBeanFactoryPostProcessors(beanFactory);
+
+				// Register bean processors that intercept bean creation.
+                // 注册拦截 Bean 创建的 Bean 处理器，这里只是注册，真正的调用在 getBean 
+				registerBeanPostProcessors(beanFactory);
+
+				// Initialize message source for this context.
+                // 为上下文初始化 Message 源，即不同语言的消息体，国际化处理
+				initMessageSource();
+
+				// Initialize event multicaster for this context.
+                // 初始化应用消息广播器，并放入 applicationEventMulticaster bean 中
+				initApplicationEventMulticaster();
+
+				// Initialize other special beans in specific context subclasses.
+                // 留给子类来初始化其它的 Bean
+				onRefresh();
+
+				// Check for listener beans and register them.
+                // 在所有注册的 bean 中查找 Listener bean，注册到消息广播器中
+				registerListeners();
+
+				// Instantiate all remaining (non-lazy-init) singletons.
+                // 初始化剩下的单实例（非惰性的)
+				finishBeanFactoryInitialization(beanFactory);
+
+				// Last step: publish corresponding event.
+                // 完成刷新过程，通知生命周期处理器 lifecycleProcessor 刷新过程，同时发出 ContextRefreshEvent 通知别人
+				finishRefresh();
+			}
+
+			catch (BeansException ex) {
+				if (logger.isWarnEnabled()) {
+					logger.warn("Exception encountered during context initialization - " +
+							"cancelling refresh attempt: " + ex);
+				}
+
+				destroyBeans();
+
+				cancelRefresh(ex);
+
+				throw ex;
+			}
+
+			finally {
+				resetCommonCaches();
+			}
+		}
+}
+```
+
+
+
+#### 环境准备
+
+```java
+// AbstractApplicationContext 类
+protected void prepareRefresh() {
+		// Switch to active.
+		this.startupDate = System.currentTimeMillis();
+		this.closed.set(false);
+		this.active.set(true);
+
+		if (logger.isDebugEnabled()) {
+			if (logger.isTraceEnabled()) {
+				logger.trace("Refreshing " + this);
+			}
+			else {
+				logger.debug("Refreshing " + getDisplayName());
+			}
+		}
+
+		// Initialize any placeholder property sources in the context environment.
+    	// 留给子类覆盖
+		initPropertySources();
+
+		// Validate that all properties marked as required are resolvable:
+		// see ConfigurablePropertyResolver#setRequiredProperties
+    	// 验证需要的属性文件是否都已经放入环境中，可以调用 getEnvironment.setRequiredProperties 添加验证要求
+		getEnvironment().validateRequiredProperties();
+
+		// Store pre-refresh ApplicationListeners...
+		if (this.earlyApplicationListeners == null) {
+			this.earlyApplicationListeners = new LinkedHashSet<>(this.applicationListeners);
+		}
+		else {
+			// Reset local application listeners to pre-refresh state.
+			this.applicationListeners.clear();
+			this.applicationListeners.addAll(this.earlyApplicationListeners);
+		}
+
+		// Allow for the collection of early ApplicationEvents,
+		// to be published once the multicaster is available...
+		this.earlyApplicationEvents = new LinkedHashSet<>();
+}
+```
+
+
+
+#### 加载 BeanFactory
+
+​		`obtainFreshBeanFactory`方法是获取`BeanFactory`。`ApplicationContext`是对`BeanFactory`的功能上的扩展，不但包含了`BeanFactory`的全部功能更在其基
+
+础上添加了大量的扩展应用，那么`obtainFreshBeanFactory`正是实现`BeanFactory`的地方，也就是经过了这个函数后`ApplicationContext`就已经拥有了
+
+`BeanFactory`的全部功能。
+
+```java
+// AbstractApplicationContext 类
+protected ConfigurableListableBeanFactory obtainFreshBeanFactory() {
+    	// 初始化 BeanFactory，并进行 XML 文件读取，并将得到的 BeanFacotry 记录在当前实体的属性中
+		refreshBeanFactory();
+    	// 返回当前实体的 beanFactory 属性
+		return getBeanFactory();
+}
+```
+
+```java
+// AbstractRefreshableApplicationContext 类
+protected final void refreshBeanFactory() throws BeansException {
+		if (hasBeanFactory()) {
+			destroyBeans();
+			closeBeanFactory();
+		}
+		try {
+            // 创建 DefaultListableBeanFactory
+			DefaultListableBeanFactory beanFactory = createBeanFactory();
+            // 为了序列化指定 id，如果需要的话，让这个 BeanFactory 从 id 反序列化到 BeanFactory 对象
+			beanFactory.setSerializationId(getId());
+            // 定制 beanFactory，设置相关属性，包括是否允许覆盖同名称的不同定义的对象以及循环依赖以及
+            // 设置 @Autowired 和 @Qualifier 注解解析器 QualifierAnnotationAutowireCandidateResolver
+			customizeBeanFactory(beanFactory);
+            // 初始化 DodumentReader，并进行XML文件读取及解析
+			loadBeanDefinitions(beanFactory);
+			synchronized (this.beanFactoryMonitor) {
+				this.beanFactory = beanFactory;
+			}
+		}
+		catch (IOException ex) {
+			throw new ApplicationContextException("I/O error parsing bean definition source for " + getDisplayName(), ex);
+		}
+}
+```
+
+
+
+##### 定制 BeanFactory
+
+​		在基本容器的基础上，增加了是否允许覆盖、是否允许扩展的设置并提供了注解`@Qualifier`和`@Autowired`的支持。
+
+```java
+protected void customizeBeanFactory(DefaultListableBeanFactory beanFactory) {
+    	// 如果属性 allowBeanDefinitionOverriding 不为空，设置给 beanFactory 对象相应属性
+    	// 此属性的含义：是否允许覆盖同名称的不同定义的对象
+		if (this.allowBeanDefinitionOverriding != null) {
+			beanFactory.setAllowBeanDefinitionOverriding(this.allowBeanDefinitionOverriding);
+		}
+    	// 如果属性 allowCircularReferences 不为空，设置给 beanFactory 对象相应属性
+    	// 此属性的含义:是否允许 bean 之间存在循环依赖
+		if (this.allowCircularReferences != null) {
+			beanFactory.setAllowCircularReferences(this.allowCircularReferences);
+		}
+}
+```
+
+
+
+##### 加载 BeanDefinition
+
+​		在已经初始化`DefaultListableBeanFactory`后，还需要`XmlBeanDefinitionReader`来读取`XML`，在这个步骤中首先要做的就是初始化
+
+`XmlBeanDefinitionReader`。
+
+```java
+// AbstractXmlApplicationContext 类
+protected void loadBeanDefinitions(DefaultListableBeanFactory beanFactory) throws BeansException, IOException {
+		// Create a new XmlBeanDefinitionReader for the given BeanFactory.
+    	// //为指定 beanFactory 创建 XmlBeanDefinitionReader
+		XmlBeanDefinitionReader beanDefinitionReader = new XmlBeanDefinitionReader(beanFactory);
+
+		// Configure the bean definition reader with this context's
+		// resource loading environment.
+    	// 对 beanDefinitionReader 进行环境变量的设置
+		beanDefinitionReader.setEnvironment(this.getEnvironment());
+		beanDefinitionReader.setResourceLoader(this);
+		beanDefinitionReader.setEntityResolver(new ResourceEntityResolver(this));
+
+		// Allow a subclass to provide custom initialization of the reader,
+		// then proceed with actually loading the bean definitions.
+	    // 对 BeanDefinitionReader 进行设置,可以覆盖
+		initBeanDefinitionReader(beanDefinitionReader);
+		loadBeanDefinitions(beanDefinitionReader);
+}
+
+protected void loadBeanDefinitions(XmlBeanDefinitionReader reader) throws BeansException, IOException {
+		Resource[] configResources = getConfigResources();
+		if (configResources != null) {
+			reader.loadBeanDefinitions(configResources);
+		}
+		String[] configLocations = getConfigLocations();
+		if (configLocations != null) {
+			reader.loadBeanDefinitions(configLocations);
+		}
+}
+```
+
+​		在`XmlBeanDefinitionReader`中已经将之前初始化的`DefaultListableBeanFactory`注册进去了，所以`XmIBeanDefinitionReader`所读取的
+
+`BeanDefinitionHolder`都会注册到`DefaultListableBeanFactory`中，也就是经过此步骤，类型`DefaultListableBeanFactory`的变量`beanFactory`已经包含了所有
+
+解析好的配置。
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
