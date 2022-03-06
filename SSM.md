@@ -7450,6 +7450,459 @@ protected void loadBeanDefinitions(XmlBeanDefinitionReader reader) throws BeansE
 
 
 
+#### 功能扩展
+
+​		`prepareBeanFactory`前，`Spring`已经完成了对配置的解析，而`ApplicationContext`在功能上的扩展也由此展开。
+
+```java
+// AbstractApplicationContext 类
+protected void prepareBeanFactory(ConfigurableListableBeanFactory beanFactory) {
+		// Tell the internal bean factory to use the context's class loader etc.
+    	// 设置 beanFactory 的 classLoader 为当前 context 的 classLoader
+		beanFactory.setBeanClassLoader(getClassLoader());
+    	// 设置 beanFactory 的表达式语言处理器，Spring 3 增加了 SpEL 表达式语言的支持
+    	// 默认可以使用 #{bean.xxx} 的形式来调用相关属性值。
+		beanFactory.setBeanExpressionResolver(new StandardBeanExpressionResolver(beanFactory.getBeanClassLoader()));
+    	// 为 beanFactory 增加了一个默认的 propertyEditor，这个主要是对 bean 的属性等设置管理的一个工具，即属性编辑器
+		beanFactory.addPropertyEditorRegistrar(new ResourceEditorRegistrar(this, getEnvironment()));
+
+		// Configure the bean factory with context callbacks.
+    	// 添加BeanPostProcessor
+		beanFactory.addBeanPostProcessor(new ApplicationContextAwareProcessor(this));
+    	/**
+    		设置了几个忽略自动装配的接口，这几个接口都是被 bean 实现的，即实现这几个接口的 bean 已经不是普通的 bean，所以依赖注入时需要忽略
+    	*/
+		beanFactory.ignoreDependencyInterface(EnvironmentAware.class);
+		beanFactory.ignoreDependencyInterface(EmbeddedValueResolverAware.class);
+		beanFactory.ignoreDependencyInterface(ResourceLoaderAware.class);
+		beanFactory.ignoreDependencyInterface(ApplicationEventPublisherAware.class);
+		beanFactory.ignoreDependencyInterface(MessageSourceAware.class);
+		beanFactory.ignoreDependencyInterface(ApplicationContextAware.class);
+
+		// BeanFactory interface not registered as resolvable type in a plain factory.
+		// MessageSource registered (and found for autowiring) as a bean.
+    	/**
+    		设置了几个自动装配的特殊规则，注册之后，在做依赖注入时，如果发现属性的类型是以下类型，则将对应的实例注入进去
+    	*/
+		beanFactory.registerResolvableDependency(BeanFactory.class, beanFactory);
+		beanFactory.registerResolvableDependency(ResourceLoader.class, this);
+		beanFactory.registerResolvableDependency(ApplicationEventPublisher.class, this);
+		beanFactory.registerResolvableDependency(ApplicationContext.class, this);
+
+		// Register early post-processor for detecting inner beans as ApplicationListeners.
+		beanFactory.addBeanPostProcessor(new ApplicationListenerDetector(this));
+
+		// Detect a LoadTimeWeaver and prepare for weaving, if found.
+    	// 增加对 AspectJ 的支持
+		if (beanFactory.containsBean(LOAD_TIME_WEAVER_BEAN_NAME)) {
+			beanFactory.addBeanPostProcessor(new LoadTimeWeaverAwareProcessor(beanFactory));
+			// Set a temporary ClassLoader for type matching.
+			beanFactory.setTempClassLoader(new ContextTypeMatchClassLoader(beanFactory.getBeanClassLoader()));
+		}
+
+		// Register default environment beans.
+    	// 添加默认的系统环境 bean
+		if (!beanFactory.containsLocalBean(ENVIRONMENT_BEAN_NAME)) {
+			beanFactory.registerSingleton(ENVIRONMENT_BEAN_NAME, getEnvironment());
+		}
+		if (!beanFactory.containsLocalBean(SYSTEM_PROPERTIES_BEAN_NAME)) {
+			beanFactory.registerSingleton(SYSTEM_PROPERTIES_BEAN_NAME, getEnvironment().getSystemProperties());
+		}
+		if (!beanFactory.containsLocalBean(SYSTEM_ENVIRONMENT_BEAN_NAME)) {
+			beanFactory.registerSingleton(SYSTEM_ENVIRONMENT_BEAN_NAME, getEnvironment().getSystemEnvironment());
+		}
+}
+```
+
+
+
+##### SpEL 表达式
+
+​		在源码中通过代码`beanFactory.setBeanExpressionResolver(new StandardBeanExpressionResolver())`注册语言解析器，就可以对`SpEL`进行解析了，`Spring`
+
+在`bean`进行初始化的时候会有属性填充的一步，而在这一步中`Spring`会调用`AbstractAutowireCapableBeanFactory`类的`applyPropertyValues`函数来完成功能。
+
+就在这个函数中，会通过构造`BeanDefinitionValueResolver`类型实例`valueR	esolver`来进行属性值的解析。同时，也是在这个步骤中一般通过
+
+`AbstractBeanFactory`中的`evaluateBeanDefinitionString`方法去完成`SpEL`的解析。应用语言解析器的调用主要是在解析依赖注入`bean`的时候，以及在完成
+
+`bean`的初始化和属性获取后进行属性填充的时候。
+
+
+
+##### 增加属性注册编辑器
+
+​		在`Spring DI`注入的时候可以把普通属性注入进来，但是像`Date`类型就无法被识别。解决方案：
+
+​				1、使用自定义属性编辑器，通过继承`PropertyEditorSupport`，重写`setAsText`方法，在配置文件中引人类型为
+
+​		`org.Springframework.beans.factory.config.CustomEditorConfigurer`的`bean`，并在属性`customEditors`中加入自定义的属性编辑器，其中`key`为属性编辑
+
+​		器所对应的类型。
+
+​				2、通过注册`Spring`自带的属性编辑器`CustomDateEditor`。
+
+```java
+// ResourceEditorRegistrar 类
+public void registerCustomEditors(PropertyEditorRegistry registry) {
+		ResourceEditor baseEditor = new ResourceEditor(this.resourceLoader, this.propertyResolver);
+		doRegisterEditor(registry, Resource.class, baseEditor);
+		doRegisterEditor(registry, ContextResource.class, baseEditor);
+		doRegisterEditor(registry, InputStream.class, new InputStreamEditor(baseEditor));
+		doRegisterEditor(registry, InputSource.class, new InputSourceEditor(baseEditor));
+		doRegisterEditor(registry, File.class, new FileEditor(baseEditor));
+		doRegisterEditor(registry, Path.class, new PathEditor(baseEditor));
+		doRegisterEditor(registry, Reader.class, new ReaderEditor(baseEditor));
+		doRegisterEditor(registry, URL.class, new URLEditor(baseEditor));
+
+		ClassLoader classLoader = this.resourceLoader.getClassLoader();
+		doRegisterEditor(registry, URI.class, new URIEditor(classLoader));
+		doRegisterEditor(registry, Class.class, new ClassEditor(classLoader));
+		doRegisterEditor(registry, Class[].class, new ClassArrayEditor(classLoader));
+
+		if (this.resourceLoader instanceof ResourcePatternResolver) {
+			doRegisterEditor(registry, Resource[].class,
+					new ResourceArrayPropertyEditor((ResourcePatternResolver) this.resourceLoader, this.propertyResolver));
+		}
+}
+
+private void doRegisterEditor(PropertyEditorRegistry registry, Class<?> requiredType, PropertyEditor editor) {
+		if (registry instanceof PropertyEditorRegistrySupport) {
+			((PropertyEditorRegistrySupport) registry).overrideDefaultEditor(requiredType, editor);
+		}
+		else {
+			registry.registerCustomEditor(requiredType, editor);
+		}
+}
+```
+
+​		通过查看`registerCustomEditors`方法的调用层次结构，在`bean`的初始化后会调用`ResourceEditorRegistrar`的`registerCustomEditors`方法进行批量的通用
+
+属性编辑器注册。注册后，在属性填充的环节便可以直接让`Spring`使用这些编辑器进行属性的解析了。`Spring`中用于封装`bean`的是`BeanWrapper`类型，而它又
+
+间接继承了`PropertyEditorRegistry`类型，其实大部分情况下都是`BeanWrapper`，对于`BeanWrapper`在`Spring`中的默认实现是`BeanWrapperImpl`，而
+
+`BeanWrapperImpl`除了实现`BeanWrapper`接口外还继承了`PropertyEditorRegistrySupport`。
+
+![](image/QQ截图20220306113437.png)
+
+```java
+// PropertyEditorRegistrySupport 类
+private void createDefaultEditors() {
+		this.defaultEditors = new HashMap<>(64);
+
+		// Simple editors, without parameterization capabilities.
+		// The JDK does not contain a default editor for any of these target types.
+		this.defaultEditors.put(Charset.class, new CharsetEditor());
+		this.defaultEditors.put(Class.class, new ClassEditor());
+		this.defaultEditors.put(Class[].class, new ClassArrayEditor());
+		this.defaultEditors.put(Currency.class, new CurrencyEditor());
+		this.defaultEditors.put(File.class, new FileEditor());
+		this.defaultEditors.put(InputStream.class, new InputStreamEditor());
+		this.defaultEditors.put(InputSource.class, new InputSourceEditor());
+		this.defaultEditors.put(Locale.class, new LocaleEditor());
+		this.defaultEditors.put(Path.class, new PathEditor());
+		this.defaultEditors.put(Pattern.class, new PatternEditor());
+		this.defaultEditors.put(Properties.class, new PropertiesEditor());
+		this.defaultEditors.put(Reader.class, new ReaderEditor());
+		this.defaultEditors.put(Resource[].class, new ResourceArrayPropertyEditor());
+		this.defaultEditors.put(TimeZone.class, new TimeZoneEditor());
+		this.defaultEditors.put(URI.class, new URIEditor());
+		this.defaultEditors.put(URL.class, new URLEditor());
+		this.defaultEditors.put(UUID.class, new UUIDEditor());
+		this.defaultEditors.put(ZoneId.class, new ZoneIdEditor());
+
+		// Default instances of collection editors.
+		// Can be overridden by registering custom instances of those as custom editors.
+		this.defaultEditors.put(Collection.class, new CustomCollectionEditor(Collection.class));
+		this.defaultEditors.put(Set.class, new CustomCollectionEditor(Set.class));
+		this.defaultEditors.put(SortedSet.class, new CustomCollectionEditor(SortedSet.class));
+		this.defaultEditors.put(List.class, new CustomCollectionEditor(List.class));
+		this.defaultEditors.put(SortedMap.class, new CustomMapEditor(SortedMap.class));
+
+		// Default editors for primitive arrays.
+		this.defaultEditors.put(byte[].class, new ByteArrayPropertyEditor());
+		this.defaultEditors.put(char[].class, new CharArrayPropertyEditor());
+
+		// The JDK does not contain a default editor for char!
+		this.defaultEditors.put(char.class, new CharacterEditor(false));
+		this.defaultEditors.put(Character.class, new CharacterEditor(true));
+
+		// Spring's CustomBooleanEditor accepts more flag values than the JDK's default editor.
+		this.defaultEditors.put(boolean.class, new CustomBooleanEditor(false));
+		this.defaultEditors.put(Boolean.class, new CustomBooleanEditor(true));
+
+		// The JDK does not contain default editors for number wrapper types!
+		// Override JDK primitive number editors with our own CustomNumberEditor.
+		this.defaultEditors.put(byte.class, new CustomNumberEditor(Byte.class, false));
+		this.defaultEditors.put(Byte.class, new CustomNumberEditor(Byte.class, true));
+		this.defaultEditors.put(short.class, new CustomNumberEditor(Short.class, false));
+		this.defaultEditors.put(Short.class, new CustomNumberEditor(Short.class, true));
+		this.defaultEditors.put(int.class, new CustomNumberEditor(Integer.class, false));
+		this.defaultEditors.put(Integer.class, new CustomNumberEditor(Integer.class, true));
+		this.defaultEditors.put(long.class, new CustomNumberEditor(Long.class, false));
+		this.defaultEditors.put(Long.class, new CustomNumberEditor(Long.class, true));
+		this.defaultEditors.put(float.class, new CustomNumberEditor(Float.class, false));
+		this.defaultEditors.put(Float.class, new CustomNumberEditor(Float.class, true));
+		this.defaultEditors.put(double.class, new CustomNumberEditor(Double.class, false));
+		this.defaultEditors.put(Double.class, new CustomNumberEditor(Double.class, true));
+		this.defaultEditors.put(BigDecimal.class, new CustomNumberEditor(BigDecimal.class, true));
+		this.defaultEditors.put(BigInteger.class, new CustomNumberEditor(BigInteger.class, true));
+
+		// Only register config value editors if explicitly requested.
+		if (this.configValueEditorsActive) {
+			StringArrayPropertyEditor sae = new StringArrayPropertyEditor();
+			this.defaultEditors.put(String[].class, sae);
+			this.defaultEditors.put(short[].class, sae);
+			this.defaultEditors.put(int[].class, sae);
+			this.defaultEditors.put(long[].class, sae);
+		}
+}
+```
+
+​		通过这个方法在`Spring`中定义了上面一系列常用的属性编辑器可以方便地进行配置。只有定义的 bean 中的某个属性的类型不在上面的常用配置中的话，才
+
+需要我们进行个性化属性编辑器的注册。
+
+
+
+##### 添加 ApplicationContextAwareProcessor 处理器
+
+```java
+class ApplicationContextAwareProcessor implements BeanPostProcessor {
+
+	public Object postProcessBeforeInitialization(Object bean, String beanName) throws BeansException {
+		if (!(bean instanceof EnvironmentAware || bean instanceof EmbeddedValueResolverAware ||
+				bean instanceof ResourceLoaderAware || bean instanceof ApplicationEventPublisherAware ||
+				bean instanceof MessageSourceAware || bean instanceof ApplicationContextAware)){
+			return bean;
+		}
+
+		AccessControlContext acc = null;
+
+		if (System.getSecurityManager() != null) {
+			acc = this.applicationContext.getBeanFactory().getAccessControlContext();
+		}
+
+		if (acc != null) {
+			AccessController.doPrivileged((PrivilegedAction<Object>) () -> {
+				invokeAwareInterfaces(bean);
+				return null;
+			}, acc);
+		}
+		else {
+			invokeAwareInterfaces(bean);
+		}
+
+		return bean;
+	}
+
+	private void invokeAwareInterfaces(Object bean) {
+		if (bean instanceof EnvironmentAware) {
+			((EnvironmentAware) bean).setEnvironment(this.applicationContext.getEnvironment());
+		}
+		if (bean instanceof EmbeddedValueResolverAware) {
+			((EmbeddedValueResolverAware) bean).setEmbeddedValueResolver(this.embeddedValueResolver);
+		}
+		if (bean instanceof ResourceLoaderAware) {
+			((ResourceLoaderAware) bean).setResourceLoader(this.applicationContext);
+		}
+		if (bean instanceof ApplicationEventPublisherAware) {
+			((ApplicationEventPublisherAware) bean).setApplicationEventPublisher(this.applicationContext);
+		}
+		if (bean instanceof MessageSourceAware) {
+			((MessageSourceAware) bean).setMessageSource(this.applicationContext);
+		}
+		if (bean instanceof ApplicationContextAware) {
+			((ApplicationContextAware) bean).setApplicationContext(this.applicationContext);
+		}
+	}
+}
+```
+
+​		通过`postProcessBeforeInitialization`中的`if`判断可以看出：实现这些`Aware`接口的`bean`在被初始化之后，可以取得一些对应的资源。
+
+
+
+#### BeanFactory的后处理
+
+##### 激活注册的BeanFactoryPostProcessor
+
+​		`BeanFactoryPostProcessor`接口跟`BeanPostProcessor`类似，可以对`bean`的定义`(`配置元数据`)`进行处理。也就是说，`Spring loC`容器允许
+
+`BeanFactoryPostProcessor`在容器实际实例化任何其他的`bean`之前读取配置元数据，并有可能修改它。可以配置多个`BeanFactoryPostProcessor`。还能通过设
+
+置`order`属性来控制`BeanFactoryPostProcessor`的执行次序`(`仅当`BeanFactoryPostProcessor`实现了`Ordered`接口时才可以设置此属性，因此在实现
+
+`BeanFactoryPostProcessor`时，就应当考虑实现`Ordered`接口`)`。
+
+​		想改变实际的`bean`实例，那么最好使用`BeanPostProcessor`。同样地，`BeanFactoryPostProcessor`的作用域范围是容器级的。它只和所使用的容器有关。如
+
+果在容器中定义一个`BeanFactoryPostProcessor`，它仅仅对此容器中的`bean`进行后置处理。`BeanFactoryPostProcessor`不会对定义在另一个容器中的`bean`进行
+
+后置处理，即使这两个容器都是在同一层次上。
+
+```java
+// PostProcessorRegistrationDelegate 类
+public static void invokeBeanFactoryPostProcessors(
+			ConfigurableListableBeanFactory beanFactory, List<BeanFactoryPostProcessor> beanFactoryPostProcessors) {
+
+		
+		Set<String> processedBeans = new HashSet<>();
+		// 对 BeanDefinitionRegistry 类型的处理
+		if (beanFactory instanceof BeanDefinitionRegistry) {
+			BeanDefinitionRegistry registry = (BeanDefinitionRegistry) beanFactory;
+			List<BeanFactoryPostProcessor> regularPostProcessors = new ArrayList<>();
+			List<BeanDefinitionRegistryPostProcessor> registryProcessors = new ArrayList<>();
+
+            // 硬编码注册的后处理器
+			for (BeanFactoryPostProcessor postProcessor : beanFactoryPostProcessors) {
+				if (postProcessor instanceof BeanDefinitionRegistryPostProcessor) {
+					BeanDefinitionRegistryPostProcessor registryProcessor =
+							(BeanDefinitionRegistryPostProcessor) postProcessor;
+                    // 对于 BeanDefinitionRegistryPostProcessor 类型，在 BeanFactoryPostProcessor 的基础上还有自己定义的方法,需要先调用
+					registryProcessor.postProcessBeanDefinitionRegistry(registry);
+					registryProcessors.add(registryProcessor);
+				}
+				else {
+                    // 记录常规 BeanFactoryPostProcessor
+					regularPostProcessors.add(postProcessor);
+				}
+			}
+
+			List<BeanDefinitionRegistryPostProcessor> currentRegistryProcessors = new ArrayList<>();
+
+			// First, invoke the BeanDefinitionRegistryPostProcessors that implement PriorityOrdered.
+            // 对于配置中读取的 BeanFactoryPostProcessor 的处理
+			String[] postProcessorNames =
+					beanFactory.getBeanNamesForType(BeanDefinitionRegistryPostProcessor.class, true, false);
+            // 对后处理器进行分类
+			for (String ppName : postProcessorNames) {
+                // 已经处理过
+				if (beanFactory.isTypeMatch(ppName, PriorityOrdered.class)) {
+					currentRegistryProcessors.add(beanFactory.getBean(ppName, BeanDefinitionRegistryPostProcessor.class));
+					processedBeans.add(ppName);
+				}
+			}
+			sortPostProcessors(currentRegistryProcessors, beanFactory);
+			registryProcessors.addAll(currentRegistryProcessors);
+			invokeBeanDefinitionRegistryPostProcessors(currentRegistryProcessors, registry, beanFactory.getApplicationStartup());
+			currentRegistryProcessors.clear();
+
+			// Next, invoke the BeanDefinitionRegistryPostProcessors that implement Ordered.
+			postProcessorNames = beanFactory.getBeanNamesForType(BeanDefinitionRegistryPostProcessor.class, true, false);
+			for (String ppName : postProcessorNames) {
+				if (!processedBeans.contains(ppName) && beanFactory.isTypeMatch(ppName, Ordered.class)) {
+					currentRegistryProcessors.add(beanFactory.getBean(ppName, BeanDefinitionRegistryPostProcessor.class));
+					processedBeans.add(ppName);
+				}
+			}
+			sortPostProcessors(currentRegistryProcessors, beanFactory);
+			registryProcessors.addAll(currentRegistryProcessors);
+			invokeBeanDefinitionRegistryPostProcessors(currentRegistryProcessors, registry, beanFactory.getApplicationStartup());
+			currentRegistryProcessors.clear();
+
+			// Finally, invoke all other BeanDefinitionRegistryPostProcessors until no further ones appear.
+			boolean reiterate = true;
+			while (reiterate) {
+				reiterate = false;
+				postProcessorNames = beanFactory.getBeanNamesForType(BeanDefinitionRegistryPostProcessor.class, true, false);
+				for (String ppName : postProcessorNames) {
+					if (!processedBeans.contains(ppName)) {
+						currentRegistryProcessors.add(beanFactory.getBean(ppName, BeanDefinitionRegistryPostProcessor.class));
+						processedBeans.add(ppName);
+						reiterate = true;
+					}
+				}
+				sortPostProcessors(currentRegistryProcessors, beanFactory);
+				registryProcessors.addAll(currentRegistryProcessors);
+				invokeBeanDefinitionRegistryPostProcessors(currentRegistryProcessors, registry, beanFactory.getApplicationStartup());
+				currentRegistryProcessors.clear();
+			}
+
+			// Now, invoke the postProcessBeanFactory callback of all processors handled so far.
+			invokeBeanFactoryPostProcessors(registryProcessors, beanFactory);
+			invokeBeanFactoryPostProcessors(regularPostProcessors, beanFactory);
+		}
+
+		else {
+			// Invoke factory processors registered with the context instance.
+			invokeBeanFactoryPostProcessors(beanFactoryPostProcessors, beanFactory);
+		}
+
+		// Do not initialize FactoryBeans here: We need to leave all regular beans
+		// uninitialized to let the bean factory post-processors apply to them!
+		String[] postProcessorNames =
+				beanFactory.getBeanNamesForType(BeanFactoryPostProcessor.class, true, false);
+
+		// Separate between BeanFactoryPostProcessors that implement PriorityOrdered,
+		// Ordered, and the rest.
+		List<BeanFactoryPostProcessor> priorityOrderedPostProcessors = new ArrayList<>();
+		List<String> orderedPostProcessorNames = new ArrayList<>();
+		List<String> nonOrderedPostProcessorNames = new ArrayList<>();
+		for (String ppName : postProcessorNames) {
+			if (processedBeans.contains(ppName)) {
+				// skip - already processed in first phase above
+			}
+			else if (beanFactory.isTypeMatch(ppName, PriorityOrdered.class)) {
+				priorityOrderedPostProcessors.add(beanFactory.getBean(ppName, BeanFactoryPostProcessor.class));
+			}
+			else if (beanFactory.isTypeMatch(ppName, Ordered.class)) {
+				orderedPostProcessorNames.add(ppName);
+			}
+			else {
+				nonOrderedPostProcessorNames.add(ppName);
+			}
+		}
+
+		// First, invoke the BeanFactoryPostProcessors that implement PriorityOrdered.
+		sortPostProcessors(priorityOrderedPostProcessors, beanFactory);
+		invokeBeanFactoryPostProcessors(priorityOrderedPostProcessors, beanFactory);
+
+		// Next, invoke the BeanFactoryPostProcessors that implement Ordered.
+		List<BeanFactoryPostProcessor> orderedPostProcessors = new ArrayList<>(orderedPostProcessorNames.size());
+		for (String postProcessorName : orderedPostProcessorNames) {
+			orderedPostProcessors.add(beanFactory.getBean(postProcessorName, BeanFactoryPostProcessor.class));
+		}
+		sortPostProcessors(orderedPostProcessors, beanFactory);
+		invokeBeanFactoryPostProcessors(orderedPostProcessors, beanFactory);
+
+		// Finally, invoke all other BeanFactoryPostProcessors.
+    	// 无序，直接调用
+		List<BeanFactoryPostProcessor> nonOrderedPostProcessors = new ArrayList<>(nonOrderedPostProcessorNames.size());
+		for (String postProcessorName : nonOrderedPostProcessorNames) {
+			nonOrderedPostProcessors.add(beanFactory.getBean(postProcessorName, BeanFactoryPostProcessor.class));
+		}
+		invokeBeanFactoryPostProcessors(nonOrderedPostProcessors, beanFactory);
+
+		// Clear cached merged bean definitions since the post-processors might have
+		// modified the original metadata, e.g. replacing placeholders in values...
+		beanFactory.clearMetadataCache();
+}
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
