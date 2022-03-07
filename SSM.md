@@ -7881,6 +7881,441 @@ public static void invokeBeanFactoryPostProcessors(
 }
 ```
 
+​		对于`BeanFactoryPostProcessor`的处理主要分两种情况进行，一个是对于`BeanDefinitionRegistry`类的特殊处理，另一种是对普通的
+
+`BeanFactoryPostProcessor`进行处理。而对于每种情况都需要考虑硬编码注入注册的后处理器以及通过配置注入的后处理器。
+
+​		对于硬编码注册的后处理器的处理，主要是通过`AbstractApplicationContext`中的添加处理器方法`addBeanFactoryPostProcessor`进行添加。添加后的后处理
+
+器会存放在`beanFactoryPostProcessors`中，而在处理`BeanFactoryPostProcessor`时候会首先检测`beanFactoryPostProcessors`是否有数据。当然，
+
+`BeanDefinitionRegistryPostProcessor`继承自`BeanFactoryPostProcessor`，不但有`BeanFactoryPostProcessor`的特性，同时还有自己定义的个性化方法，也需要
+
+在此调用。所以，这里需要从`beanFactoryPostProcessors`中挑出`BeanDefinitionRegistryPostProcessor`的后处理器，并进行其
+
+`postProcessBeanDefinitionRegistry`方法的激活。
+
+
+
+##### 注册 BeanPostProcessor
+
+```java
+// AbstractApplicationContext 类
+public static void registerBeanPostProcessors(
+			ConfigurableListableBeanFactory beanFactory, AbstractApplicationContext applicationContext) {
+
+		String[] postProcessorNames = beanFactory.getBeanNamesForType(BeanPostProcessor.class, true, false);
+
+		// Register BeanPostProcessorChecker that logs an info message when
+		// a bean is created during BeanPostProcessor instantiation, i.e. when
+		// a bean is not eligible for getting processed by all BeanPostProcessors.
+    	/*
+		* BeanPostProcessorChecker 是一个普通的信息打印，可能会有些情况，
+		* 当 Spring 的配置中的后处理器还没有被注册就已经开始了bean的初始化时
+		* 便会打印出 BeanPostProcessorChecker 中设定的信息
+		*/
+		int beanProcessorTargetCount = beanFactory.getBeanPostProcessorCount() + 1 + postProcessorNames.length;
+		beanFactory.addBeanPostProcessor(new BeanPostProcessorChecker(beanFactory, beanProcessorTargetCount));
+
+		// Separate between BeanPostProcessors that implement PriorityOrdered,
+		// Ordered, and the rest.
+    	// 使用 Priorityordered 保证顺序
+		List<BeanPostProcessor> priorityOrderedPostProcessors = new ArrayList<>();
+		List<BeanPostProcessor> internalPostProcessors = new ArrayList<>();
+    	// 使用 ordered 保证顺序
+		List<String> orderedPostProcessorNames = new ArrayList<>();
+    	// 无序 BeanPostProcessor
+		List<String> nonOrderedPostProcessorNames = new ArrayList<>();
+		for (String ppName : postProcessorNames) {
+			if (beanFactory.isTypeMatch(ppName, PriorityOrdered.class)) {
+				BeanPostProcessor pp = beanFactory.getBean(ppName, BeanPostProcessor.class);
+				priorityOrderedPostProcessors.add(pp);
+				if (pp instanceof MergedBeanDefinitionPostProcessor) {
+					internalPostProcessors.add(pp);
+				}
+			}
+			else if (beanFactory.isTypeMatch(ppName, Ordered.class)) {
+				orderedPostProcessorNames.add(ppName);
+			}
+			else {
+				nonOrderedPostProcessorNames.add(ppName);
+			}
+		}
+
+		// First, register the BeanPostProcessors that implement PriorityOrdered.
+	    // 第 1 步，注册所有实现 Priorityordered 的 BeanPostProcessor
+		sortPostProcessors(priorityOrderedPostProcessors, beanFactory);
+		registerBeanPostProcessors(beanFactory, priorityOrderedPostProcessors);
+
+		// Next, register the BeanPostProcessors that implement Ordered.
+    	// 第 2 步，注册所有实现 ordered 的 BeanPostProcessor
+		List<BeanPostProcessor> orderedPostProcessors = new ArrayList<>(orderedPostProcessorNames.size());
+		for (String ppName : orderedPostProcessorNames) {
+			BeanPostProcessor pp = beanFactory.getBean(ppName, BeanPostProcessor.class);
+			orderedPostProcessors.add(pp);
+			if (pp instanceof MergedBeanDefinitionPostProcessor) {
+				internalPostProcessors.add(pp);
+			}
+		}
+		sortPostProcessors(orderedPostProcessors, beanFactory);
+		registerBeanPostProcessors(beanFactory, orderedPostProcessors);
+
+		// Now, register all regular BeanPostProcessors.
+    	// 第 3 步，注册所有无序的 BeanPostProcessor
+		List<BeanPostProcessor> nonOrderedPostProcessors = new ArrayList<>(nonOrderedPostProcessorNames.size());
+		for (String ppName : nonOrderedPostProcessorNames) {
+			BeanPostProcessor pp = beanFactory.getBean(ppName, BeanPostProcessor.class);
+			nonOrderedPostProcessors.add(pp);
+			if (pp instanceof MergedBeanDefinitionPostProcessor) {
+				internalPostProcessors.add(pp);
+			}
+		}
+		registerBeanPostProcessors(beanFactory, nonOrderedPostProcessors);
+
+		// Finally, re-register all internal BeanPostProcessors.
+    	// 第 4 步，注册所有 MergedBeanDefinitionPostProcessor 类型的 BeanPostProcessor ，并非重复注册，
+		// 在 beanFactory.addBeanPostProcessor 中会先移除已经存在的 BeanPostProcessor
+		sortPostProcessors(internalPostProcessors, beanFactory);
+		registerBeanPostProcessors(beanFactory, internalPostProcessors);
+
+		// Re-register post-processor for detecting inner beans as ApplicationListeners,
+		// moving it to the end of the processor chain (for picking up proxies etc).
+	    // 添加 ApplicationListener 探测器
+		beanFactory.addBeanPostProcessor(new ApplicationListenerDetector(applicationContext));
+}
+```
+
+
+
+##### 初始化消息资源
+
+```java
+// AbstractApplicationContext 类
+protected void initMessageSource() {
+		ConfigurableListableBeanFactory beanFactory = getBeanFactory();
+		if (beanFactory.containsLocalBean(MESSAGE_SOURCE_BEAN_NAME)) {
+            // 如果在配置中已经配置了 messageSource，那么将 messageSource 提取并记录在 this.messagesource 中
+			this.messageSource = beanFactory.getBean(MESSAGE_SOURCE_BEAN_NAME, MessageSource.class);
+			// Make MessageSource aware of parent MessageSource.
+			if (this.parent != null && this.messageSource instanceof HierarchicalMessageSource) {
+				HierarchicalMessageSource hms = (HierarchicalMessageSource) this.messageSource;
+				if (hms.getParentMessageSource() == null) {
+					// Only set parent context as parent MessageSource if no parent MessageSource
+					// registered already.
+					hms.setParentMessageSource(getInternalParentMessageSource());
+				}
+			}
+			if (logger.isTraceEnabled()) {
+				logger.trace("Using MessageSource [" + this.messageSource + "]");
+			}
+		}
+		else {
+			// Use empty MessageSource to be able to accept getMessage calls.
+            // 如果用户并没有定义配置文件，那么使用临时的 DelegatingMessageSource 以便于作为调用 getMessage 方法的返回
+			DelegatingMessageSource dms = new DelegatingMessageSource();
+			dms.setParentMessageSource(getInternalParentMessageSource());
+			this.messageSource = dms;
+			beanFactory.registerSingleton(MESSAGE_SOURCE_BEAN_NAME, this.messageSource);
+			if (logger.isTraceEnabled()) {
+				logger.trace("No '" + MESSAGE_SOURCE_BEAN_NAME + "' bean, using [" + this.messageSource + "]");
+			}
+		}
+}
+```
+
+​		在`initMessageSource`中的方法主要功能是提取配置中定义的`messageSource`，并将其记录在`Spring`的容器中，也就是`AbstractApplicationContext`中。当
+
+然，如果未设置资源文件的话，`Spring`中也提供了默认的配置`DelegatingMessageSource`。在`initMessageSource`中获取自定义资源文件的方式为
+
+`beanFactory.getBean(MESSAGE_SOURCE_BEAN_NAME, MessageSource.class)`，在这里`Spring`使用了硬编码的方式硬性规定了子定义资源文件必须为`message`，否则
+
+便会获取不到自定义资源配置。
+
+
+
+##### 初始化 ApplicationEventMulticaster
+
+​		`initApplicationEventMulticaster`的方式比较简单，无非考虑两种情况：
+
+​				1、如果用户自定义了事件广播器，那么使用用户自定义的事件广播器。
+
+​				2、如果用户没有自定义事件广播器，那么使用默认的`ApplicationEventMulticaster`。
+
+```java
+// AbstractApplicationContext 类
+protected void initApplicationEventMulticaster() {
+		ConfigurableListableBeanFactory beanFactory = getBeanFactory();
+		if (beanFactory.containsLocalBean(APPLICATION_EVENT_MULTICASTER_BEAN_NAME)) {
+			this.applicationEventMulticaster =
+					beanFactory.getBean(APPLICATION_EVENT_MULTICASTER_BEAN_NAME, ApplicationEventMulticaster.class);
+			if (logger.isTraceEnabled()) {
+				logger.trace("Using ApplicationEventMulticaster [" + this.applicationEventMulticaster + "]");
+			}
+		}
+		else {
+			this.applicationEventMulticaster = new SimpleApplicationEventMulticaster(beanFactory);
+			beanFactory.registerSingleton(APPLICATION_EVENT_MULTICASTER_BEAN_NAME, this.applicationEventMulticaster);
+			if (logger.isTraceEnabled()) {
+				logger.trace("No '" + APPLICATION_EVENT_MULTICASTER_BEAN_NAME + "' bean, using " +
+						"[" + this.applicationEventMulticaster.getClass().getSimpleName() + "]");
+			}
+		}
+}
+```
+
+```java
+// SimpleApplicationEventMulticaster 类
+public void multicastEvent(final ApplicationEvent event, @Nullable ResolvableType eventType) {
+		ResolvableType type = (eventType != null ? eventType : resolveDefaultEventType(event));
+		Executor executor = getTaskExecutor();
+		for (ApplicationListener<?> listener : getApplicationListeners(event, type)) {
+			if (executor != null) {
+				executor.execute(() -> invokeListener(listener, event));
+			}
+			else {
+				invokeListener(listener, event);
+			}
+		}
+}
+
+protected void invokeListener(ApplicationListener<?> listener, ApplicationEvent event) {
+		ErrorHandler errorHandler = getErrorHandler();
+		if (errorHandler != null) {
+			try {
+				doInvokeListener(listener, event);
+			}
+			catch (Throwable err) {
+				errorHandler.handleError(err);
+			}
+		}
+		else {
+			doInvokeListener(listener, event);
+		}
+}
+
+private void doInvokeListener(ApplicationListener listener, ApplicationEvent event) {
+		try {
+			listener.onApplicationEvent(event); // 调用事件监听器的方法处理事件
+		}
+		catch (ClassCastException ex) {
+			String msg = ex.getMessage();
+			if (msg == null || matchesClassCastMessage(msg, event.getClass()) ||
+					(event instanceof PayloadApplicationEvent &&
+							matchesClassCastMessage(msg, ((PayloadApplicationEvent) event).getPayload().getClass()))) {
+				// Possibly a lambda-defined listener which we could not resolve the generic event type for
+				// -> let's suppress the exception.
+				Log loggerToUse = this.lazyLogger;
+				if (loggerToUse == null) {
+					loggerToUse = LogFactory.getLog(getClass());
+					this.lazyLogger = loggerToUse;
+				}
+				if (loggerToUse.isTraceEnabled()) {
+					loggerToUse.trace("Non-matching event type for listener: " + listener, ex);
+				}
+			}
+			else {
+				throw ex;
+			}
+		}
+}
+```
+
+
+
+##### 注册监听器
+
+```java
+// AbstractApplicationContext 类
+protected void registerListeners() {
+		// Register statically specified listeners first.
+    	// 硬编码方式注册的监听器处理
+		for (ApplicationListener<?> listener : getApplicationListeners()) {
+			getApplicationEventMulticaster().addApplicationListener(listener);
+		}
+
+		// Do not initialize FactoryBeans here: We need to leave all regular beans
+		// uninitialized to let post-processors apply to them!
+    	// 配置文件注册的监听器处理
+		String[] listenerBeanNames = getBeanNamesForType(ApplicationListener.class, true, false);
+		for (String listenerBeanName : listenerBeanNames) {
+			getApplicationEventMulticaster().addApplicationListenerBean(listenerBeanName);
+		}
+
+		// Publish early application events now that we finally have a multicaster...
+		Set<ApplicationEvent> earlyEventsToProcess = this.earlyApplicationEvents;
+		this.earlyApplicationEvents = null;
+		if (!CollectionUtils.isEmpty(earlyEventsToProcess)) {
+			for (ApplicationEvent earlyEvent : earlyEventsToProcess) {
+				getApplicationEventMulticaster().multicastEvent(earlyEvent);
+			}
+		}
+}
+```
+
+
+
+#### 初始化非延迟加载单例
+
+​		完成`BeanFactory`的初始化工作，其中包括`ConversionService`的设置、配置冻结以及非延迟加载的`bean`的初始化工作。
+
+```java
+// AbstractApplicationContext 类
+protected void finishBeanFactoryInitialization(ConfigurableListableBeanFactory beanFactory) {
+		// Initialize conversion service for this context.
+    	// ConversionService：类型转换
+		if (beanFactory.containsBean(CONVERSION_SERVICE_BEAN_NAME) &&
+				beanFactory.isTypeMatch(CONVERSION_SERVICE_BEAN_NAME, ConversionService.class)) {
+			beanFactory.setConversionService(
+					beanFactory.getBean(CONVERSION_SERVICE_BEAN_NAME, ConversionService.class));
+		}
+
+		// Register a default embedded value resolver if no BeanFactoryPostProcessor
+		// (such as a PropertySourcesPlaceholderConfigurer bean) registered any before:
+		// at this point, primarily for resolution in annotation attribute values.
+		if (!beanFactory.hasEmbeddedValueResolver()) {
+			beanFactory.addEmbeddedValueResolver(strVal -> getEnvironment().resolvePlaceholders(strVal));
+		}
+
+		// Initialize LoadTimeWeaverAware beans early to allow for registering their transformers early.
+		String[] weaverAwareNames = beanFactory.getBeanNamesForType(LoadTimeWeaverAware.class, false, false);
+		for (String weaverAwareName : weaverAwareNames) {
+			getBean(weaverAwareName);
+		}
+
+		// Stop using the temporary ClassLoader for type matching.
+		beanFactory.setTempClassLoader(null);
+
+		// Allow for caching all bean definition metadata, not expecting further changes.
+	    // 冻结所有的 bean 定义，说明注册的 bean 定义将不被修改或任何进一步的处理
+		beanFactory.freezeConfiguration();
+
+		// Instantiate all remaining (non-lazy-init) singletons.
+	    // 初始化剩下的单实例（非惰性的)
+		beanFactory.preInstantiateSingletons();
+}
+```
+
+```java
+// DefaultListableBeanFactory 类
+public void freezeConfiguration() {
+		this.configurationFrozen = true;
+		this.frozenBeanDefinitionNames = StringUtils.toStringArray(this.beanDefinitionNames);
+}
+```
+
+​		`ApplicationContext`实现的默认行为就是在启动时将所有单例`bean`提前进行实例化。提前实例化意味着作为初始化过程的一部分，`ApplicationContext`实
+
+例会创建并配置所有的单例`bean`。通常情况下这是一件好事，因为这样在配置中的任何错误就会即刻被发现`(`否则的话可能要花几个小时甚至几天`)`。而这个实
+
+例化的过程就是在`finishBeanFactoryInitialization中`完成的。
+
+```java
+// DefaultListableBeanFactory 类
+public void preInstantiateSingletons() throws BeansException {
+		if (logger.isTraceEnabled()) {
+			logger.trace("Pre-instantiating singletons in " + this);
+		}
+
+		// Iterate over a copy to allow for init methods which in turn register new bean definitions.
+		// While this may not be part of the regular factory bootstrap, it does otherwise work fine.
+		List<String> beanNames = new ArrayList<>(this.beanDefinitionNames);
+
+		// Trigger initialization of all non-lazy singleton beans...
+		for (String beanName : beanNames) {
+			RootBeanDefinition bd = getMergedLocalBeanDefinition(beanName);
+			if (!bd.isAbstract() && bd.isSingleton() && !bd.isLazyInit()) {
+				if (isFactoryBean(beanName)) {
+					Object bean = getBean(FACTORY_BEAN_PREFIX + beanName);
+					if (bean instanceof FactoryBean) {
+						FactoryBean<?> factory = (FactoryBean<?>) bean;
+						boolean isEagerInit;
+						if (System.getSecurityManager() != null && factory instanceof SmartFactoryBean) {
+							isEagerInit = AccessController.doPrivileged(
+									(PrivilegedAction<Boolean>) ((SmartFactoryBean<?>) factory)::isEagerInit,
+									getAccessControlContext());
+						}
+						else {
+							isEagerInit = (factory instanceof SmartFactoryBean &&
+									((SmartFactoryBean<?>) factory).isEagerInit());
+						}
+						if (isEagerInit) {
+							getBean(beanName);
+						}
+					}
+				}
+				else {
+					getBean(beanName);
+				}
+			}
+		}
+
+		// Trigger post-initialization callback for all applicable beans...
+		for (String beanName : beanNames) {
+			Object singletonInstance = getSingleton(beanName);
+			if (singletonInstance instanceof SmartInitializingSingleton) {
+				StartupStep smartInitialize = this.getApplicationStartup().start("spring.beans.smart-initialize")
+						.tag("beanName", beanName);
+				SmartInitializingSingleton smartSingleton = (SmartInitializingSingleton) singletonInstance;
+				if (System.getSecurityManager() != null) {
+					AccessController.doPrivileged((PrivilegedAction<Object>) () -> {
+						smartSingleton.afterSingletonsInstantiated();
+						return null;
+					}, getAccessControlContext());
+				}
+				else {
+					smartSingleton.afterSingletonsInstantiated();
+				}
+				smartInitialize.end();
+			}
+		}
+}
+```
+
+
+
+#### finishRefresh
+
+​		在`Spring`中还提供了`Lifecycle`接口，`Lifecycle`中包含`start/stop`方法，实现此接口后`Spring`会保证在启动的时候调用其`start`方法开始生命周期，并
+
+在`Spring`关闭的时候调用`stop`方法来结束生命周期，通常用来配置后台程序，在启动后一直运行。而`ApplicationContext`的初始化最后正是保证了这一功能的
+
+实现。
+
+```java
+// AbstractApplicationContext 类
+protected void finishRefresh() {
+		// Clear context-level resource caches (such as ASM metadata from scanning).
+		clearResourceCaches();
+
+		// Initialize lifecycle processor for this context.
+		// 当 ApplicationContext 启动或停止时，它会通过 LifecycleProcessor 来与所有声明的 bean 的周期做状态更新
+    	// 而在 LifecycleProcessor  的使用前首先需要初始化。
+		initLifecycleProcessor();
+
+		// Propagate refresh to lifecycle processor first.
+    	// 启动所有实现了 Lifecycle 接口的 bean
+		getLifecycleProcessor().onRefresh();
+
+		// Publish the final event.
+		// 当完成 ApplicationContext 初始化的时候,要通过 Spring 中的事件发布机制来发出 ContextRefreshedEvent 事件
+    	// 以保证对应的监听器可以做进一步的逻辑处理。
+		publishEvent(new ContextRefreshedEvent(this));
+
+		// Participate in LiveBeansView MBean, if active.
+		if (!NativeDetector.inNativeImage()) {
+			LiveBeansView.registerApplicationContext(this);
+		}
+}
+```
+
+
+
+
+
+
+
+
+
 
 
 
