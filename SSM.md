@@ -9710,6 +9710,207 @@ public Object intercept(Object proxy, Method method, Object[] args, MethodProxy 
 
 ​				将`aop.xml`中定义的增强器通过自定义的`ClassFileTransformer`织入对应的类中
 
+​		在`Spring`中如果需要使用`AspectJ`的功能，首先要做的第一步就是在配置文件中加入配置`<context:load-time-weaver />`：
+
+```java
+public class ContextNamespaceHandler extends NamespaceHandlerSupport {
+	@Override
+	public void init() {
+		registerBeanDefinitionParser("property-placeholder", new PropertyPlaceholderBeanDefinitionParser());
+		registerBeanDefinitionParser("property-override", new PropertyOverrideBeanDefinitionParser());
+		registerBeanDefinitionParser("annotation-config", new AnnotationConfigBeanDefinitionParser());
+		registerBeanDefinitionParser("component-scan", new ComponentScanBeanDefinitionParser());
+		registerBeanDefinitionParser("load-time-weaver", new LoadTimeWeaverBeanDefinitionParser());
+		registerBeanDefinitionParser("spring-configured", new SpringConfiguredBeanDefinitionParser());
+		registerBeanDefinitionParser("mbean-export", new MBeanExportBeanDefinitionParser());
+		registerBeanDefinitionParser("mbean-server", new MBeanServerBeanDefinitionParser());
+	}
+}
+```
+
+```java
+// LoadTimeWeaverBeanDefinitionParser 类
+protected void doParse(Element element, ParserContext parserContext, BeanDefinitionBuilder builder) {
+		builder.setRole(BeanDefinition.ROLE_INFRASTRUCTURE);
+
+		if (isAspectJWeavingEnabled(element.getAttribute(ASPECTJ_WEAVING_ATTRIBUTE), parserContext)) {
+			if (!parserContext.getRegistry().containsBeanDefinition(ASPECTJ_WEAVING_ENABLER_BEAN_NAME)) {
+            // 注册一个对于 ApectJ 处理的类：org.springframework.context.weaving.AspectJWeavingEnabler
+                RootBeanDefinition def = new RootBeanDefinition(ASPECTJ_WEAVING_ENABLER_CLASS_NAME);
+				parserContext.registerBeanComponent(
+						new BeanComponentDefinition(def, ASPECTJ_WEAVING_ENABLER_BEAN_NAME));
+			}
+
+			if (isBeanConfigurerAspectEnabled(parserContext.getReaderContext().getBeanClassLoader())) {
+				new SpringConfiguredBeanDefinitionParser().parse(element, parserContext);
+			}
+		}
+}
+
+/**
+	在配置文件中加入了 <context:load-time-weaver /> 便相当于加入了 AspectJ 开关。但是，并不是配置了这个标签就意味着开启了 AspectJ 功能，这个标签中还有一个属性 aspectj-weaving，这个属性有 3 个备选值，on、off和 autodetect，默认为 autodetect，如果只是使用了 <context:load-time-weaver />，那么Spring会帮助我们检测是否可以使用 AspectJ 功能，而检测的依据便是文件 META-INF/aop.xml 是否存在
+*/
+protected boolean isAspectJWeavingEnabled(String value, ParserContext parserContext) {
+		if ("on".equals(value)) {
+			return true;
+		}
+		else if ("off".equals(value)) {
+			return false;
+		}
+		else {
+			// Determine default...
+            // 自动检测
+			ClassLoader cl = parserContext.getReaderContext().getBeanClassLoader();
+			return (cl != null && cl.getResource(AspectJWeavingEnabler.ASPECTJ_AOP_XML_RESOURCE) != null);
+		}
+}
+```
+
+​		当`Spring`在读取到自定义标签`<context:load-time-weaver/>`后会产生一个`bean`，而这个`bean`的`id`为`loadTimeWeaver`，`class`为
+
+`org.Springframework.context.weaving.DefaultContextLoadTimeWeaver`，也就是完成了`DefaultContextLoadTimeWeaver`类的注册。
+
+​		完成了以上的注册功能后，还有一个很重要的步骤，就是`LoadTimeWeaverAwareProcessor`的注册：
+
+```java
+// AbstractApplicationContext 类 prepareBeanFactory 方法
+if (!NativeDetector.inNativeImage() && beanFactory.containsBean(LOAD_TIME_WEAVER_BEAN_NAME)) {
+			beanFactory.addBeanPostProcessor(new LoadTimeWeaverAwareProcessor(beanFactory));
+			// Set a temporary ClassLoader for type matching.
+			beanFactory.setTempClassLoader(new ContextTypeMatchClassLoader(beanFactory.getBeanClassLoader()));
+}
+```
+
+
+
+##### 织入
+
+![](image/QQ截图20220318125235.png)
+
+```java
+// LoadTimeWeaverAwareProcessor 类
+public Object postProcessBeforeInitialization(Object bean, String beanName) throws BeansException {
+    	// 实现 LoadTimeWeaverAware 接口的类只有 AspectJWeavingEnabler
+		if (bean instanceof LoadTimeWeaverAware) {
+			LoadTimeWeaver ltw = this.loadTimeWeaver;
+			if (ltw == null) {
+				Assert.state(this.beanFactory != null,
+						"BeanFactory required if no LoadTimeWeaver explicitly specified");
+				ltw = this.beanFactory.getBean(
+						ConfigurableApplicationContext.LOAD_TIME_WEAVER_BEAN_NAME, LoadTimeWeaver.class);
+			}
+			((LoadTimeWeaverAware) bean).setLoadTimeWeaver(ltw);
+		}
+		return bean;
+}
+```
+
+​		当在`Spring`中调用`AspectJWeavingEnabler时`，`this.loadTimeWeaver`尚未被初始化，那么，会直接调用`beanFactory.getBean`方法获取对应的
+
+`DefaultContextLoadTimeWeaver`类型的`bean`，并将其设置为`AspectJWeavingEnabler`类型`bean`的`loadTimeWeaver`属性中。当然`AspectJWeavingEnabler`同样实现
+
+了`BeanClassLoaderAware`以及`Ordered`接口，实现`BeanClassLoaderAware`接口保证了在`bean`初始化的时候调用`AbstractAutowireCapableBeanFactory`的
+
+`invokeAwareMethods`的时候将`beanClassLoader`赋值给当前类。而实现`Ordered`接口则保证在实例化`bean`时当前`bean`会被最先初始化。
+
+​		`DefaultContextLoadTimeWeaver`类又同时实现了`LoadTimeWeaver`、`BeanClassLoaderAware`以及`DisposableBean`。其中`DisposableBean`接口保证在`bean`销毁
+
+时会调用`destroy`方法进行`bean`的清理，而`BeanClassLoaderAware`接口则保证在`bean`的初始化调用`AbstractAutowireCapableBeanFactory`的
+
+`invokeAwareMethods`时调用`setBeanClassLoader`方法。
+
+```java
+// DefaultContextLoadTimeWeaver 类
+public void setBeanClassLoader(ClassLoader classLoader) {
+		LoadTimeWeaver serverSpecificLoadTimeWeaver = createServerSpecificLoadTimeWeaver(classLoader);
+		if (serverSpecificLoadTimeWeaver != null) {
+			if (logger.isDebugEnabled()) {
+				logger.debug("Determined server-specific load-time weaver: " +
+						serverSpecificLoadTimeWeaver.getClass().getName());
+			}
+			this.loadTimeWeaver = serverSpecificLoadTimeWeaver;
+		}
+		else if (InstrumentationLoadTimeWeaver.isInstrumentationAvailable()) {
+			logger.debug("Found Spring's JVM agent for instrumentation");
+            // 检查当前虚拟机中的 Instrumentation 实例是否可用
+			this.loadTimeWeaver = new InstrumentationLoadTimeWeaver(classLoader);
+		}
+		else {
+			try {
+				this.loadTimeWeaver = new ReflectiveLoadTimeWeaver(classLoader);
+				if (logger.isDebugEnabled()) {
+					logger.debug("Using reflective load-time weaver for class loader: " +
+							this.loadTimeWeaver.getInstrumentableClassLoader().getClass().getName());
+				}
+			}
+			catch (IllegalStateException ex) {
+				throw new IllegalStateException(ex.getMessage() + " Specify a custom LoadTimeWeaver or start your " +
+						"Java virtual machine with Spring's agent: -javaagent:spring-instrument-{version}.jar");
+			}
+		}
+}
+```
+
+​		也就是经过以上程序的处理后，在`Spring`中的`bean`之间的关系如下：
+
+​				`AspectJWeavingEnabler`类型的`bean`中的`loadTimeWeaver`属性被初始化为`DefaultContextLoadTimeWeaver`类型的`bean`。
+
+​				`DefaultContextLoadTimeWeaver`类型的`bean`中的`loadTimeWeaver`属性被初始化为`InstrumentationLoadTimeWeaver`。
+
+​		`AspectJWeavingEnabler`类同样实现了`BeanFactoryPostProcessor`，所以当所有`bean`解析结束后会调用其`postProcessBeanFactory`方法：
+
+```java
+// AspectJWeavingEnabler 类
+public void postProcessBeanFactory(ConfigurableListableBeanFactory beanFactory) throws BeansException {
+		enableAspectJWeaving(this.loadTimeWeaver, this.beanClassLoader);
+}
+
+public static void enableAspectJWeaving(
+			@Nullable LoadTimeWeaver weaverToUse, @Nullable ClassLoader beanClassLoader) {
+
+		if (weaverToUse == null) {
+            // 此时已经被初始化为 DefaultContextLoadTimeweaver
+			if (InstrumentationLoadTimeWeaver.isInstrumentationAvailable()) {
+				weaverToUse = new InstrumentationLoadTimeWeaver(beanClassLoader);
+			}
+			else {
+				throw new IllegalStateException("No LoadTimeWeaver available");
+			}
+		}
+    // 使用 DefaultContextLoadTimeweaver 类型的 bean 中的 loadTimeWeaver 属性注册转换器
+		weaverToUse.addTransformer(
+				new AspectJClassBypassingClassFileTransformer(new ClassPreProcessorAgentAdapter()));
+}
+
+// AspectJWeavingEnabler#AspectJClassBypassingClassFileTransformer
+// 作用仅仅是告诉 AspectJ 以 org.aspectj 开头的或者 org/aspectj 开头的类不进行处理。
+private static class AspectJClassBypassingClassFileTransformer implements ClassFileTransformer {
+
+		private final ClassFileTransformer delegate;
+
+		public AspectJClassBypassingClassFileTransformer(ClassFileTransformer delegate) {
+			this.delegate = delegate;
+		}
+
+		@Override
+		public byte[] transform(ClassLoader loader, String className, Class<?> classBeingRedefined,
+				ProtectionDomain protectionDomain, byte[] classfileBuffer) throws IllegalClassFormatException {
+
+			if (className.startsWith("org.aspectj") || className.startsWith("org/aspectj")) {
+				return classfileBuffer;
+			}
+            // 委托给 AspectJ 代理继续处理
+			return this.delegate.transform(loader, className, classBeingRedefined, protectionDomain, classfileBuffer);
+		}
+}
+```
+
+
+
+
+
+
+
 
 
 
