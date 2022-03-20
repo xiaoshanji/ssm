@@ -9883,7 +9883,7 @@ public static void enableAspectJWeaving(
 }
 
 // AspectJWeavingEnabler#AspectJClassBypassingClassFileTransformer
-// 作用仅仅是告诉 AspectJ 以 org.aspectj 开头的或者 org/aspectj 开头的类不进行处理。
+// 作用仅仅是告诉 AspectJ 以 org.aspectj 开头的或者 org/aspectj 开头的类不进行处理
 private static class AspectJClassBypassingClassFileTransformer implements ClassFileTransformer {
 
 		private final ClassFileTransformer delegate;
@@ -9904,6 +9904,349 @@ private static class AspectJClassBypassingClassFileTransformer implements ClassF
 		}
 }
 ```
+
+
+
+### JDBC
+
+​		`Spring`中对`JDBC`的支持中的所有数据库操作以`JdbcTemplate`为基础。其中，`execute`方法是最基础的操作，而其他操作则是传入不同的
+
+`PreparedStatementCallback`参数来执行不同的逻辑。
+
+```java
+// JdbcTemplate 类
+private <T> T execute(PreparedStatementCreator psc, PreparedStatementCallback<T> action, boolean closeResources)
+			throws DataAccessException {
+
+		Assert.notNull(psc, "PreparedStatementCreator must not be null");
+		Assert.notNull(action, "Callback object must not be null");
+		if (logger.isDebugEnabled()) {
+			String sql = getSql(psc);
+			logger.debug("Executing prepared SQL statement" + (sql != null ? " [" + sql + "]" : ""));
+		}
+		// 获取数据库连接
+		Connection con = DataSourceUtils.getConnection(obtainDataSource());
+		PreparedStatement ps = null;
+		try {
+			ps = psc.createPreparedStatement(con);
+            // 应用设定的输入参数
+			applyStatementSettings(ps);
+            // 调用回调函数
+			T result = action.doInPreparedStatement(ps);
+			handleWarnings(ps);
+			return result;
+		}
+		catch (SQLException ex) {
+			// Release Connection early, to avoid potential connection pool deadlock
+			// in the case when the exception translator hasn't been initialized yet.
+            // 释放数据库连接避免当异常转换器没有被初始化的时候出现潜在的连接池死锁
+			if (psc instanceof ParameterDisposer) {
+				((ParameterDisposer) psc).cleanupParameters();
+			}
+			String sql = getSql(psc);
+			psc = null;
+			JdbcUtils.closeStatement(ps);
+			ps = null;
+			DataSourceUtils.releaseConnection(con, getDataSource());
+			con = null;
+			throw translateException("PreparedStatementCallback", sql, ex);
+		}
+		finally {
+			if (closeResources) {
+				if (psc instanceof ParameterDisposer) {
+					((ParameterDisposer) psc).cleanupParameters();
+				}
+				JdbcUtils.closeStatement(ps);
+				DataSourceUtils.releaseConnection(con, getDataSource());
+			}
+		}
+}
+```
+
+
+
+#### 获取数据库连接
+
+```java
+// DataSourceUtils 类
+public static Connection getConnection(DataSource dataSource) throws CannotGetJdbcConnectionException {
+		try {
+			return doGetConnection(dataSource);
+		}
+		catch (SQLException ex) {
+			throw new CannotGetJdbcConnectionException("Failed to obtain JDBC Connection", ex);
+		}
+		catch (IllegalStateException ex) {
+			throw new CannotGetJdbcConnectionException("Failed to obtain JDBC Connection: " + ex.getMessage());
+		}
+}
+
+public static Connection doGetConnection(DataSource dataSource) throws SQLException {
+		Assert.notNull(dataSource, "No DataSource specified");
+
+		ConnectionHolder conHolder = (ConnectionHolder) TransactionSynchronizationManager.getResource(dataSource);
+		if (conHolder != null && (conHolder.hasConnection() || conHolder.isSynchronizedWithTransaction())) {
+			conHolder.requested();
+			if (!conHolder.hasConnection()) {
+				logger.debug("Fetching resumed JDBC Connection from DataSource");
+				conHolder.setConnection(fetchConnection(dataSource));
+			}
+			return conHolder.getConnection();
+		}
+		// Else we either got no holder or an empty thread-bound holder here.
+
+		logger.debug("Fetching JDBC Connection from DataSource");
+		Connection con = fetchConnection(dataSource);
+		// 当前线程支持同步
+		if (TransactionSynchronizationManager.isSynchronizationActive()) {
+			try {
+				// Use same Connection for further JDBC actions within the transaction.
+				// Thread-bound object will get removed by synchronization at transaction completion.
+                // 在事务中使用同一数据库连接
+				ConnectionHolder holderToUse = conHolder;
+				if (holderToUse == null) {
+					holderToUse = new ConnectionHolder(con);
+				}
+				else {
+					holderToUse.setConnection(con);
+				}
+                // 记录数据库连接
+				holderToUse.requested();
+				TransactionSynchronizationManager.registerSynchronization(
+						new ConnectionSynchronization(holderToUse, dataSource));
+				holderToUse.setSynchronizedWithTransaction(true);
+				if (holderToUse != conHolder) {
+					TransactionSynchronizationManager.bindResource(dataSource, holderToUse);
+				}
+			}
+			catch (RuntimeException ex) {
+				// Unexpected exception from external delegation call -> close Connection and rethrow.
+				releaseConnection(con, dataSource);
+				throw ex;
+			}
+		}
+
+		return con;
+}
+```
+
+
+
+#### 应用输入参数
+
+```java
+// JdbcTemplate 类
+protected void applyStatementSettings(Statement stmt) throws SQLException {
+		int fetchSize = getFetchSize();
+		if (fetchSize != -1) {
+			stmt.setFetchSize(fetchSize);
+		}
+		int maxRows = getMaxRows();
+		if (maxRows != -1) {
+			stmt.setMaxRows(maxRows);
+		}
+		DataSourceUtils.applyTimeout(stmt, getDataSource(), getQueryTimeout());
+}
+```
+
+​		`setFetchSize`最主要是为了减少网络交互次数设计的。访问`ResultSet`时，如果它每次只从服务器上读取一行数据，则会产生大量的开销。`setFetchSize`的
+
+意思是当调用`rs.next`时，`ResultSet`会一次性从服务器上取得多少行数据回来，这样在下次`rs.next`时，它可以直接从内存中获取数据而不需要网络交互，提高
+
+了效率。这个设置可能会被某些`JDBC`驱动忽略，而且设置过大也会造成内存的上升。
+
+​		`setMaxRows`将此`Statement`对象生成的所有`ResultSet`对象可以包含的最大行数限制设置为给定数。
+
+
+
+#### 资源释放
+
+​		数据库的连接释放并不是直接调用了`Connection`的`API`中的`close`方法。考虑到存在事务的情况，如果当前线程存在事务，那么说明在当前线程中存在共用
+
+数据库连接，这种情况下直接使用`ConnectionHolder`中的`released`方法进行连接数减一，而不是真正的释放连接。
+
+```java
+// DataSourceUtils 类
+public static void releaseConnection(@Nullable Connection con, @Nullable DataSource dataSource) {
+		try {
+			doReleaseConnection(con, dataSource);
+		}
+		catch (SQLException ex) {
+			logger.debug("Could not close JDBC Connection", ex);
+		}
+		catch (Throwable ex) {
+			logger.debug("Unexpected exception on closing JDBC Connection", ex);
+		}
+}
+
+public static void doReleaseConnection(@Nullable Connection con, @Nullable DataSource dataSource) throws SQLException {
+		if (con == null) {
+			return;
+		}
+		if (dataSource != null) {
+            // 当前线程存在事务的情况下说明存在共用数据库连接直接使用 connectionHolder 中的 released 方法进行连接数减一而不是真正的释放连接
+			ConnectionHolder conHolder = (ConnectionHolder) TransactionSynchronizationManager.getResource(dataSource);
+			if (conHolder != null && connectionEquals(conHolder, con)) {
+				// It's the transactional Connection: Don't close it.
+				conHolder.released();
+				return;
+			}
+		}
+		doCloseConnection(con, dataSource);
+}
+
+public static void doCloseConnection(Connection con, @Nullable DataSource dataSource) throws SQLException {
+		if (!(dataSource instanceof SmartDataSource) || ((SmartDataSource) dataSource).shouldClose(con)) {
+			con.close();
+		}
+}
+```
+
+
+
+#### 回调函数
+
+​		`PreparedStatementCallback`作为一个接口，其中只有一个函数`doInPreparedStatement`，这个函数是用于调用通用方法`execute`的时候无法处理的一些个性
+
+化处理方法：
+
+```java
+// ArgumentTypePreparedStatementSetter 类
+public void setValues(PreparedStatement ps) throws SQLException {
+		int parameterPosition = 1;
+		if (this.args != null && this.argTypes != null) {
+            // 遍历每个参数以作类型匹配及转换
+			for (int i = 0; i < this.args.length; i++) {
+				Object arg = this.args[i];
+                // 如果是集合则需要进入集合类内部递归解析集合内部属性
+				if (arg instanceof Collection && this.argTypes[i] != Types.ARRAY) {
+					Collection<?> entries = (Collection<?>) arg;
+					for (Object entry : entries) {
+						if (entry instanceof Object[]) {
+							Object[] valueArray = ((Object[]) entry);
+							for (Object argValue : valueArray) {
+								doSetValue(ps, parameterPosition, this.argTypes[i], argValue);
+								parameterPosition++;
+							}
+						}
+						else {
+							doSetValue(ps, parameterPosition, this.argTypes[i], entry);
+							parameterPosition++;
+						}
+					}
+				}
+				else {
+                    // 解析当前属性
+					doSetValue(ps, parameterPosition, this.argTypes[i], arg);
+					parameterPosition++;
+				}
+			}
+		}
+}
+
+protected void doSetValue(PreparedStatement ps, int parameterPosition, int argType, Object argValue)
+			throws SQLException {
+
+		StatementCreatorUtils.setParameterValue(ps, parameterPosition, argType, argValue);
+}
+```
+
+```java
+// StatementCreatorUtils 类
+public static void setParameterValue(PreparedStatement ps, int paramIndex, int sqlType,
+			@Nullable Object inValue) throws SQLException {
+
+		setParameterValueInternal(ps, paramIndex, sqlType, null, null, inValue);
+}
+private static void setParameterValueInternal(PreparedStatement ps, int paramIndex, int sqlType,
+			@Nullable String typeName, @Nullable Integer scale, @Nullable Object inValue) throws SQLException {
+
+		String typeNameToUse = typeName;
+		int sqlTypeToUse = sqlType;
+		Object inValueToUse = inValue;
+
+		// override type info?
+		if (inValue instanceof SqlParameterValue) {
+			SqlParameterValue parameterValue = (SqlParameterValue) inValue;
+			if (logger.isDebugEnabled()) {
+				logger.debug("Overriding type info with runtime info from SqlParameterValue: column index " + paramIndex +
+						", SQL type " + parameterValue.getSqlType() + ", type name " + parameterValue.getTypeName());
+			}
+			if (parameterValue.getSqlType() != SqlTypeValue.TYPE_UNKNOWN) {
+				sqlTypeToUse = parameterValue.getSqlType();
+			}
+			if (parameterValue.getTypeName() != null) {
+				typeNameToUse = parameterValue.getTypeName();
+			}
+			inValueToUse = parameterValue.getValue();
+		}
+
+		if (logger.isTraceEnabled()) {
+			logger.trace("Setting SQL statement parameter value: column index " + paramIndex +
+					", parameter value [" + inValueToUse +
+					"], value class [" + (inValueToUse != null ? inValueToUse.getClass().getName() : "null") +
+					"], SQL type " + (sqlTypeToUse == SqlTypeValue.TYPE_UNKNOWN ? "unknown" : Integer.toString(sqlTypeToUse)));
+		}
+
+		if (inValueToUse == null) {
+			setNull(ps, paramIndex, sqlTypeToUse, typeNameToUse);
+		}
+		else {
+			setValue(ps, paramIndex, sqlTypeToUse, typeNameToUse, scale, inValueToUse);
+		}
+}
+```
+
+
+
+#### query 的实现
+
+```java
+// JdbcTemplate 类
+public <T> T query(
+			PreparedStatementCreator psc, @Nullable final PreparedStatementSetter pss, final ResultSetExtractor<T> rse)
+			throws DataAccessException {
+
+		Assert.notNull(rse, "ResultSetExtractor must not be null");
+		logger.debug("Executing prepared SQL query");
+
+		return execute(psc, new PreparedStatementCallback<T>() {
+			@Override
+			@Nullable
+			public T doInPreparedStatement(PreparedStatement ps) throws SQLException {
+				ResultSet rs = null;
+				try {
+					if (pss != null) {
+						pss.setValues(ps);
+					}
+					rs = ps.executeQuery();
+                    // 将查询结果封装并转换为 POJO
+					return rse.extractData(rs);
+				}
+				finally {
+					JdbcUtils.closeResultSet(rs);
+					if (pss instanceof ParameterDisposer) {
+						((ParameterDisposer) pss).cleanupParameters();
+					}
+				}
+			}
+		}, true);
+}
+```
+
+```java
+// RowMapperResultSetExtractor 类
+public List<T> extractData(ResultSet rs) throws SQLException {
+		List<T> results = (this.rowsExpected > 0 ? new ArrayList<>(this.rowsExpected) : new ArrayList<>());
+		int rowNum = 0;
+		while (rs.next()) {
+			results.add(this.rowMapper.mapRow(rs, rowNum++));
+		}
+		return results;
+}
+```
+
+
 
 
 
