@@ -17138,6 +17138,448 @@ Locale：${pageContext.response.locale}
 </html>
 ```
 
+
+
+## 源码
+
+### ContextLoaderlistener
+
+​		当使用编程方式的时候可以直接将`Spring`配置信息作为参数传入`Spring`容器中，但是在`Web`下，更多的是与`Web`环境相互结合，通常的办法是将路径以
+
+`context-param`的方式注册并使用`ContextLoaderListener`进行监听读取。
+
+​		`ContextLoaderListener`的作用就是启动`Web`容器时，自动装配`ApplicationContext`的配置信息。因为它实现了`ServletContextListener`接口，开发者能够
+
+在为客户端请求提就会默认执行它实现的方法，使用`ServletContextListener`接口，开发者能够在为客户端请求提供服务之前向`ServletContext`中添加任意的对
+
+象。这个对象在`ServletContext`启动的时候被初始化，然后在`ServletContext`整个运行期间都是可见的。
+
+​		每一个`Web`应用都有一个`ServletContext`与之相关联。`ServletContext`对象在应用启动时被创建，在应用关闭的时候被销毁。`ServletContext`在全局范围
+
+内有效，类似于应用中的一个全局变量。在`ServletContextListener`中的核心逻辑便是初始化`WebApplicationContext`实例并存放至`ServletContext`中。
+
+```java
+// ContextLoaderListener 类
+public void contextInitialized(ServletContextEvent event) {
+		initWebApplicationContext(event.getServletContext());
+}
+```
+
+```java
+// ContextLoader 类
+public WebApplicationContext initWebApplicationContext(ServletContext servletContext) {
+    	// 存在多次 ContextLoader 定义
+		if (servletContext.getAttribute(WebApplicationContext.ROOT_WEB_APPLICATION_CONTEXT_ATTRIBUTE) != null) {
+			throw new IllegalStateException(
+					"Cannot initialize context because there is already a root application context present - " +
+					"check whether you have multiple ContextLoader* definitions in your web.xml!");
+		}
+
+		servletContext.log("Initializing Spring root WebApplicationContext");
+		Log logger = LogFactory.getLog(ContextLoader.class);
+		if (logger.isInfoEnabled()) {
+			logger.info("Root WebApplicationContext: initialization started");
+		}
+		long startTime = System.currentTimeMillis();
+
+		try {
+			// Store context in local instance variable, to guarantee that
+			// it is available on ServletContext shutdown.
+			if (this.context == null) {
+                // 初始化 context
+				this.context = createWebApplicationContext(servletContext);
+			}
+			if (this.context instanceof ConfigurableWebApplicationContext) {
+				ConfigurableWebApplicationContext cwac = (ConfigurableWebApplicationContext) this.context;
+				if (!cwac.isActive()) {
+					// The context has not yet been refreshed -> provide services such as
+					// setting the parent context, setting the application context id, etc
+					if (cwac.getParent() == null) {
+						// The context instance was injected without an explicit parent ->
+						// determine parent for root web application context, if any.
+						ApplicationContext parent = loadParentContext(servletContext);
+						cwac.setParent(parent);
+					}
+					configureAndRefreshWebApplicationContext(cwac, servletContext);
+				}
+			}
+            // 记录在 servletContext 中
+			servletContext.setAttribute(WebApplicationContext.ROOT_WEB_APPLICATION_CONTEXT_ATTRIBUTE, this.context);
+
+			ClassLoader ccl = Thread.currentThread().getContextClassLoader();
+			if (ccl == ContextLoader.class.getClassLoader()) {
+				currentContext = this.context;
+			}
+			else if (ccl != null) {
+                // 映射当前的类加载器与创建的实例到全局变量 currentContextPerThread 中
+				currentContextPerThread.put(ccl, this.context);
+			}
+
+			if (logger.isInfoEnabled()) {
+				long elapsedTime = System.currentTimeMillis() - startTime;
+				logger.info("Root WebApplicationContext initialized in " + elapsedTime + " ms");
+			}
+
+			return this.context;
+		}
+		catch (RuntimeException | Error ex) {
+			logger.error("Context initialization failed", ex);
+			servletContext.setAttribute(WebApplicationContext.ROOT_WEB_APPLICATION_CONTEXT_ATTRIBUTE, ex);
+			throw ex;
+		}
+}
+```
+
+```java
+// ContextLoader 类
+static {
+		// Load default strategy implementations from properties file.
+		// This is currently strictly internal and not meant to be customized
+		// by application developers.
+	    // 读取 ContextLoader 类的同目录下的属性文件 ContextLoader.properties
+		try {
+			ClassPathResource resource = new ClassPathResource(DEFAULT_STRATEGIES_PATH, ContextLoader.class);
+			defaultStrategies = PropertiesLoaderUtils.loadProperties(resource);
+		}
+		catch (IOException ex) {
+			throw new IllegalStateException("Could not load 'ContextLoader.properties': " + ex.getMessage());
+		}
+}
+
+protected WebApplicationContext createWebApplicationContext(ServletContext sc) {
+		Class<?> contextClass = determineContextClass(sc);
+		if (!ConfigurableWebApplicationContext.class.isAssignableFrom(contextClass)) {
+			throw new ApplicationContextException("Custom context class [" + contextClass.getName() +
+					"] is not of type [" + ConfigurableWebApplicationContext.class.getName() + "]");
+		}
+	    // 根据这个实现类通过反射的方式进行实例的创建
+		return (ConfigurableWebApplicationContext) BeanUtils.instantiateClass(contextClass);
+}
+
+protected Class<?> determineContextClass(ServletContext servletContext) {
+		String contextClassName = servletContext.getInitParameter(CONTEXT_CLASS_PARAM);
+		if (contextClassName != null) {
+			try {
+				return ClassUtils.forName(contextClassName, ClassUtils.getDefaultClassLoader());
+			}
+			catch (ClassNotFoundException ex) {
+				throw new ApplicationContextException(
+						"Failed to load custom context class [" + contextClassName + "]", ex);
+			}
+		}
+		else {
+            // 提取将要实现 WebApplicationContext 接口的实现类
+			contextClassName = defaultStrategies.getProperty(WebApplicationContext.class.getName());
+			try {
+				return ClassUtils.forName(contextClassName, ContextLoader.class.getClassLoader());
+			}
+			catch (ClassNotFoundException ex) {
+				throw new ApplicationContextException(
+						"Failed to load default context class [" + contextClassName + "]", ex);
+			}
+		}
+}
+```
+
+
+
+### DispatcherServlet
+
+​		在`Spring`中，`ContextLoaderListener`只是辅助功能，用于创建`WebApplicationContext`类型实例，而真正的逻辑实现其实是在`DispatcherServlet`中进行
+
+的，`DispatcherServlet`是实现`servlet`接口的实现类。
+
+​		`servlet`的生命周期是由`servlet`的容器来控制的，它可以分为`3`个阶段：初始化、运行和销毁。
+
+​		初始化阶段：
+
+​				`servlet`容器加载`servlet`类，把`servlet`类的`class`文件中的数据读到内存中。
+
+​				`servlet`容器创建一个`ServletConfig`对象。`ServletConfig`对象包含了`servlet`的初始化配置信息。
+
+​				`servlet`容器创建一个`servlet`对象。
+
+​				`servlet`容器调用`servlet`对象的`init`方法进行初始化。
+
+​		运行阶段：
+
+​				当`servlet`容器接收到一个请求时，`servlet`容器会针对这个请求创建`servletRequest`和`servletResponse`对象，然后调用`service`方法。并把这两个
+
+​		参数传递给`service`方法。`service`方法通过`servletRequest`对象获得请求的信息。并处理该请求。再通过`servletResponse`对象生成这个请求的响应结
+
+​		果。然后销毁`servletRequest`和`servletResponse`对象。我们不管这个请求是`post`提交的还是`get`提交的，最终这个请求都会由`service`方法来处理。
+
+​		销毁阶段：
+
+​				当`Web`应用被终止时，`servlet`容器会先调用`servlet`对象的`destrory`方法，然后再销毁`servlet`对象，同时也会销毁与`servlet`对象相关联的
+
+​		`servletConfig`对象。
+
+
+
+#### DispatcherServlet 的初始化
+
+```java
+// DispatcherServlet 的父类 HttpServletBean 类
+public final void init() throws ServletException {
+
+		// Set bean properties from init parameters.
+	    // 解析 init-param 并封装至pvs中，FrameworkServlet 类中包含对应的同名属性
+		PropertyValues pvs = new ServletConfigPropertyValues(getServletConfig(), this.requiredProperties);
+		if (!pvs.isEmpty()) {
+			try {
+                // 将当前的这个 servlet 类转化为一个 BeanWrapper,从而能够以 Spring 的方式来对 init-param 的值进行注入
+				BeanWrapper bw = PropertyAccessorFactory.forBeanPropertyAccess(this);
+				ResourceLoader resourceLoader = new ServletContextResourceLoader(getServletContext());
+                // 注册自定义属性编辑器，一旦遇到 Resource 类型的属性将会使用 ResourceEditor 进行解析
+				bw.registerCustomEditor(Resource.class, new ResourceEditor(resourceLoader, getEnvironment()));
+                // 空实现,留给子类覆盖
+				initBeanWrapper(bw);
+                // 属性注入
+				bw.setPropertyValues(pvs, true);
+			}
+			catch (BeansException ex) {
+				if (logger.isErrorEnabled()) {
+					logger.error("Failed to set bean properties on servlet '" + getServletName() + "'", ex);
+				}
+				throw ex;
+			}
+		}
+
+		// Let subclasses do whatever initialization they like.
+	    // 留给子类扩展，对 WebApplicationContext 进行补充初始化
+		initServletBean();
+}
+```
+
+
+
+##### 封装及验证初始化参数
+
+```java
+// HttpServletBean#ServletConfigPropertyValues 类
+public ServletConfigPropertyValues(ServletConfig config, Set<String> requiredProperties)
+				throws ServletException {
+
+			Set<String> missingProps = (!CollectionUtils.isEmpty(requiredProperties) ?
+					new HashSet<>(requiredProperties) : null);
+
+			Enumeration<String> paramNames = config.getInitParameterNames();
+			while (paramNames.hasMoreElements()) {
+				String property = paramNames.nextElement();
+				Object value = config.getInitParameter(property);
+				addPropertyValue(new PropertyValue(property, value));
+				if (missingProps != null) {
+					missingProps.remove(property);
+				}
+			}
+
+			// Fail if we are still missing properties.
+			if (!CollectionUtils.isEmpty(missingProps)) {
+				throw new ServletException(
+						"Initialization from ServletConfig for servlet '" + config.getServletName() +
+						"' failed; the following required properties were missing: " +
+						StringUtils.collectionToDelimitedString(missingProps, ", "));
+			}
+}
+```
+
+
+
+##### ServletBean 的初始化
+
+```java
+// FrameworkServlet 类
+protected final void initServletBean() throws ServletException {
+		getServletContext().log("Initializing Spring " + getClass().getSimpleName() + " '" + getServletName() + "'");
+		if (logger.isInfoEnabled()) {
+			logger.info("Initializing Servlet '" + getServletName() + "'");
+		}
+		long startTime = System.currentTimeMillis();
+
+		try {
+			this.webApplicationContext = initWebApplicationContext();
+            // 设计为子类覆盖
+			initFrameworkServlet();
+		}
+		catch (ServletException | RuntimeException ex) {
+			logger.error("Context initialization failed", ex);
+			throw ex;
+		}
+
+		if (logger.isDebugEnabled()) {
+			String value = this.enableLoggingRequestDetails ?
+					"shown which may lead to unsafe logging of potentially sensitive data" :
+					"masked to prevent unsafe logging of potentially sensitive data";
+			logger.debug("enableLoggingRequestDetails='" + this.enableLoggingRequestDetails +
+					"': request parameters and headers will be " + value);
+		}
+
+		if (logger.isInfoEnabled()) {
+			logger.info("Completed initialization in " + (System.currentTimeMillis() - startTime) + " ms");
+		}
+}
+```
+
+
+
+#### WebApplicationContext 的初始化
+
+```java
+// FrameworkServlet 类
+protected WebApplicationContext initWebApplicationContext() {
+		WebApplicationContext rootContext =
+				WebApplicationContextUtils.getWebApplicationContext(getServletContext());
+		WebApplicationContext wac = null;
+
+		if (this.webApplicationContext != null) {
+			// A context instance was injected at construction time -> use it
+            // context 实例在构造函数中被注入
+			wac = this.webApplicationContext;
+			if (wac instanceof ConfigurableWebApplicationContext) {
+				ConfigurableWebApplicationContext cwac = (ConfigurableWebApplicationContext) wac;
+				if (!cwac.isActive()) {
+					// The context has not yet been refreshed -> provide services such as
+					// setting the parent context, setting the application context id, etc
+					if (cwac.getParent() == null) {
+						// The context instance was injected without an explicit parent -> set
+						// the root application context (if any; may be null) as the parent
+						cwac.setParent(rootContext);
+					}
+                    // 刷新上下文环境
+                    // 使用公共父类 AbstractApplicationContext 提供的 refresh() 进行配置文件加载
+					configureAndRefreshWebApplicationContext(cwac);
+				}
+			}
+		}
+		if (wac == null) {
+			// No context instance was injected at construction time -> see if one
+			// has been registered in the servlet context. If one exists, it is assumed
+			// that the parent context (if any) has already been set and that the
+			// user has performed any initialization such as setting the context id
+            // 根据 contextAttribute 属性加载 webApplicationContext
+			wac = findWebApplicationContext();
+		}
+		if (wac == null) {
+			// No context instance is defined for this servlet -> create a local one
+			wac = createWebApplicationContext(rootContext);
+		}
+
+		if (!this.refreshEventReceived) {
+			// Either the context is not a ConfigurableApplicationContext with refresh
+			// support or the context injected at construction time had already been
+			// refreshed -> trigger initial onRefresh manually here.
+			synchronized (this.onRefreshMonitor) {
+				onRefresh(wac);
+			}
+		}
+
+		if (this.publishContext) {
+			// Publish the context as a servlet context attribute.
+			String attrName = getServletContextAttributeName();
+			getServletContext().setAttribute(attrName, wac);
+		}
+
+		return wac;
+}
+```
+
+```java
+// DispatcherServlet 类
+protected void onRefresh(ApplicationContext context) {
+		initStrategies(context);
+}
+
+protected void initStrategies(ApplicationContext context) {
+    	// 初始化 MultipartResolver，除妖用于处理文件上传
+		initMultipartResolver(context);
+    	// 初始化 LocaleResolver，国际化配置
+		initLocaleResolver(context);
+        // 初始化 ThemeResolver，主题配置
+		initThemeResolver(context);
+	    // 初始化 HandlerMappings，当客户端发出请求时，DispatcherServlet 会将请求提交给 HandlerMapping，HandlerMapping 根据配置来回传给 				DispatcherServlet 相应的 Controller
+		initHandlerMappings(context);
+	    // 初始化 HandlerAdapters，HandlerAdapters 通过适配器模式寻找合适的控制器进行处理
+		initHandlerAdapters(context);
+    	// 初始化 HandlerExceptionResolvers，处理异常，实现 HandlerExceptionResolver 接口的 bean ，会返回一个 ModelAndView 。Spring 会搜索容器		中所有实现了 HandlerExceptionResolver 接口的 bean 逐个执行，知道某一个返回一个 ModelAndView 对象
+		initHandlerExceptionResolvers(context);
+    	// 初始化 RequestToViewNameTranslator，当 Controller 处理器方法没有返回一个 View 对象或逻辑视图名称,并且在该方法中没有直接往 response 的输			出流里面写数据的时候，Spring 就会采用约定好的方式提供一个逻辑视图名称。这个逻辑视图名称是通过 Spring 定义的 					  				org.Springframework.web.servlet.RequestToViewNameTranslator接口的getViewName方法来实现的
+		initRequestToViewNameTranslator(context);
+	    // 初始化 ViewResolvers，当 Controller 将请求处理结果放入到 ModelAndView 中以后，DispatcherServlet 会根据 ModelAndView 选择合适的视图进			行渲染。ViewResolver 接口定义了resolverViewName方法，根据viewName创建合适类型的 View实现
+		initViewResolvers(context);
+	    // 初始化 FlashMapManager，SpringMVC Flash attributes提供了一个请求存储属性，可供其他请求使用。在使用重定向时候非常必要，Flash attributes			  在重定向之前暂存（就像存在session中）以便重定向之后还能使用，并立即删除。FlashMap 用于保持 flash attributes ,而 FlashMapManager 用于存			  储、检索、管理FlashMap实例
+		initFlashMapManager(context);
+}
+
+private void initHandlerMappings(ApplicationContext context) {
+		this.handlerMappings = null;
+
+		if (this.detectAllHandlerMappings) {
+			// Find all HandlerMappings in the ApplicationContext, including ancestor contexts.
+           	// 加载系统中所有实现了 HandlerMapping 接口的 bean
+			Map<String, HandlerMapping> matchingBeans =
+					BeanFactoryUtils.beansOfTypeIncludingAncestors(context, HandlerMapping.class, true, false);
+			if (!matchingBeans.isEmpty()) {
+				this.handlerMappings = new ArrayList<>(matchingBeans.values());
+				// We keep HandlerMappings in sorted order.
+				AnnotationAwareOrderComparator.sort(this.handlerMappings);
+			}
+		}
+		else {
+            // 配置了 detectAllHandlerMappings 参数为 false，即只加载 name 为 handlerMapping 的 bean
+			try {
+				HandlerMapping hm = context.getBean(HANDLER_MAPPING_BEAN_NAME, HandlerMapping.class);
+				this.handlerMappings = Collections.singletonList(hm);
+			}
+			catch (NoSuchBeanDefinitionException ex) {
+				// Ignore, we'll add a default HandlerMapping later.
+			}
+		}
+
+		// Ensure we have at least one HandlerMapping, by registering
+		// a default HandlerMapping if no other mappings are found.
+    	// 没有找到时，将在类 DispatcherServlet 所在的目录下的 DispatcherServlet.properties 中定义的 org.springframework.web.servlet.HandlerMapping 的内容来加载默认的 handlerMapping
+		if (this.handlerMappings == null) {
+			this.handlerMappings = getDefaultStrategies(context, HandlerMapping.class);
+			if (logger.isTraceEnabled()) {
+				logger.trace("No HandlerMappings declared for servlet '" + getServletName() +
+						"': using default strategies from DispatcherServlet.properties");
+			}
+		}
+
+		for (HandlerMapping mapping : this.handlerMappings) {
+			if (mapping.usesPathPatterns()) {
+				this.parseRequestPath = true;
+				break;
+			}
+		}
+}
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 # SSM
 
 ```xml
