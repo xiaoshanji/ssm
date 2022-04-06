@@ -11828,6 +11828,14 @@ protected void doCommit(DefaultTransactionStatus status) {
 
 
 
+
+
+
+
+
+
+
+
 # 二、设计模式
 
 ## 1、单例模式
@@ -17558,6 +17566,261 @@ private void initHandlerMappings(ApplicationContext context) {
 
 
 
+#### DispatcherServlet 的逻辑处理
+
+```java
+// FrameworkServlet 类
+protected final void doGet(HttpServletRequest request, HttpServletResponse response)
+			throws ServletException, IOException {
+
+		processRequest(request, response);
+}
+
+protected final void doPost(HttpServletRequest request, HttpServletResponse response)
+			throws ServletException, IOException {
+
+		processRequest(request, response);
+}
+
+protected final void processRequest(HttpServletRequest request, HttpServletResponse response)
+			throws ServletException, IOException {
+    	// 记录当前时间，用于计算 web 请求的处理时间
+		long startTime = System.currentTimeMillis();
+		Throwable failureCause = null;
+
+		LocaleContext previousLocaleContext = LocaleContextHolder.getLocaleContext();
+		// 为了保证当前线程的 LocaleContext 以及 RequestAttributes 可以在当前请求后还能恢复，提取当前线程的两个属性
+    	// 根据当前 request 创建对应的 LocaleContext 和 RequestAttributes
+		LocaleContext localeContext = buildLocaleContext(request);
+
+		RequestAttributes previousAttributes = RequestContextHolder.getRequestAttributes();
+		ServletRequestAttributes requestAttributes = buildRequestAttributes(request, response, previousAttributes);
+
+		WebAsyncManager asyncManager = WebAsyncUtils.getAsyncManager(request);
+		asyncManager.registerCallableInterceptor(FrameworkServlet.class.getName(), new RequestBindingInterceptor());
+		// 绑定到当前线程
+		initContextHolders(request, localeContext, requestAttributes);
+
+		try {
+			// 委托给 doService 方法进一步处理
+			doService(request, response);
+		}
+		catch (ServletException | IOException ex) {
+			failureCause = ex;
+			throw ex;
+		}
+		catch (Throwable ex) {
+			failureCause = ex;
+			throw new NestedServletException("Request processing failed", ex);
+		}
+		finally {
+			// 请求处理结束后恢复线程到原始状态
+			resetContextHolders(request, previousLocaleContext, previousAttributes);
+			if (requestAttributes != null) {
+				requestAttributes.requestCompleted();
+			}
+			logResult(request, response, failureCause, asyncManager);
+           	// 请求处理结束后无论成功与否发布事件通知
+			publishRequestHandledEvent(request, response, startTime, failureCause);
+		}
+}
+```
+
+```java
+// DispatcherServlet 类
+protected void doService(HttpServletRequest request, HttpServletResponse response) throws Exception {
+		logRequest(request);
+
+		// Keep a snapshot of the request attributes in case of an include,
+		// to be able to restore the original attributes after the include.
+		Map<String, Object> attributesSnapshot = null;
+		if (WebUtils.isIncludeRequest(request)) {
+			attributesSnapshot = new HashMap<>();
+			Enumeration<?> attrNames = request.getAttributeNames();
+			while (attrNames.hasMoreElements()) {
+				String attrName = (String) attrNames.nextElement();
+				if (this.cleanupAfterInclude || attrName.startsWith(DEFAULT_STRATEGIES_PREFIX)) {
+					attributesSnapshot.put(attrName, request.getAttribute(attrName));
+				}
+			}
+		}
+
+		// Make framework objects available to handlers and view objects.
+    	// 设置功能辅助工具变量
+		request.setAttribute(WEB_APPLICATION_CONTEXT_ATTRIBUTE, getWebApplicationContext());
+		request.setAttribute(LOCALE_RESOLVER_ATTRIBUTE, this.localeResolver);
+		request.setAttribute(THEME_RESOLVER_ATTRIBUTE, this.themeResolver);
+		request.setAttribute(THEME_SOURCE_ATTRIBUTE, getThemeSource());
+
+		if (this.flashMapManager != null) {
+			FlashMap inputFlashMap = this.flashMapManager.retrieveAndUpdate(request, response);
+			if (inputFlashMap != null) {
+				request.setAttribute(INPUT_FLASH_MAP_ATTRIBUTE, Collections.unmodifiableMap(inputFlashMap));
+			}
+			request.setAttribute(OUTPUT_FLASH_MAP_ATTRIBUTE, new FlashMap());
+			request.setAttribute(FLASH_MAP_MANAGER_ATTRIBUTE, this.flashMapManager);
+		}
+
+		RequestPath previousRequestPath = null;
+		if (this.parseRequestPath) {
+			previousRequestPath = (RequestPath) request.getAttribute(ServletRequestPathUtils.PATH_ATTRIBUTE);
+			ServletRequestPathUtils.parseAndCache(request);
+		}
+
+		try {
+			doDispatch(request, response);
+		}
+		finally {
+			if (!WebAsyncUtils.getAsyncManager(request).isConcurrentHandlingStarted()) {
+				// Restore the original attribute snapshot, in case of an include.
+				if (attributesSnapshot != null) {
+					restoreAttributesAfterInclude(request, attributesSnapshot);
+				}
+			}
+			if (this.parseRequestPath) {
+				ServletRequestPathUtils.setParsedRequestPath(previousRequestPath, request);
+			}
+		}
+}
+
+protected void doDispatch(HttpServletRequest request, HttpServletResponse response) throws Exception {
+		HttpServletRequest processedRequest = request;
+		HandlerExecutionChain mappedHandler = null;
+		boolean multipartRequestParsed = false;
+
+		WebAsyncManager asyncManager = WebAsyncUtils.getAsyncManager(request);
+
+		try {
+			ModelAndView mv = null;
+			Exception dispatchException = null;
+
+			try {
+				// 如果是 MultipartContent 类型的 request 则转换 request 为 MultipartHttpServletRequest 类型的 request
+				processedRequest = checkMultipart(request);
+				multipartRequestParsed = (processedRequest != request);
+
+				// Determine handler for the current request.
+                 // 根据 request 信息寻找对应的 Handler
+				mappedHandler = getHandler(processedRequest);
+				if (mappedHandler == null) {
+                    // 如果没有找到对应的 handler 则通过 response 反馈错误信息
+					noHandlerFound(processedRequest, response);
+					return;
+				}
+
+				// Determine handler adapter for the current request.
+                // 根据当前的 handler 寻找对应的 HandlerAdapter
+				HandlerAdapter ha = getHandlerAdapter(mappedHandler.getHandler());
+
+				// Process last-modified header, if supported by the handler.
+				String method = request.getMethod();
+				boolean isGet = HttpMethod.GET.matches(method);
+                // 如果当前 handler 支持 last-modified 头处理
+                // Last-Modified 缓存机制。在客户端第一次输入 URL 时，服务器端会返回内容和状态码 200，表示请求成功，同时会添加一个 Last-Modified 的					响应头，表示此文件在服务器上的最后更新时间，客户端第二次请求此 URL 时，客户端会向服务器发送请求头 If-Modified-Since，询问服务器该				  时间之后当前请求内容是否有被修改过，如果服务器端的内容没有变化，则自动返回 HTTP 304 状态码（只要响应头，内容为空，这样就节省了网络带					宽)。
+				if (isGet || HttpMethod.HEAD.matches(method)) {
+					long lastModified = ha.getLastModified(request, mappedHandler.getHandler());
+					if (new ServletWebRequest(request, response).checkNotModified(lastModified) && isGet) {
+						return;
+					}
+				}
+				// 拦截器的 preHandler 方法的调用
+				if (!mappedHandler.applyPreHandle(processedRequest, response)) {
+					return;
+				}
+
+				// Actually invoke the handler.
+                // 真正的激活 handler 并返回视图
+				mv = ha.handle(processedRequest, response, mappedHandler.getHandler());
+
+				if (asyncManager.isConcurrentHandlingStarted()) {
+					return;
+				}
+				// 视图名称转换应用于需要添加前缀后缀的情况
+				applyDefaultViewName(processedRequest, mv);
+				// 应用所有拦截器的 postHandle 方法
+				mappedHandler.applyPostHandle(processedRequest, response, mv);
+			}
+			catch (Exception ex) {
+				dispatchException = ex;
+			}
+			catch (Throwable err) {
+				// As of 4.3, we're processing Errors thrown from handler methods as well,
+				// making them available for @ExceptionHandler methods and other scenarios.
+				dispatchException = new NestedServletException("Handler dispatch failed", err);
+			}
+            // 如果在 Handler 实例的处理中返回了 view，那么需要做页面的处理
+			processDispatchResult(processedRequest, response, mappedHandler, mv, dispatchException);
+		}
+		catch (Exception ex) {
+			triggerAfterCompletion(processedRequest, response, mappedHandler, ex);
+		}
+		catch (Throwable err) {
+			triggerAfterCompletion(processedRequest, response, mappedHandler,
+					new NestedServletException("Handler processing failed", err));
+		}
+		finally {
+			if (asyncManager.isConcurrentHandlingStarted()) {
+				// Instead of postHandle and afterCompletion
+				if (mappedHandler != null) {
+					mappedHandler.applyAfterConcurrentHandlingStarted(processedRequest, response);
+				}
+			}
+			else {
+				// Clean up any resources used by a multipart request.
+				if (multipartRequestParsed) {
+					cleanupMultipart(processedRequest);
+				}
+			}
+		}
+}
+
+private void processDispatchResult(HttpServletRequest request, HttpServletResponse response,
+			@Nullable HandlerExecutionChain mappedHandler, @Nullable ModelAndView mv,
+			@Nullable Exception exception) throws Exception {
+
+		boolean errorView = false;
+		// 异常视图的处理
+		if (exception != null) {
+			if (exception instanceof ModelAndViewDefiningException) {
+				logger.debug("ModelAndViewDefiningException encountered", exception);
+				mv = ((ModelAndViewDefiningException) exception).getModelAndView();
+			}
+			else {
+				Object handler = (mappedHandler != null ? mappedHandler.getHandler() : null);
+				mv = processHandlerException(request, response, handler, exception);
+				errorView = (mv != null);
+			}
+		}
+
+		// Did the handler return a view to render?
+		if (mv != null && !mv.wasCleared()) {
+            // 处理页面跳转
+			render(mv, request, response);
+			if (errorView) {
+				WebUtils.clearErrorRequestAttributes(request);
+			}
+		}
+		else {
+			if (logger.isTraceEnabled()) {
+				logger.trace("No view rendering, null ModelAndView returned.");
+			}
+		}
+
+		if (WebAsyncUtils.getAsyncManager(request).isConcurrentHandlingStarted()) {
+			// Concurrent handling started during a forward
+			return;
+		}
+
+		if (mappedHandler != null) {
+			// Exception (if any) is already handled..
+            // 完成处理激活触发器
+			mappedHandler.triggerAfterCompletion(request, response, null);
+		}
+}
+```
+
+
+
 
 
 
@@ -20492,7 +20755,7 @@ typedef struct redisObject {
     unsigned encoding:4; // 编码格式，即存储数据使用的数据结构，同一个类型的数据，Redis 会根据数据量、占用内存等情况使用不同的编码，最大限度节省内存
     unsigned lru:LRU_BITS; // 24位，LRU 时间戳或 LFU 计数
     int refcount; // 引用计数，为了节省内存，Redis 会在多处引用同一个 redisObject
-    void *ptr; // 指向知己的数据结构
+    void *ptr; // 指向实际的数据结构
 } robj;
 ```
 
@@ -20522,18 +20785,21 @@ typedef struct redisObject {
 ​		`C`语言中将空字符结尾的字符数组作为字符串，`Redis`做了扩展，定义了字符串类型`sds`：
 
 ```c++
+// sds.h
 typedef char *sds;
 
-
+/** __attribute__ ((__packed__)) 取消结构体内的字节对齐以节省内存
+	buf 数组并没有指定数组长度，使用的是柔性数组，即结构体中最后一个属性可以被定义为一个大小可变的数组，使用 sizeof 函数计算结构体大小时，返回结构不包含数组占用的内存
+*/
 struct __attribute__ ((__packed__)) sdshdr5 {
-    unsigned char flags; /* 3 lsb of type, and 5 msb of string length */
+    unsigned char flags; // 低 3 位代表 sdshdr 的类型，高 5 位代表字符串长度，这个类型定义的是常量字符串，不支持扩容，所以没有 alloc 属性
     char buf[];
 };
 struct __attribute__ ((__packed__)) sdshdr8 {
-    uint8_t len; // 已使用字节长度，即字符串长度，最大长度为 2^8 - 1
-    uint8_t alloc; // 已申请字节长度，即 sds 总长度
-    unsigned char flags; /* 3 lsb of type, 5 unused bits */
-    char buf[];
+    uint8_t len; // 已使用字节长度，即字符串长度，最大长度为 2^8 - 1，Redis规定字符串长度最大不能超过 512M，由于该属性记录了字符串长度，所以字符串中可以存放空字符 '\0'
+    uint8_t alloc; // 已申请字节长度，即 sds 总长度，alloc - len 为可用（空闲）空间
+    unsigned char flags; // 低 3 位代表 sdshdr 的类型
+    char buf[]; // 字符串内容，其遵循 C 语言的规范，保存一个空字符作为 buf 的结尾并且不计入 len、alloc 属性，所以直接可以使用 strcmp、strcpy 等函数
 };
 struct __attribute__ ((__packed__)) sdshdr16 {
     uint16_t len; /* used */
@@ -20554,6 +20820,272 @@ struct __attribute__ ((__packed__)) sdshdr64 {
     char buf[];
 };
 ```
+
+
+
+#### 构建字符串
+
+```c++
+// sds.c
+sds sdsnewlen(const void *init, size_t initlen) {
+    return _sdsnewlen(init, initlen, 0);
+}
+// init：字符串内容；initlen：字符串长度
+sds _sdsnewlen(const void *init, size_t initlen, int trymalloc) {
+    void *sh;
+    sds s;
+    // 根据字符串长度，判断对应的 sdshdr 类型
+    char type = sdsReqType(initlen);
+
+    // 长度为 0 的字符串通常需要扩容，使用 sdshdr 8
+    if (type == SDS_TYPE_5 && initlen == 0) type = SDS_TYPE_8;
+    
+    // sdsHdrSize 查询 sdshdr 结构体的长度
+    int hdrlen = sdsHdrSize(type);
+    unsigned char *fp; /* flags pointer. */
+    size_t usable;
+
+    assert(initlen + hdrlen + 1 > initlen); /* Catch size_t overflow */
+    // 申请内存空间，hdrlen：sdshdr 结构体长度（不包含 buf 数组）；initlen：字符串内容长度；1：存放空字符 '\0'
+    sh = trymalloc ? s_trymalloc_usable(hdrlen + initlen + 1, &usable) : s_malloc_usable(hdrlen + initlen + 1, &usable);
+    if (sh == NULL) return NULL;
+    if (init==SDS_NOINIT)
+        init = NULL;
+    else if (!init)
+        memset(sh, 0, hdrlen+initlen+1);
+    
+    // 给 sdshdr 属性赋值
+    s = (char*)sh+hdrlen;
+    fp = ((unsigned char*)s)-1;
+    usable = usable-hdrlen-1;
+    if (usable > sdsTypeMaxSize(type))
+        usable = sdsTypeMaxSize(type);
+    switch(type) {
+        case SDS_TYPE_5: {
+            *fp = type | (initlen << SDS_TYPE_BITS);
+            break;
+        }
+        case SDS_TYPE_8: {
+            // SDS_HDR_VAR 将 sh 指针转化为对应的 sdshdr 结构体指针
+            SDS_HDR_VAR(8,s);
+            sh->len = initlen;
+            sh->alloc = usable;
+            *fp = type;
+            break;
+        }
+        case SDS_TYPE_16: {
+            SDS_HDR_VAR(16,s);
+            sh->len = initlen;
+            sh->alloc = usable;
+            *fp = type;
+            break;
+        }
+        case SDS_TYPE_32: {
+            SDS_HDR_VAR(32,s);
+            sh->len = initlen;
+            sh->alloc = usable;
+            *fp = type;
+            break;
+        }
+        case SDS_TYPE_64: {
+            SDS_HDR_VAR(64,s);
+            sh->len = initlen;
+            sh->alloc = usable;
+            *fp = type;
+            break;
+        }
+    }
+    if (initlen && init)
+        memcpy(s, init, initlen);
+    s[initlen] = '\0';
+    
+    // sds 实际上 char* 的别名，s 指针指向 sdshdr.buf 属性，即字符串内容，Redis 通过该指针可以直接读/写字符串数据
+    return s;
+}
+```
+
+
+
+#### 扩容
+
+```c++
+// sds.c
+// addlen：要求扩容后可用长度 (alloc - len)大于该参数
+sds sdsMakeRoomFor(sds s, size_t addlen) {
+    void *sh, *newsh;
+    // 获取当前可用空间长度，如果当前可用空间长度满足要求，直接返回
+    size_t avail = sdsavail(s);
+    size_t len, newlen, reqlen;
+    char type, oldtype = s[-1] & SDS_TYPE_MASK;
+    int hdrlen;
+    size_t usable;
+
+    /* Return ASAP if there is enough space left. */
+    if (avail >= addlen) return s;
+	
+    // sdslen：获取字符串长度，len 为原 sds 字符串长度；newlen 为新 sds 长度；sh 指向原 sds 的 sdshdr 结构体
+    len = sdslen(s);
+    sh = (char*)s-sdsHdrSize(oldtype);
+    reqlen = newlen = (len+addlen);
+    assert(newlen > len);   /* Catch size_t overflow */
+    
+    // 预分配比参数要求多的内存空间，避免每次扩容都要进行内存拷贝操作
+    // 新的 sds 长度如果小于 SDS_MAX_PREALLOC（1024 x 1024 字节），则扩大两倍，否则增加 SDS_MAX_PREALLOC
+    if (newlen < SDS_MAX_PREALLOC)
+        newlen *= 2;
+    else
+        newlen += SDS_MAX_PREALLOC;
+
+    // sdsReqType：计算新的 sdshdr 类型
+    type = sdsReqType(newlen);
+
+    /* Don't use type 5: the user is appending to the string and type 5 is
+     * not able to remember empty space, so sdsMakeRoomFor() must be called
+     * at every appending operation. */
+    // 扩容后不使用 sdshdr5
+    if (type == SDS_TYPE_5) type = SDS_TYPE_8;
+	
+    // 如果扩容后 sds 还是同一类型，则直接申请内存，否则，由于 sds 结构已经变动，必须移动整个 sds，直接分配新的内容空间，并将原来的字符串内容复制到新的内存空间
+    hdrlen = sdsHdrSize(type);
+    assert(hdrlen + newlen + 1 > reqlen);  /* Catch size_t overflow */
+    if (oldtype==type) {
+        newsh = s_realloc_usable(sh, hdrlen+newlen+1, &usable);
+        if (newsh == NULL) return NULL;
+        s = (char*)newsh+hdrlen;
+    } else {
+        /* Since the header size changes, need to move the string forward,
+         * and can't use realloc */
+        newsh = s_malloc_usable(hdrlen+newlen+1, &usable);
+        if (newsh == NULL) return NULL;
+        memcpy((char*)newsh+hdrlen, s, len+1);
+        s_free(sh);
+        s = (char*)newsh+hdrlen;
+        s[-1] = type;
+        sdssetlen(s, len);
+    }
+    usable = usable-hdrlen-1;
+    if (usable > sdsTypeMaxSize(type))
+        usable = sdsTypeMaxSize(type);
+    
+    // 更新 sdshdr.alloc 属性
+    sdssetalloc(s, usable);
+    return s;
+}
+```
+
+​		`Redis`字符串支持二进制安全，可用将输入存储为没有特定格式意义的原始数据流，因此`Redis`字符串可以存储任何数据。
+
+
+
+#### 常用函数
+
+|                 函数                  |                            作用                            |
+| :-----------------------------------: | :--------------------------------------------------------: |
+|           sdsnew，sdsempty            |                          创建 sds                          |
+| sdsfree，sdsclear，sdsRemoveFreeSpace | 释放 sds，清空 sds 中的字符串内容，移除 sds 剩余的可用空间 |
+|                sdslen                 |                    获取 sds 字符串长度                     |
+|                 sdsup                 |          将给定字符串复制到 sds 中，覆盖原字符串           |
+|                sdscat                 |            将给定字符串拼接到 sds 字符串内容后             |
+|                sdscmp                 |                对比两个 sds 字符串是否相同                 |
+|               sdstrange               |        获取子字符串，不在指定范围内的字符串将被清除        |
+
+
+
+#### 编码
+
+​		字符串有 3 中编码：
+
+​				`OBJ_ENCODING_EMBSTR`：长度小于或等于`OBJ_ENCODING_EMBSTR_SIZE_LIMIT(44`字节`)`的字符串。该编码是`Redis`针对短字符串的优化。其内存申请和释
+
+​		放都只需要调用一次内存操作函数。并且`redisObject`和`sdshdr`结构保存在一块连续的内存中，减少了内存碎片。
+
+![](image/QQ截图20220406140809.png)
+
+​				`OBJ_ENCODING_RAW`：长度大于`OBJ_ENCODING_EMBSTR_SIZE_LIMIT`的字符串，`redisObject`和`sdshdr`结构存放在两个不连续的内存块中。
+
+​				`OBJ_ENCODING_INT`：将数值型字符串转换为整型，可以大幅江都数据占用的内存空间。
+
+
+
+​		向`Redis`发送一个请求后，`Redis`会解析请求报文，并将命令、参数转化为`redisObject`：
+
+```c++
+// object.c
+robj *createStringObject(const char *ptr, size_t len) {
+    if (len <= OBJ_ENCODING_EMBSTR_SIZE_LIMIT)
+        return createEmbeddedStringObject(ptr,len);
+    else
+        return createRawStringObject(ptr,len);
+}
+```
+
+​		根据字符串长度，将`encoding`转化为`OBJ_ENCODING_EMBSTR`或`OBJ_ENCODING_RAW`的`redisObject`，然后`Redis`再将`redisObject`存入数据库。
+
+​		转为`OBJ_ENCODING_INT`：
+
+```c++
+// object.c
+robj *tryObjectEncoding(robj *o) {
+    long value;
+    sds s = o->ptr;
+    size_t len;
+
+    serverAssertWithInfo(NULL,o,o->type == OBJ_STRING);
+
+    if (!sdsEncodedObject(o)) return o;
+	// 如果被多处引用，不能进行编码操作，否则会影响其他地方的正常运行
+    if (o->refcount > 1) return o;
+
+    len = sdslen(s);
+    // 如果字符串长度小于或等于 20 ，则调用 string2l 函数尝试将其转换为 long long 类型，如果成功返回 1，long long 最大保存长度为 20 的数值型字符串（19 位数值 + 1 位符号位）
+    if (len <= 20 && string2l(s,len,&value)) {
+        // 首先尝试使用 shared.integers 中的共享数据，避免重复创建相同数据对象而浪费内存。shared.integers 是一个整数数组，存放了 0 ~ 9999
+        /*
+        	如果配置了 server.maxmemory ，并使用了不支持共享数据的淘汰算法（LRU，LFU），将不能使用共享数据，此时每个数据中心都必须存在一个 					redisObject.lru 属性，这些算法才能正常工作
+        */
+        if ((server.maxmemory == 0 ||
+            !(server.maxmemory_policy & MAXMEMORY_FLAG_NO_SHARED_INTEGERS)) &&
+            value >= 0 &&
+            value < OBJ_SHARED_INTEGERS)
+        {
+            decrRefCount(o);
+            incrRefCount(shared.integers[value]);
+            return shared.integers[value];
+        } else {
+            // 如果不能使用共享数据并且原编码格式为 OBJ_ENCODING_RAW，则将 redisObject.ptr 原来的 sds 类型替换为字符串转换后的数值
+            if (o->encoding == OBJ_ENCODING_RAW) {
+                sdsfree(o->ptr);
+                o->encoding = OBJ_ENCODING_INT;
+                o->ptr = (void*) value;
+                return o;
+            } else if (o->encoding == OBJ_ENCODING_EMBSTR) {
+                // 如果不能使用共享数据并且原编码格式为 OBJ_ENCODING_EMBSTR，由于 redisObject、sds 存在在同一个内存块中，无法直接替换 							redisObject.ptr ，所以调用 createStringObjectFromLongLongForValue 函数创建一个新的 redisObject，编码为 									OBJ_ENCODING_INT，redisObject.ptr 指向 long long 类型或 long 类型
+                decrRefCount(o);
+                return createStringObjectFromLongLongForValue(value);
+            }
+        }
+    }
+	// 此时说明字符串不能转换为 OBJ_ENCODING_INT 编码，尝试将其转换为 OBJ_ENCODING_EMBSTR 编码
+    if (len <= OBJ_ENCODING_EMBSTR_SIZE_LIMIT) {
+        robj *emb;
+
+        if (o->encoding == OBJ_ENCODING_EMBSTR) return o;
+        emb = createEmbeddedStringObject(s,sdslen(s));
+        decrRefCount(o);
+        return emb;
+    }
+	// 此时说明字符串只能使用 OBJ_ENCODING_RAW编码，尝试释放 sds 中剩余的可用空间
+    trimStringObjectIfNeeded(o);
+
+    return o;
+}
+```
+
+​		`server.c/redisCommandTable`定义了每个`Redis`命令与对应的处理函数。
+
+​		通过`TYPE`命令查看数据对象类型，`OBJECT ENCODING`命令查看编码。
+
+
 
 
 
