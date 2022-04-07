@@ -21089,6 +21089,697 @@ robj *tryObjectEncoding(robj *o) {
 
 
 
+### 列表
+
+​		列表类型可以存储一组按插入顺序排序的字符串，支持两端插入、弹出数据、可以充当栈和队列的角色。
+
+​		`Redis`中链表结构实现列表：
+
+```c++
+// adlist.h
+typedef struct listNode {
+    struct listNode *prev;
+    struct listNode *next;
+    void *value;
+} listNode;
+
+typedef struct list {
+    listNode *head;
+    listNode *tail;
+    void *(*dup)(void *ptr);
+    void (*free)(void *ptr);
+    int (*match)(void *ptr, void *key);
+    unsigned long len;
+} list;
+```
+
+​		`Redis`使用上面的结构保存运行数据，但不保存用户列表数据：链表中每个节点都占用独立的一块内存，导致内存碎片过多；链表节点中前后节点指针占用
+
+过多的额外内存。
+
+​		对于用户数据`Redis`使用类似数组的紧凑型链表结构，申请一整块内存，在这个内存上存放该链表所有数据。
+
+```tex
+<zlbytes> <zltail> <zllen> <entry> <entry> ... <entry> <zlend>
+```
+
+​		`zlbytes`：`uint32_t`，记录整个`ziplist`占用的字节数，包括`zlbytes`占用的`4`字节。
+
+​		`zltail`：`uint32_t`，记录从`ziplist`起始位置到最后一个节点的偏移量，用于支持链表从尾部弹出或反向`(`从尾到头`)`遍历链表。
+
+​		`zllen`：`uint16_t`，记录节点数量，如果存在`2 ^ 16 - 2`个节点，则该值设置为`2 ^ 16 - 1`，这是需要遍历整个`ziplist`获取真正的节点数量。
+
+​		`zlend`：一个特殊的标志节点，等于`255`，标志`ziplist`结尾，其他节点数据不会以`255`开头。
+
+​		`entry`：`ziplist`中保存数据的节点：
+
+```tex
+<prevlen> <encoding> <entry-data>
+```
+
+​				`entry-data`：节点存储的数据。
+
+​				`prevlen`：记录前驱节点长度，单位为字节，该属性长度为`1`字节或`5`字节。如果前驱节点长度小于`254`，则使用`1`字节存储前驱节点长度。否则，使
+
+​		用`5`字节，并且第一个字节固定为`254`，剩余`4`个字节存储前驱节点长度。
+
+​				`encoding`：代表当前节点元素的编码格式，包含编码类型和节点长度。`ziplist`中不同节点元素的编码格式可以不同：
+
+​						`00xxxxxx`：`(xxxxxx)`代表`encoding`低`6`位，字符串编码，长度小于或等于`63(2 ^ 6 - 1)`，长度存放在`encoding`的低`6`位。
+
+​						`01xxxxxx`：字符串编码，长度小于或等于`16383(2 ^ 14 - 1)`，长度存放在`encoding`的后`6`位和`encoding`后一个字节中。
+
+​						`10000000`：字符串编码，长度大于`16383(2 ^ 14 - 1)`，长度存放在`encoding`后`4`字节中。
+
+​						`11000000`：数值编码。类型为`int16_t`，占用`2`字节。
+
+​						`11010000`：数值编码，类型为`int32_t`，占用`4`字节。
+
+​						`11100000`：数值编码，类型为`int64_t`，占用`8`字节。
+
+​						`11110000`：数值编码，使用`3`字节保存一个整数。
+
+​						`11111110`：数值编码，使用`1`字节保存一个整数。
+
+​						`1111xxxx`：使用`encoding`低`4`位存储一个整数，范围为`0 ~ 12`，该编码下`encoding`低`4`位的可用范围为`0001 ~ 1101`，`encoding`低`4`位减`1`
+
+​				为实际存储的值。这种编码是针对小数字的优化，节点元素直接存放在`encoding`上，`entry-data`为空。
+
+​						`11111111`：`255`，`ziplist`结束节点。
+
+
+
+#### 查找
+
+```c++
+// ziplist.c
+/**
+	zl：待查找 ziplist
+	p：指定从 ziplist 哪个节点开始查找
+	vstr、vlen：待查找元素的内容和长度
+	skip：间隔多少个节点才执行一次元素对比操作
+*/
+unsigned char *ziplistFind(unsigned char *zl, unsigned char *p, unsigned char *vstr, unsigned int vlen, unsigned int skip) {
+    int skipcnt = 0;
+    unsigned char vencoding = 0;
+    long long vll = 0;
+    size_t zlbytes = ziplistBlobLen(zl);
+
+    while (p[0] != ZIP_END) {
+        struct zlentry e;
+        unsigned char *q;
+		/*
+			zipEntrySafe：计算 p 指向的节点的 prevrawlen 属性长度是 1 字节还是5 字节，将结果存在 e->prevrawlensize 属性中。然后解析节点的相关属				性，e->encoding 节点编码格式， e->lensize 额外存放节点元素长度的字节数，即 01xxxxxx 和 10000000 两种编码格式需要额外的空间存放节点元素			长度， e->len 节点元素的长度
+		*/
+        assert(zipEntrySafe(zl, zlbytes, p, &e, 1));
+        q = p + e.prevrawlensize + e.lensize;
+
+        if (skipcnt == 0) {
+            /* Compare current entry with specified entry */
+            // 如果节点时字符串编码，则对比 String 的内容，相等则返回
+            if (ZIP_IS_STR(e.encoding)) {
+                if (e.len == vlen && memcmp(q, vstr, vlen) == 0) {
+                    return p;
+                }
+            } else {
+                /* Find out if the searched field can be encoded. Note that
+                 * we do it only the first time, once done vencoding is set
+                 * to non-zero and vll is set to the integer value. */
+                // 如果节点是数值编码，并且没有对，待查找的内容 vstr 进行编码，则对 vstr 进行编码，编码后的数值存储在 vll 中
+                if (vencoding == 0) {
+                    if (!zipTryEncoding(vstr, vlen, &vll, &vencoding)) {
+                        /* If the entry can't be encoded we set it to
+                         * UCHAR_MAX so that we don't retry again the next
+                         * time. */
+                        vencoding = UCHAR_MAX;
+                    }
+                    /* Must be non-zero by now */
+                    assert(vencoding);
+                }
+
+                /* Compare current entry with specified entry, do it only
+                 * if vencoding != UCHAR_MAX because if there is no encoding
+                 * possible for the field it can't be a valid integer. */
+                // 若编码成功，则对比编码后的结果
+                if (vencoding != UCHAR_MAX) {
+                    // zipLoadInteger 从节点中提取存储的数值
+                    long long ll = zipLoadInteger(q, e.encoding);
+                    if (ll == vll) {
+                        return p;
+                    }
+                }
+            }
+
+            /* Reset skip count */
+            // skipcnt 不为 0，则直接跳过节点并将 skipcnt - 1，知道 skipcnt 为 0 才对比数据
+            skipcnt = skip;
+        } else {
+            /* Skip entry */
+            skipcnt--;
+        }
+
+        /* Move to next entry */
+        // 得到下一个节点的起始位置
+        p = q + e.len;
+    }
+
+    return NULL;
+}
+```
+
+
+
+#### 插入
+
+```java
+// ziplist.c
+/**
+	zl：待插入 ziplist
+	p：指向插入位置的后驱节点
+	s,slen：待插入元素的内容和长度
+*/
+unsigned char *__ziplistInsert(unsigned char *zl, unsigned char *p, unsigned char *s, unsigned int slen) {
+    size_t curlen = intrev32ifbe(ZIPLIST_BYTES(zl)), reqlen, newlen;
+    unsigned int prevlensize, prevlen = 0;
+    size_t offset;
+    int nextdiff = 0;
+    unsigned char encoding = 0;
+    long long value = 123456789; /* initialized to avoid warning. Using a value
+                                    that is easy to see if for some reason
+                                    we use it uninitialized. */
+    zlentry tail;
+
+    /* Find out prevlen for the entry that is inserted. */
+    // 计算前驱节点长度并存放到 prevlen
+    if (p[0] != ZIP_END) {
+        // 如果 p 没有指定 ZIP_END 则直接读取 p 节点的 prevlen 属性，否则需要通过 zpulist.zltail 找到前驱节点，在获取前驱节点的长度
+        ZIP_DECODE_PREVLEN(p, prevlensize, prevlen);
+    } else {
+        unsigned char *ptail = ZIPLIST_ENTRY_TAIL(zl);
+        if (ptail[0] != ZIP_END) {
+            prevlen = zipRawEntryLengthSafe(zl, curlen, ptail);
+        }
+    }
+
+    /* See if the entry can be encoded */
+    // 对插入元素的内容编码，并将内容的长度存放在 reqlen
+    // zipTryEncoding 尝试将内容编码为数值，如果成功返回 1 ，此时 value 指向编码后的值，encoding 存储对应编码格式，否则返回 0
+    if (zipTryEncoding(s,slen,&value,&encoding)) {
+        /* 'encoding' is set to the appropriate integer encoding */
+        reqlen = zipIntSize(encoding);
+    } else {
+        /* 'encoding' is untouched, however zipStoreEntryEncoding will use the
+         * string length to figure out how to encode it. */
+        reqlen = slen;
+    }
+    /* We need space for both the length of the previous entry and
+     * the length of the payload. */
+    // zipStorePrevEntryLength：计算 prevlen 属性的长度（1 字节或 5 字节）
+    // zipStoreEntryEncoding：计算额外存放元素长度所需字节数
+    // reqlen 最后的结果为插入节点长度
+    reqlen += zipStorePrevEntryLength(NULL,prevlen);
+    reqlen += zipStoreEntryEncoding(NULL,encoding,slen);
+
+    /* When the insert position is not equal to the tail, we need to
+     * make sure that the next entry can hold this entry's length in
+     * its prevlen field. */
+    // zipPrevLenByteDiff：计算后驱节点 prevlen 属性长度需要调整多少个字节，结果存入 nextdiff
+    int forcelarge = 0;
+    nextdiff = (p[0] != ZIP_END) ? zipPrevLenByteDiff(p,reqlen) : 0;
+    if (nextdiff == -4 && reqlen < 4) {
+        nextdiff = 0;
+        forcelarge = 1; // 这里是插入小节点时避免级联更新，所以强制保持后驱节点的 prevlen 属性长度不变
+    }
+
+    /* Store offset because a realloc may change the address of zl. */
+    // 重新为 ziplist 分配内存，主要是为插入节点申请空间
+    offset = p-zl;
+    // 新的ziplist 的内存大小，curlen 为插入前 ziplist 的长度
+    newlen = curlen+reqlen+nextdiff;
+    // ziplistResize 可能会为 ziplist 申请新的内存地址，需要给 p 重新赋值，offset 为插入节点的偏移量
+    zl = ziplistResize(zl,newlen);
+    p = zl+offset;
+
+    /* Apply memory move when necessary and update tail offset. */
+    if (p[0] != ZIP_END) {
+        /* Subtract one because of the ZIP_END bytes */
+        // 将插入位置后面的节点后移
+        memmove(p+reqlen,p-nextdiff,curlen-offset-1+nextdiff);
+
+        /* Encode this entry's raw length in the next entry. */
+        // 修改后驱节点的 prevlen 属性
+        if (forcelarge)
+            zipStorePrevEntryLengthLarge(p+reqlen,reqlen);
+        else
+            zipStorePrevEntryLength(p+reqlen,reqlen);
+
+        /* Update offset for tail */
+        // 更新 ziplist.zltail
+        ZIPLIST_TAIL_OFFSET(zl) =
+            intrev32ifbe(intrev32ifbe(ZIPLIST_TAIL_OFFSET(zl))+reqlen);
+
+        /* When the tail contains more than one entry, we need to take
+         * "nextdiff" in account as well. Otherwise, a change in the
+         * size of prevlen doesn't have an effect on the *tail* offset. */
+        // 如果存在多个后驱节点，则 ziplist.zltail 还需要加上 nextdiff
+        assert(zipEntrySafe(zl, newlen, p+reqlen, &tail, 1));
+        if (p[reqlen+tail.headersize+tail.len] != ZIP_END) {
+            ZIPLIST_TAIL_OFFSET(zl) =
+                intrev32ifbe(intrev32ifbe(ZIPLIST_TAIL_OFFSET(zl))+nextdiff);
+        }
+    } else {
+        /* This element will be the new tail. */
+        // 不存在后驱节点，只更新 ziplist.zltail
+        ZIPLIST_TAIL_OFFSET(zl) = intrev32ifbe(p-zl);
+    }
+
+    /* When nextdiff != 0, the raw length of the next entry has changed, so
+     * we need to cascade the update throughout the ziplist */
+    // 级联更新
+    if (nextdiff != 0) {
+        offset = p-zl;
+        zl = __ziplistCascadeUpdate(zl,p+reqlen);
+        p = zl+offset;
+    }
+
+    /* Write the entry */
+    // 写入插入数据
+    p += zipStorePrevEntryLength(p,prevlen);
+    p += zipStoreEntryEncoding(p,encoding,slen);
+    if (ZIP_IS_STR(encoding)) {
+        memcpy(p,s,slen);
+    } else {
+        zipSaveInteger(p,value,encoding);
+    }
+    // 更新 ziplist 节点数量 ziplist.zllen
+    ZIPLIST_INCR_LENGTH(zl,1);
+    return zl;
+}
+```
+
+​		在新插入一个节点后，可能需要；两次内存拷贝：
+
+​				为整个链表分配新内存空间，主要是为新节点创建空间。
+
+​				将插入节点所有后驱节点后移，为插入节点腾出空间。
+
+
+
+#### 级联更新
+
+​		如果插入的节点长度大于等于`254`，则插入后，其后驱节点的`prevlen`属性可能由`1`字节变为`5`字节，此时后驱节点的长度也有可能大于等于`254`，则它的
+
+后驱节点的`prevlen`也有可能由`1`字节变为`5`字节，即级联更新。最极端的情况：插入位置后面的所有节点都需要更新`prevlen`属性。
+
+```c++
+// ziplist.c
+/**
+	p：指向插入节点的后驱节点
+*/
+unsigned char *__ziplistCascadeUpdate(unsigned char *zl, unsigned char *p) {
+    zlentry cur;
+    size_t prevlen, prevlensize, prevoffset; /* Informat of the last changed entry. */
+    size_t firstentrylen; /* Used to handle insert at head. */
+    size_t rawlen, curlen = intrev32ifbe(ZIPLIST_BYTES(zl));
+    size_t extra = 0, cnt = 0, offset;
+    size_t delta = 4; /* Extra bytes needed to update a entry's prevlen (5-1). */
+    unsigned char *tail = zl + intrev32ifbe(ZIPLIST_TAIL_OFFSET(zl));
+
+    /* Empty ziplist */
+    if (p[0] == ZIP_END) return zl;
+
+    zipEntry(p, &cur); /* no need for "safe" variant since the input pointer was validated by the function that returned it. */
+    firstentrylen = prevlen = cur.headersize + cur.len;
+    prevlensize = zipStorePrevEntryLength(NULL, prevlen);
+    prevoffset = p - zl;
+    p += prevlen;
+
+    /* Iterate ziplist to find out how many extra bytes do we need to update it. */
+    // 遇到 ZIP_END ，终止循环
+    while (p[0] != ZIP_END) {
+        assert(zipEntrySafe(zl, curlen, p, &cur, 0));
+
+        /* Abort when "prevlen" has not changed. */
+        // 下一个节点是 ZIP_END，退出循环
+        if (cur.prevrawlen == prevlen) break;
+
+        /* Abort when entry's "prevlensize" is big enough. */
+        if (cur.prevrawlensize >= prevlensize) {
+            if (cur.prevrawlensize == prevlensize) {
+                zipStorePrevEntryLength(p, prevlen);
+            } else {
+                /* This would result in shrinking, which we want to avoid.
+                 * So, set "prevlen" in the available bytes. */
+                zipStorePrevEntryLengthLarge(p, prevlen);
+            }
+            break;
+        }
+
+        /* cur.prevrawlen means cur is the former head entry. */
+        assert(cur.prevrawlen == 0 || cur.prevrawlen + delta == prevlen);
+
+        /* Update prev entry's info and advance the cursor. */
+        rawlen = cur.headersize + cur.len;
+        prevlen = rawlen + delta; 
+        prevlensize = zipStorePrevEntryLength(NULL, prevlen);
+        prevoffset = p - zl;
+        p += rawlen;
+        extra += delta;
+        cnt++;
+    }
+
+    /* Extra bytes is zero all update has been done(or no need to update). */
+    if (extra == 0) return zl;
+
+    /* Update tail offset after loop. */
+    if (tail == zl + prevoffset) {
+        /* When the the last entry we need to update is also the tail, update tail offset
+         * unless this is the only entry that was updated (so the tail offset didn't change). */
+        if (extra - delta != 0) {
+            ZIPLIST_TAIL_OFFSET(zl) =
+                intrev32ifbe(intrev32ifbe(ZIPLIST_TAIL_OFFSET(zl))+extra-delta);
+        }
+    } else {
+        /* Update the tail offset in cases where the last entry we updated is not the tail. */
+        ZIPLIST_TAIL_OFFSET(zl) =
+            intrev32ifbe(intrev32ifbe(ZIPLIST_TAIL_OFFSET(zl))+extra);
+    }
+
+    /* Now "p" points at the first unchanged byte in original ziplist,
+     * move data after that to new ziplist. */
+    offset = p - zl;
+    zl = ziplistResize(zl, curlen + extra);
+    p = zl + offset;
+    memmove(p + extra, p, curlen - offset - 1);
+    p += extra;
+
+    /* Iterate all entries that need to be updated tail to head. */
+    while (cnt) {
+        zipEntry(zl + prevoffset, &cur); /* no need for "safe" variant since we already iterated on all these entries above. */
+        rawlen = cur.headersize + cur.len;
+        /* Move entry to tail and reset prevlen. */
+        memmove(p - (rawlen - cur.prevrawlensize), 
+                zl + prevoffset + cur.prevrawlensize, 
+                rawlen - cur.prevrawlensize);
+        p -= (rawlen + delta);
+        if (cur.prevrawlen == 0) {
+            /* "cur" is the previous head entry, update its prevlen with firstentrylen. */
+            zipStorePrevEntryLength(p, firstentrylen);
+        } else {
+            /* An entry's prevlen can only increment 4 bytes. */
+            zipStorePrevEntryLength(p, cur.prevrawlen+delta);
+        }
+        /* Foward to previous entry. */
+        prevoffset -= cur.prevrawlen;
+        cnt--;
+    }
+    return zl;
+}
+```
+
+
+
+#### quicklist
+
+​		`ziplist`在插入和删除节点时有可能需要进行大量的内存拷贝，性能影响较大。`quicklist`将一个长`ziplist`拆分为多个短`ziplist`，避免插入或删除元素时
+
+导致大量的内存拷贝。
+
+​		`quicklist`基于链表结构，由`quicklistNode`节点链接而成，在`quicklistNode`中使用`ziplist`存储数据。
+
+```c++
+// quicklist.h
+typedef struct quicklistNode {
+    struct quicklistNode *prev; // 指向前驱节点
+    struct quicklistNode *next; // 指向后继节点
+    unsigned char *zl; // ziplist，负责存储数据
+    unsigned int sz; // ziplist 占用的字节数
+    unsigned int count : 16; // ziplist 的元素数量
+    unsigned int encoding : 2; // 2 代表节点已压缩，1 代表没有压缩
+    unsigned int container : 2; // 目前固定为 2，代表使用 ziplist 存储数据
+    unsigned int recompress : 1; // 1 代表暂时解压（用于读取数据），后续需要时再将其压缩
+    unsigned int attempted_compress : 1; /* node can't compress; too small */
+    unsigned int extra : 10; // 预留属性，暂未使用
+} quicklistNode;
+```
+
+​		当链表很长时，中间节点数据访问频率较低，`Redis`会将中间节点数据进行压缩`(LZF`算法`)`，节省内存空间，压缩后的定义：
+
+```c++
+// quicklist.h
+typedef struct quicklistLZF {
+    unsigned int sz; // 压缩后 ziplist 的大小
+    char compressed[]; // 存放压缩后的 ziplist 字节数组
+} quicklistLZF;
+```
+
+​		`quiclist`：
+
+```c++
+// quicklist.h
+typedef struct quicklist {
+    quicklistNode *head; // 指向头节点
+    quicklistNode *tail; // 指向尾节点
+    unsigned long count; // 所有节点的 ziplist 元素数量总和
+    unsigned long len; // 节点数量
+    int fill : QL_FILL_BITS; // 16bit，用于判断节点 ziplist 是否已满
+    unsigned int compress : QL_COMP_BITS; // 16bit，存放节点压缩配置
+    unsigned int bookmark_count: QL_BM_BITS;
+    quicklistBookmark bookmarks[];
+} quicklist;
+```
+
+![](image/quicklist.png)
+
+##### 头插法
+
+```c++
+// quicklist.c
+/**
+	value：插入元素的内容
+	sz：插入元素的大小
+*/
+int quicklistPushHead(quicklist *quicklist, void *value, size_t sz) {
+    quicklistNode *orig_head = quicklist->head;
+    assert(sz < UINT32_MAX); /* TODO: add support for quicklist nodes that are sds encoded (not zipped) */
+    // 判断 head 节点 ziplist 是否已满
+    if (likely(
+            _quicklistNodeAllowInsert(quicklist->head, quicklist->fill, sz))) {
+        //  head 节点未满，直接调用 ziplistPush 函数，插入到 ziplist 中
+        quicklist->head->zl =
+            ziplistPush(quicklist->head->zl, value, sz, ZIPLIST_HEAD);
+        // 更新 quicklistNode.sz 属性
+        quicklistNodeUpdateSz(quicklist->head);
+    } else {
+        // head 节点已满，创建一个新节点，将元素插入新节点的 ziplist 中，在将该节点头插入到 quicklist 中
+        quicklistNode *node = quicklistCreateNode();
+        node->zl = ziplistPush(ziplistNew(), value, sz, ZIPLIST_HEAD);
+
+        quicklistNodeUpdateSz(node);
+        _quicklistInsertNodeBefore(quicklist, quicklist->head, node);
+    }
+    quicklist->count++;
+    quicklist->head->count++;
+    return (orig_head != quicklist->head);
+}
+```
+
+
+
+##### 指定位置插入
+
+```c++
+// quicklist.c
+/**
+	entry：quicklistEntry 结构，quicklistEntry.node 指定元素插入的 quicklistNode 节点，quicklistEntry.offset 指定插入 ziplist 的索引位置
+	after：是否在 quicklistEntry.offset 之后插入
+*/
+REDIS_STATIC void _quicklistInsert(quicklist *quicklist, quicklistEntry *entry,
+                                   void *value, const size_t sz, int after) {
+    int full = 0, at_tail = 0, at_head = 0, full_next = 0, full_prev = 0;
+    int fill = quicklist->fill;
+    quicklistNode *node = entry->node;
+    quicklistNode *new_node = NULL;
+    assert(sz < UINT32_MAX); /* TODO: add support for quicklist nodes that are sds encoded (not zipped) */
+
+    if (!node) {
+        /* we have no reference node, so let's create only node in the list */
+        D("No node given!");
+        new_node = quicklistCreateNode();
+        new_node->zl = ziplistPush(ziplistNew(), value, sz, ZIPLIST_HEAD);
+        __quicklistInsertNode(quicklist, NULL, new_node, after);
+        new_node->count++;
+        quicklist->count++;
+        return;
+    }
+
+    /* Populate accounting flags for easier boolean checks later */
+    /** 根据参数设置标志：
+    	full：待插入节点 ziplsit 是否已满
+    	at_tail：是否 ziplist 尾插
+    	at_head：是否 ziplist 头插
+    	full_next：后驱节点是否已满
+    	full_prev：前驱节点是否已满
+    */
+    if (!_quicklistNodeAllowInsert(node, fill, sz)) {
+        D("Current node is full with count %d with requested fill %lu",
+          node->count, fill);
+        full = 1;
+    }
+
+    if (after && (entry->offset == node->count)) {
+        D("At Tail of current ziplist");
+        at_tail = 1;
+        if (!_quicklistNodeAllowInsert(node->next, fill, sz)) {
+            D("Next node is full too.");
+            full_next = 1;
+        }
+    }
+
+    if (!after && (entry->offset == 0)) {
+        D("At Head");
+        at_head = 1;
+        if (!_quicklistNodeAllowInsert(node->prev, fill, sz)) {
+            D("Prev node is full too.");
+            full_prev = 1;
+        }
+    }
+    
+    // 待插入节点未满，ziplist 尾插：再次检查 ziplist 插入位置是否存在后驱元素，如果不存在则调用 ziplistPush 函数插入元素，否则调用 ziplistInsert 插入元素
+    if (!full && after) {
+        D("Not full, inserting after current position.");
+        quicklistDecompressNodeForUse(node);
+        unsigned char *next = ziplistNext(node->zl, entry->zi);
+        if (next == NULL) {
+            node->zl = ziplistPush(node->zl, value, sz, ZIPLIST_TAIL);
+        } else {
+            node->zl = ziplistInsert(node->zl, next, value, sz);
+        }
+        node->count++;
+        quicklistNodeUpdateSz(node);
+        quicklistRecompressOnly(quicklist, node);
+    } else if (!full && !after) {
+        // 待插入节点未满，非 ziplist 尾插：调用 ziplistInsert 插入元素
+        D("Not full, inserting before current position.");
+        quicklistDecompressNodeForUse(node);
+        node->zl = ziplistInsert(node->zl, entry->zi, value, sz);
+        node->count++;
+        quicklistNodeUpdateSz(node);
+        quicklistRecompressOnly(quicklist, node);
+    } else if (full && at_tail && node->next && !full_next && after) {
+        // 待插入节点已满，尾插，后驱节点未满：将元素插入后驱节点 ziplist 中
+        /* If we are: at tail, next has free space, and inserting after:
+         *   - insert entry at head of next node. */
+        D("Full and tail, but next isn't full; inserting next node head");
+        new_node = node->next;
+        quicklistDecompressNodeForUse(new_node);
+        new_node->zl = ziplistPush(new_node->zl, value, sz, ZIPLIST_HEAD);
+        new_node->count++;
+        quicklistNodeUpdateSz(new_node);
+        quicklistRecompressOnly(quicklist, new_node);
+    } else if (full && at_head && node->prev && !full_prev && !after) {
+        // 待插入节点已满， ziplist 头插，前驱节点未满：将元素插入前驱节点 ziplist 中
+        /* If we are: at head, previous has free space, and inserting before:
+         *   - insert entry at tail of previous node. */
+        D("Full and head, but prev isn't full, inserting prev node tail");
+        new_node = node->prev;
+        quicklistDecompressNodeForUse(new_node);
+        new_node->zl = ziplistPush(new_node->zl, value, sz, ZIPLIST_TAIL);
+        new_node->count++;
+        quicklistNodeUpdateSz(new_node);
+        quicklistRecompressOnly(quicklist, new_node);
+    } else if (full && ((at_tail && node->next && full_next && after) ||
+                        (at_head && node->prev && full_prev && !after))) {
+        // 待插入节点已满，尾插且后驱节点已满，或者头插且前驱节点已满：构建一个新节点，将元素插入新节点，并根据 after 参数将新节点插入 quicklist 中
+        /* If we are: full, and our prev/next is full, then:
+         *   - create new node and attach to quicklist */
+        D("\tprovisioning new node...");
+        new_node = quicklistCreateNode();
+        new_node->zl = ziplistPush(ziplistNew(), value, sz, ZIPLIST_HEAD);
+        new_node->count++;
+        quicklistNodeUpdateSz(new_node);
+        __quicklistInsertNode(quicklist, node, new_node, after);
+    } else if (full) {
+        // 待插入节点已满，并且在节点 ziplist 中间插入：将插入节点的数据拆分到两个节点中，在插入拆分后的新节点中
+        /* else, node is full we need to split it. */
+        /* covers both after and !after cases */
+        D("\tsplitting node...");
+        // 如果节点已压缩，则解压节点
+        quicklistDecompressNodeForUse(node);
+        // 从插入节点中拆分出一个新节点，并将元素插入新节点中
+        new_node = _quicklistSplitNode(node, entry->offset, after);
+        new_node->zl = ziplistPush(new_node->zl, value, sz,
+                                   after ? ZIPLIST_HEAD : ZIPLIST_TAIL);
+        new_node->count++;
+        quicklistNodeUpdateSz(new_node);
+        // 将新节点插入 quicklist 中
+        __quicklistInsertNode(quicklist, node, new_node, after);
+        // 尝试合并节点，合并条件：如果合并后节点大小扔满足 quicklist.fill 参数要求，则合并节点
+        /**
+        	将 node-prev-prev 合并到 node-prev
+        	将 node-next 合并到 node-next-next
+        	将 node-prev 合并到 node
+        	将 node 合并到 node-next
+        */
+        _quicklistMergeNodes(quicklist, node);
+    }
+
+    quicklist->count++;
+}
+```
+
+
+
+##### 参数
+
+​		`list-max-ziplist-size`：配置`server.list-max-ziplist-size`属性，会赋值给`quicklist.fill`。取正值，表示`quicklist`节点的`ziplist`最多可以存放多
+
+少个元素。取负值，表示`quicklist`节点的`ziplist`最多占用字节数，此时只能取`-1 ~ -5`，默认为`-2`。
+
+​				`-5`：每个`quicklist`节点上的`ziplist`大小不能超过`64KB`。
+
+​				`-4`：每个`quicklist`节点上的`ziplist`大小不能超过`32KB`。
+
+​				`-3`：每个`quicklist`节点上的`ziplist`大小不能超过`16KB`。
+
+​				`-2`：每个`quicklist`节点上的`ziplist`大小不能超过`8KB`。
+
+​				`-1`：每个`quicklist`节点上的`ziplist`大小不能超过`4KB`。
+
+​		`list-compress-depth`：配置`server.list-compress-depth`属性，会赋值`quicklist.compress`：
+
+​				`0`：表示节点都不压缩，`Redis`的默认配置。
+
+​				`1`：表示`quicklist`两端各有`1`个节点不压缩，中间的节点压缩。
+
+​				`2`：表示`quicklist`两端各有`2`个节点不压缩，中间的节点压缩。
+
+​				`3`：表示`quicklist`两端各有`3`个节点不压缩，中间的节点压缩。
+
+
+
+​		列表类型只有一种编码格式`OBJ_ENCODING_QUICKLIST`，即使用`quicklist`存储数据`(redisObject.ptr`指向`quicklist`结构`)`。
+
+​				
+
+​		
+
+​		
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 # 七、高并发
