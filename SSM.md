@@ -21760,6 +21760,364 @@ REDIS_STATIC void _quicklistInsert(quicklist *quicklist, quicklistEntry *entry,
 
 ​		列表类型只有一种编码格式`OBJ_ENCODING_QUICKLIST`，即使用`quicklist`存储数据`(redisObject.ptr`指向`quicklist`结构`)`。
 
+
+
+### 字典
+
+​		`Redis`通常使用字典结构存储用户散列数据。`Redis`数据库也使用了字典结构，其使用`Hash`表实现字典结构。
+
+​		键值对：
+
+```c++
+// dict.h
+typedef struct dictEntry {
+    void *key; // 键
+    union {
+        void *val;
+        uint64_t u64;
+        int64_t s64;
+        double d;
+    } v; // 值
+    struct dictEntry *next; // 下一个键值对指针，即用链表法解决 Hash 冲突
+} dictEntry;
+```
+
+​		`Hash`表：
+
+```c++
+// dict.h
+typedef struct dictht {
+    dictEntry **table; // Hash 表数组，负责存储数据
+    unsigned long size; // 记录存储键值对的数量
+    unsigned long sizemask;
+    unsigned long used; // Hash 表数组长度
+} dictht;
+```
+
+![](image/QQ截图20220409110009.png)
+
+​		字典：
+
+```c++
+// dict.h
+typedef struct dict {
+    dictType *type; // 指定操作数据的函数指针
+    void *privdata; 
+    dictht ht[2]; // 定义两个 Hash 表用于实现字典扩容机制，通常只使用 ht[0]，在扩容时会创建 ht[1]，并在操作数据时逐步将 ht[0] 的数据移到 ht[1] 中
+    long rehashidx; // 下一次执行扩容单步操作要迁移的 ht[0] Hash 表数组索引，-1 代表当前没有进行扩容操作
+    int16_t pauserehash; /* If >0 rehashing is paused (<0 indicates coding error) */
+} dict;
+```
+
+​		`dictType`定义了字典中用于操作数据的函数指针，这些函数负责实现数据复制，比较等：
+
+```c++
+// dict.h
+typedef struct dictType {
+    uint64_t (*hashFunction)(const void *key); // Hash 算法，使用 SipHash 算法
+    void *(*keyDup)(void *privdata, const void *key);
+    void *(*valDup)(void *privdata, const void *obj);
+    int (*keyCompare)(void *privdata, const void *key1, const void *key2);
+    void (*keyDestructor)(void *privdata, void *key);
+    void (*valDestructor)(void *privdata, void *obj);
+    int (*expandAllowed)(size_t moreMem, double usedRatio);
+} dictType;
+```
+
+​		通过`dictType`指定操作数据的函数指针，字典可以存放不同类型的数据，键、值可以是不同的类型，但键必须类型相同，值也必须类型相同。
+
+
+
+#### 插入或查找
+
+```c++
+// dict.c
+int dictAdd(dict *d, void *key, void *val)
+{
+    dictEntry *entry = dictAddRaw(d,key,NULL);
+    if (!entry) return DICT_ERR;
+    dictSetVal(d, entry, val);
+    return DICT_OK;
+}
+/**
+	existing：如果字典中存在参数 key，且将对应的 dictEntry 指针赋值给 *existing，并返回 null，否则返回创建的 dictEntry
+	这个方法只会插入键，并不会插入对应的值。可以使用返回的 dictEntry 插入值
+*/
+dictEntry *dictAddRaw(dict *d, void *key, dictEntry **existing)
+{
+    long index;
+    dictEntry *entry;
+    dictht *ht;
+	// 如果字典正在扩容，则执行一次扩容单步操作
+    if (dictIsRehashing(d)) _dictRehashStep(d);
+
+    // 计算 key 的 Hash 表数组索引，返回 -1 表示键已存在，数组索引计算方式 hash&ht.sizemask 等同于 hash % ht.size，链表拆分方式与 HashMap 
+    if ((index = _dictKeyIndex(d, key, dictHashKey(d,key), existing)) == -1)
+        return NULL;
+
+    // 如果字典正在扩容，则将新的 dictEntry 添加到 ht[1] 中，否则添加到 ht[0] 中
+    ht = dictIsRehashing(d) ? &d->ht[1] : &d->ht[0];
+    
+    // 创建 dictEntry，头插法插入链表中
+    entry = zmalloc(sizeof(*entry));
+    entry->next = ht->table[index];
+    ht->table[index] = entry;
+    ht->used++;
+
+    // 将键设置到 dictEntry 中
+    dictSetKey(d, entry, key);
+    return entry;
+}
+
+// 计算键的 Hash 表数组索引
+static long _dictKeyIndex(dict *d, const void *key, uint64_t hash, dictEntry **existing)
+{
+    unsigned long idx, table;
+    dictEntry *he;
+    if (existing) *existing = NULL;
+
+    /* Expand the hash table if needed */
+    // 根据需要进行扩容或初始化 Hash 表操作
+    if (_dictExpandIfNeeded(d) == DICT_ERR)
+        return -1;
+    // 遍历 ht[0]，ht[1] ，计算 Hash 表数组索引，并判断 Hash 表中是否已存在参数 key
+    for (table = 0; table <= 1; table++) {
+        idx = hash & d->ht[table].sizemask;
+        /* Search if this slot does not already contain the given key */
+        he = d->ht[table].table[idx];
+        while(he) {
+            if (key==he->key || dictCompareKeys(d, key, he->key)) {
+                // 如果存在 key
+                if (existing) *existing = he;
+                return -1;
+            }
+            he = he->next;
+        }
+        // 如果没有进行扩容操作，则计算 ht[0] 索引后边退出，不需要计算 ht[1]
+        if (!dictIsRehashing(d)) break;
+    }
+    return idx;
+}
+```
+
+
+
+#### 扩容
+
+​		`Redis`使用了一种渐进式的扩容方式，`Redis`是单线程的。如果在一个操作内将`ht[0]`所有数据迁移到`ht[1]`，可能会引起线程长期阻塞。所以，`Redis`字
+
+典扩容是在每次操作数据时都执行一次扩容单步操作，即将`ht[0].table[rehashidx]`的数据迁移到`ht[1]`，等到`ht[0]`的所有数据都迁移到`ht[1]`，便将`ht[0]`
+
+指向`ht[1]`，完成扩容。
+
+```c++
+// dict.c
+// 判断 Hash 表是否需要扩容
+static int _dictExpandIfNeeded(dict *d)
+{
+    /* Incremental rehashing already in progress. Return. */
+    if (dictIsRehashing(d)) return DICT_OK;
+
+    /* If the hash table is empty expand it to the initial size. */
+    if (d->ht[0].size == 0) return dictExpand(d, DICT_HT_INITIAL_SIZE);
+
+    /* If we reached the 1:1 ratio, and we are allowed to resize the hash
+     * table (global setting) or we should avoid it but the ratio between
+     * elements/buckets is over the "safe" threshold, we resize doubling
+     * the number of buckets. */
+   	/**
+   		扩容条件：
+   			Hash 表存储的键值对数量大于或等于 Hash 表数组的长度
+   			开启了 dict_can_resize 或者 负载因子（键值对数量 / Hash 表数组的长度）大于 dict_force_resize_ratio
+   		dict_can_resize 默认开启，负载因子等于 1 可能出现比较高的 Hash 冲突率，但可以提高 Hash 表的内存使用率，dict_can_resize 关闭时，必须等到负载		因子等于 5 时才强制扩容
+   	*/
+    if (d->ht[0].used >= d->ht[0].size &&
+        (dict_can_resize ||
+         d->ht[0].used/d->ht[0].size > dict_force_resize_ratio) &&
+        dictTypeExpandAllowed(d))
+    {
+        return dictExpand(d, d->ht[0].used + 1);
+    }
+    return DICT_OK;
+}
+
+// size：新 Hash 表长度
+int dictExpand(dict *d, unsigned long size) {
+    return _dictExpand(d, size, NULL);
+}
+
+int _dictExpand(dict *d, unsigned long size, int* malloc_failed)
+{
+    if (malloc_failed) *malloc_failed = 0;
+
+    /* the size is invalid if it is smaller than the number of
+     * elements already inside the hash table */
+    if (dictIsRehashing(d) || d->ht[0].used > size)
+        return DICT_ERR;
+	// _dictNextPower 会将 size 调整为 2 的 n 次幂，为了使 ht[1] Hash 表数组长度是 ht[0] Hash 表数组长度的整数倍，有利于数据迁移更均匀
+    dictht n; /* the new hash table */
+    unsigned long realsize = _dictNextPower(size);
+
+    /* Detect overflows */
+    if (realsize < size || realsize * sizeof(dictEntry*) < realsize)
+        return DICT_ERR;
+
+    /* Rehashing to the same table size is not useful. */
+    if (realsize == d->ht[0].size) return DICT_ERR;
+
+    /* Allocate the new hash table and initialize all pointers to NULL */
+    // 构建一个新的 Hash 表 dictht
+    n.size = realsize;
+    n.sizemask = realsize-1;
+    if (malloc_failed) {
+        n.table = ztrycalloc(realsize*sizeof(dictEntry*));
+        *malloc_failed = n.table == NULL;
+        if (*malloc_failed)
+            return DICT_ERR;
+    } else
+        n.table = zcalloc(realsize*sizeof(dictEntry*));
+
+    n.used = 0;
+
+    /* Is this the first initialization? If so it's not really a rehashing
+     * we just set the first hash table so that it can accept keys. */
+    // 代表字典的 Hash 表数组没有初始化，即字典第一次使用前的初始化操作
+    if (d->ht[0].table == NULL) {
+        d->ht[0] = n;
+        return DICT_OK;
+    }
+
+    /* Prepare a second hash table for incremental rehashing */
+    // 将新的 dictht 赋值给 ht[1]，并将 rehashidx 赋值为 0，rehashidx 代表下一次扩容单步操作要迁移的 ht[0] Hash 表数组索引
+    d->ht[1] = n;
+    d->rehashidx = 0;
+    return DICT_OK;
+}
+```
+
+​		单步扩容：
+
+```c++
+// dict.c
+static void _dictRehashStep(dict *d) {
+    if (d->pauserehash == 0) dictRehash(d,1);
+}
+// 本次操作迁移的 Hash 数组索引的数量
+int dictRehash(dict *d, int n) {
+    int empty_visits = n*10; /* Max number of empty buckets to visit. */
+    // 如果当前没有进行扩容，则直接退出
+    if (!dictIsRehashing(d)) return 0;
+
+    while(n-- && d->ht[0].used != 0) {
+        dictEntry *de, *nextde;
+
+        /* Note that rehashidx can't overflow as we are sure there are more
+         * elements because ht[0].used != 0 */
+        assert(d->ht[0].size > (unsigned long)d->rehashidx);
+        // 从 rehashidx 开始，找到第一个非空索引位
+        while(d->ht[0].table[d->rehashidx] == NULL) {
+            d->rehashidx++;
+            // 如果查找的的空索引位的数量超过 n * 10，则直接返回
+            if (--empty_visits == 0) return 1;
+        }
+        // 遍历该索引位链表上所有的元素
+        de = d->ht[0].table[d->rehashidx];
+        /* Move all the keys in this bucket from the old to the new hash HT */
+        while(de) {
+            uint64_t h;
+
+            nextde = de->next;
+            /* Get the index in the new hash table */
+            h = dictHashKey(d, de->key) & d->ht[1].sizemask;
+            de->next = d->ht[1].table[h];
+            d->ht[1].table[h] = de;
+            d->ht[0].used--;
+            d->ht[1].used++;
+            de = nextde;
+        }
+        d->ht[0].table[d->rehashidx] = NULL;
+        d->rehashidx++;
+    }
+
+    /* Check if we already rehashed the whole table... */
+    // ht[0].used == 0 表示 ht[0] 的数据已经全部移到 ht[1] 中
+    if (d->ht[0].used == 0) {
+        // 释放 ht[0].table
+        zfree(d->ht[0].table);
+        // 将 ht[0] 指向 ht[1]
+        d->ht[0] = d->ht[1];
+        // 重置 rehashidx d.ht[1]
+        _dictReset(&d->ht[1]);
+        d->rehashidx = -1;
+        return 0;
+    }
+
+    /* More to rehash... */
+    return 1;
+}
+```
+
+
+
+#### 缩容
+
+​		执行删除操作后，`Redis`会检查字典是否需要缩容，当`Hash`表长度大于`4`且负载因子小于`0.1`时，会执行缩容操作，以节省内存。缩容操作也是通过
+
+`dictExpand`函数完成，只是`size`参数是缩容后的大小。
+
+
+
+#### 编码
+
+​		散列类型有`OBJ_ENCODING_HT`和`OBJ_ENCODING_ZIPLIST`，分别使用`dict`、`ziplist`结构存储数据`(redisObject.ptr`指向`dict`、`ziplist`结构`)`。`ziplist`
+
+会优先使用`ziplist`存储散列元素，使用一个`ziplist`节点存储键，后驱节点存放值，查找时需要遍历`ziplist`。使用`dict`存储散列元素，字典的键和值都是
+
+`sds`类型。
+
+​		使用`OBJ_ENCODING_ZIPLIST`编码，需要满足的条件：
+
+​				散列中所有键或值的长度小于或等于`server.hash_max_ziplist_value`，可通过`hash-max-ziplist-value`配置项调整。
+
+​				散列中键值对的数量小于`server.hash_max_ziplist_entries`，可通过`hash-max-ziplist-entries`配置项调整。
+
+
+
+#### 数据库
+
+​		`Redis`是内存数据库，内部定义了数据库对象`redisDb`负责存储数据，`redisDb`也使用了字典结构管理数据：
+
+```c++
+// server.h
+typedef struct redisDb {
+    dict *dict; // 数据库字典，该 redisDb 所有的数据都存储在这里
+    dict *expires; // 过期字典，存储了 Redis 中所有设置了过期时间的键及其对应的过期时间，过期时间是 long long 类型的 UNIX 时间戳
+    dict *blocking_keys; // 处于阻塞状态的键和相应的客户端
+    dict *ready_keys; // 准备好数据后可以解除阻塞状态的键和相应的客户端
+    dict *watched_keys; // 被 watch 命令监控的键和相应的客户端
+    int id; // 数据库 ID 标识
+    long long avg_ttl;          /* Average TTL, just for stats */
+    unsigned long expires_cursor; /* Cursor of the active expire cycle. */
+    list *defrag_later;         /* List of key names to attempt to defrag one by one, gradually. */
+} redisDb;
+```
+
+​		`Redis`本身也是一个字典服务，`redisDb.dict`字典中的键都是`sds`，值都是`redisObject`。`db.c`中定义了一系列函数可以通过键找到`redisDb.dict`中对应
+
+的`redisObject`。
+
+![](image/redisdb.png)
+
+
+
+​		
+
+
+
+
+
+
+
 ​				
 
 ​		
