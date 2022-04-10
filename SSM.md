@@ -22110,7 +22110,271 @@ typedef struct redisDb {
 
 
 
-​		
+### 集合
+
+#### 无序集合
+
+​		`Redis`通常使用字典结构保存用户集合数据，字典键存储集合元素，字典值为空。如果一个集合全是整数，`Redis`设计了`intset`来保存：
+
+```c++
+// intset.h
+typedef struct intset {
+    uint32_t encoding; // 编码格式，intset 中的所有元素必须是同一种编码格式
+    uint32_t length; // 元素数量
+    int8_t contents[]; // 存储元素数据，元素必须排序，并且无重复
+} intset;
+```
+
+​		编码格式：
+
+|       定义       | 存储类型 |
+| :--------------: | :------: |
+| INTSET_ENC_INT16 | int16_t  |
+| INTSET_ENC_INT32 | int32_t  |
+| INTSET_ENC_INT64 | int64_t  |
+
+
+
+##### 插入
+
+```c++
+// intset.c
+intset *intsetAdd(intset *is, int64_t value, uint8_t *success) {
+    // 获取插入元素编码
+    uint8_t valenc = _intsetValueEncoding(value);
+    uint32_t pos;
+    if (success) *success = 1;
+
+	// 如果插入元素编码级别高于 intset 编码，则升级 intset 编码格式，Redis 不会对 intset 进行编码格式降级操作
+    if (valenc > intrev32ifbe(is->encoding)) {
+        return intsetUpgradeAndAdd(is,value);
+    } else {
+		// 使用二分查找法查找待插入元素，如果元素存在，则插入失败，否则将 pos 指向插入位置
+        if (intsetSearch(is,value,&pos)) {
+            if (success) *success = 0;
+            return is;
+        }
+		// 为 intset 重新分配内存空间，主要是分配插入元素所需空间
+        is = intsetResize(is,intrev32ifbe(is->length)+1);
+        if (pos < intrev32ifbe(is->length)) intsetMoveTail(is,pos,pos+1);
+    }
+	// 插入元素，更新 intset.length 属性
+    _intsetSet(is,pos,value);
+    is->length = intrev32ifbe(intrev32ifbe(is->length)+1);
+    return is;
+}
+
+/**
+	如果需要对编码进行升级，只有两种情况：
+		待插入元素是正数，并且比 intset 中所有元素都大
+		待插入元素是负数，并且比 intset 中所有元素都小
+	这两种情况，新元素只能插入到 intset 头部或尾部
+*/
+static intset *intsetUpgradeAndAdd(intset *is, int64_t value) {
+    uint8_t curenc = intrev32ifbe(is->encoding);
+    uint8_t newenc = _intsetValueEncoding(value);
+    int length = intrev32ifbe(is->length);
+    int prepend = value < 0 ? 1 : 0;
+
+    // 设置 intset 新的编码格式，并重新分配新的内存空间
+    is->encoding = intrev32ifbe(newenc);
+    is = intsetResize(is,intrev32ifbe(is->length)+1);
+
+	// 将 intset 的元素移动到新的位置
+    while(length--)
+        _intsetSet(is,length+prepend,_intsetGetEncoded(is,length,curenc));
+	
+    // 插入新的元素，prepend 为 1 代表插入头部
+    if (prepend)
+        _intsetSet(is,0,value);
+    else
+        _intsetSet(is,intrev32ifbe(is->length),value);
+    is->length = intrev32ifbe(intrev32ifbe(is->length)+1);
+    return is;
+}
+```
+
+
+
+##### 编码
+
+​		无序集合有`OBJ_ENCODING_HT`和`OBJ_ENCODING_INTSET`，采用`dict`与`intset`存储数据，使用`OBJ_ENCODING_HT`时，键存储集合元素，值为空。
+
+​		使用`OBJ_ENCODING_INTSET`需要满足的元素：
+
+​				集合中只存在整数型元素。
+
+​				集合元素数量小于或等于`server.set_max_intset_entries`，该值可通过`set-max-intset-entries`配置项配置。
+
+
+
+#### 有序集合
+
+​		有序集合数据都是有序的，采用跳表`skiplist`结构实现，`skiplist`兼具了数组和链表的优点。
+
+​		`skiplist`是一个多层级的链表结构：
+
+​				上层链表是相邻下层链表的子集。
+
+​				头结点层数不小于其他节点的层数。
+
+​				每个节点`(`除了头结点`)`都有一个随机的层数。
+
+![](image/skiplist.png)
+
+​		`skiplist`可以看成一颗平衡树，其使用的是一种概率平衡而不是精准平衡。在查找数据时，需要从最高层开始查找，如果某一层后驱节点元素已经大于目标
+
+元素`(`或者不存在后驱节点`)`，则下降一层，从下一层当前位置继续查找。如果在第一层找不到目标元素，则查找失败。在高层查找时，没向后移动一个几点，实
+
+际上会跨越底层多个节点，最终达到二分查找的效率。
+
+```c++
+// server.h
+typedef struct zskiplistNode {
+    sds ele; // 节点值
+    double score; // 分数，用于排序节点
+    struct zskiplistNode *backward; // 指向前驱节点，一个节点只有第一层有前驱节点指针，skiplist 第一层是一个双向链表
+    struct zskiplistLevel {
+        struct zskiplistNode *forward; // 指向本层后驱节点
+        unsigned long span; // 本层后驱节点跨越了多少个第一层节点，用于计算节点索引
+    } level[];
+} zskiplistNode;
+```
+
+```c++
+// server.h
+typedef struct zskiplist {
+    struct zskiplistNode *header, *tail; // 指向头、尾节点指针
+    unsigned long length; // 节点数量
+    int level; // skiplist 最大的层数，最多为 ZSKIPLIST_MAXLEVEL（固定为 32）层
+} zskiplist;
+```
+
+![](image/20171113194041499.png)
+
+
+
+##### 查找指定索引的节点
+
+```c++
+// t_zset.c
+zskiplistNode* zslGetElementByRank(zskiplist *zsl, unsigned long rank) {
+    zskiplistNode *x;
+    unsigned long traversed = 0;
+    int i;
+
+    x = zsl->header;
+    // 从头结点的最高层开始查找
+    for (i = zsl->level-1; i >= 0; i--) {
+        // 如果存在后驱节点，并且后驱节点的索引小于目标值，则沿 forward 继续查找，每次使用 forward 指针跳转到后驱节点，traversed 都需要加上 span，得到		下一个节点的索引
+        while (x->level[i].forward && (traversed + x->level[i].span) <= rank)
+        {
+            traversed += x->level[i].span;
+            x = x->level[i].forward;
+        }
+        // 如果节点索引等于目标值，则返回该节点，否则下降一层继续查找，直到在第一层查找失败
+        if (traversed == rank) {
+            return x;
+        }
+    }
+    return NULL;
+}
+```
+
+
+
+##### 插入
+
+```c++
+// t_zset.c
+zskiplistNode *zslInsert(zskiplist *zsl, double score, sds ele) {
+    zskiplistNode *update[ZSKIPLIST_MAXLEVEL], *x;
+    unsigned int rank[ZSKIPLIST_MAXLEVEL];
+    int i, level;
+
+    serverAssert(!isnan(score));
+    // 查找每层插入节点的前驱节点，update 数组记录了每层插入位置的前驱节点， rank 数组记录了每层插入位置的前驱节点索引
+    x = zsl->header;
+    for (i = zsl->level-1; i >= 0; i--) {
+        /* store rank that is crossed to reach the insert position */
+        rank[i] = i == (zsl->level-1) ? 0 : rank[i+1];
+        while (x->level[i].forward &&
+                (x->level[i].forward->score < score ||
+                    (x->level[i].forward->score == score &&
+                    sdscmp(x->level[i].forward->ele,ele) < 0)))
+        {
+            rank[i] += x->level[i].span;
+            x = x->level[i].forward;
+        }
+        update[i] = x;
+    }
+	// 随机生成新节点的层数
+    level = zslRandomLevel();
+    // 新节点的层数比其他节点都大，此时 skiplist 需要添加新的层
+    if (level > zsl->level) {
+        for (i = zsl->level; i < level; i++) {
+            rank[i] = 0;
+            update[i] = zsl->header;
+            update[i]->level[i].span = zsl->length; 
+        }
+        zsl->level = level;
+    }
+    // 创建一个节点
+    x = zslCreateNode(level,score,ele);
+    for (i = 0; i < level; i++) {
+        x->level[i].forward = update[i]->level[i].forward;
+        update[i]->level[i].forward = x;
+
+        /* update span covered by update[i] as x is inserted here */
+        x->level[i].span = update[i]->level[i].span - (rank[0] - rank[i]);
+        update[i]->level[i].span = (rank[0] - rank[i]) + 1;
+    }
+
+    /* increment span for untouched levels */
+    // 如果某个节点存在比新节点层数大的层，则其前驱节点 span 都需要加 1，因为第一层插入了一个新节点
+    for (i = level; i < zsl->level; i++) {
+        update[i]->level[i].span++;
+    }
+	// 设置新节点的 backward 属性，更新 skiplist.length
+    x->backward = (update[0] == zsl->header) ? NULL : update[0];
+    if (x->level[0].forward)
+        x->level[0].forward->backward = x;
+    else
+        zsl->tail = x;
+    zsl->length++;
+    return x;
+}
+```
+
+​		为什么不使用红黑树：
+
+​				`skiplist`没有过度占用内存，内存使用率在合理范围内。
+
+​				游戏集合常常执行`ZRANGE`或`ZREVRANGE`等遍历操作，使用`skiplist`可以更高效地实现这些操作`(skiplist`第一层的双向链表可以遍历数据`)`。
+
+​				`skiplist`实现简单。
+
+
+
+##### 编码
+
+​		有序集合编码类型有`OBJ_ENCODING_ZIPLIST`和`OBJ_ENCODING_SKIPLIST`,使用`ziplist`或`skiplist`存储数据。
+
+​		使用`OBJ_ENCODING_ZIPLIST`的条件：
+
+​				有序集合元素刷领小于或等于`server.zste_max_ziplist_entries`，可通过`zset-max-ziplist-entries`配置项配置。
+
+​				有序集合所有元素长度都小于等于`serer.zset_max_ziplist_value`，可通过`zset-max-ziplist-value`配置项配置。
+
+
+
+
+
+
+
+
+
+
 
 
 
