@@ -22850,6 +22850,398 @@ void initServer(void) {
 
 
 
+### 事件机制
+
+​		`Redis`服务器是一个事件驱动程序，主要负责处理两种事件：
+
+​				文本事件：利用`I/O`复用机制，监听`Scoket`等文件描述符上发生的事件，这类事件主要由客户端`(`或其他`Redis`服务器`)`发送网络请求触发。
+
+​				时间事件：定时触发的事件，负责完成`Redis`内部定时任务。
+
+​		`Redis`利用`I/O`复用机制实现网络通信，`I/O`复用是一种高性能`I/O`模型，利用单进程监听多个客户端连接，当某个连接状态发生变化`(`可读、可写`)`时，
+
+操作系统会发送事件`(`称为已就绪事件`)`通知进程处理该连接的数据，`Redis`实现了自己的事件机制，支持不同系统的`I/O`复用`API`。
+
+![](image/QQ截图20220414105540.png)
+
+​		事件循环器：
+
+```c++
+// ae.h
+typedef struct aeEventLoop {
+    int maxfd; // 当前已注册的最大文件描述符
+    int setsize; // 该事件循环器允许监听的最大的文件描述符
+    long long timeEventNextId; // 下一个时间事件 ID
+    aeFileEvent *events; // 已注册的文件事件表
+    aeFiredEvent *fired; // 已就绪的事件表
+    aeTimeEvent *timeEventHead; // 时间事件表的头结点指针
+    int stop; // 事件循环器是否停止
+    void *apidata; // 存放用于 I/O 复用层的附加数据
+    aeBeforeSleepProc *beforesleep; // 进程阻塞前调用的钩子函数
+    aeBeforeSleepProc *aftersleep; // 进程阻塞后调用的钩子函数
+    int flags;
+} aeEventLoop;
+
+/**
+	aeFileEvent 并没有记录文件描述符 fd 的属性，fd 的约束：
+		值为 0、1、2 的文件描述符分别表示标准输入、标准输出、错误输出
+		每次新打开的文件描述符，必须使用当前进程中最小可用的文件描述符
+*/
+typedef struct aeFileEvent {
+    int mask; // 已注册的文件事件类型，AE_NONE，AE_READABLE，AE_WRITABLE
+    aeFileProc *rfileProc; // AE_READABLE 事件处理函数
+    aeFileProc *wfileProc; // AE_WRITABLE 事件处理函数
+    void *clientData; // 附加数据
+} aeFileEvent;
+
+/**
+	I/O 复用层会将已就绪的事件转化为 aeFiredEvent
+*/
+typedef struct aeFiredEvent {
+    int fd; // 产生事件的文件描述符
+    int mask; // 产生的事件类型
+} aeFiredEvent;
+
+// 存储时间事件的信息
+typedef struct aeTimeEvent {
+    long long id; // 时间事件 ID
+    monotime when; // 时间事件下一次执行的秒数和剩余毫秒数
+    aeTimeProc *timeProc; // 时间事件处理函数
+    aeEventFinalizerProc *finalizerProc; // 时间事件终结函数
+    void *clientData; // 客户端传入的附加数据
+    struct aeTimeEvent *prev; // 后一个时间事件
+    struct aeTimeEvent *next; // 前一个时间事件
+    int refcount; /* refcount to prevent timer events from being
+  		   * freed in recursive time event calls. */
+} aeTimeEvent;
+```
+
+
+
+#### 创建事件
+
+```c++
+// ae.c
+// Redis 启动时，在 server.c 的 initServer 函数中会调用 aeCreateEventLoop 创建循环器
+aeEventLoop *aeCreateEventLoop(int setsize) {
+    aeEventLoop *eventLoop;
+    int i;
+
+    monotonicInit();    /* just in case the calling app didn't initialize */
+	// 初始化 aeEventLoop 属性
+    if ((eventLoop = zmalloc(sizeof(*eventLoop))) == NULL) goto err;
+    eventLoop->events = zmalloc(sizeof(aeFileEvent)*setsize);
+    eventLoop->fired = zmalloc(sizeof(aeFiredEvent)*setsize);
+    if (eventLoop->events == NULL || eventLoop->fired == NULL) goto err;
+    eventLoop->setsize = setsize;
+    eventLoop->timeEventHead = NULL;
+    eventLoop->timeEventNextId = 0;
+    eventLoop->stop = 0;
+    eventLoop->maxfd = -1;
+    eventLoop->beforesleep = NULL;
+    eventLoop->aftersleep = NULL;
+    eventLoop->flags = 0;
+    // aeApiCreate 由 I/O 复用层实现，此时已经根据运行系统选择了具体的 I/O 复用层适配代码
+    if (aeApiCreate(eventLoop) == -1) goto err;
+    /* Events with mask == AE_NONE are not set. So let's initialize the
+     * vector with it. */
+    for (i = 0; i < setsize; i++)
+        eventLoop->events[i].mask = AE_NONE;
+    return eventLoop;
+
+err:
+    if (eventLoop) {
+        zfree(eventLoop->events);
+        zfree(eventLoop->fired);
+        zfree(eventLoop);
+    }
+    return NULL;
+}
+
+// Redis 启动时，在 server.c 的 initServer 函数中会调用 aeCreateFileEvent 为 TCP Socket 等文件描述符注册了 AE_WRITABLE 文本事件的处理函数。所以事件循环器会监听 TCP Socket ，并使用指定函数处理 AE_WRITABLE 事件
+/**
+	fd：需监听的文件描述符
+	mask：监听事件类型
+	proc：事件处理函数
+	clientData：附加数据
+*/
+int aeCreateFileEvent(aeEventLoop *eventLoop, int fd, int mask,
+        aeFileProc *proc, void *clientData)
+{
+    // 如果超出了 eventLoop.setsize 限制，则返回错误
+    if (fd >= eventLoop->setsize) {
+        errno = ERANGE;
+        return AE_ERR;
+    }
+    aeFileEvent *fe = &eventLoop->events[fd];
+	// aeApiAddEvent 由 I/O 复用层实现，调用 I/O 复用函数添加事件监听对象
+    if (aeApiAddEvent(eventLoop, fd, mask) == -1)
+        return AE_ERR;
+    // 初始化 aeFileEvent 属性
+    fe->mask |= mask;
+    if (mask & AE_READABLE) fe->rfileProc = proc;
+    if (mask & AE_WRITABLE) fe->wfileProc = proc;
+    fe->clientData = clientData;
+    if (fd > eventLoop->maxfd)
+        eventLoop->maxfd = fd;
+    return AE_OK;
+}
+
+// Redis 启动时，在 server.c 的 initServer 函数中会调用 aeCreateTimeEvent 创建一个处理函数为 serverCron 的时间事件，负责处理 Redis 中的定时任务
+long long aeCreateTimeEvent(aeEventLoop *eventLoop, long long milliseconds,
+        aeTimeProc *proc, void *clientData,
+        aeEventFinalizerProc *finalizerProc)
+{
+    // 初始化 aeTimeEvent 属性
+    long long id = eventLoop->timeEventNextId++;
+    aeTimeEvent *te;
+
+    te = zmalloc(sizeof(*te));
+    if (te == NULL) return AE_ERR;
+    te->id = id;
+    // 计算时间事件下次执行时间
+    te->when = getMonotonicUs() + milliseconds * 1000;
+    te->timeProc = proc;
+    te->finalizerProc = finalizerProc;
+    te->clientData = clientData;
+    // 头插入 eventLoop->timeEventHead 链表
+    te->prev = NULL;
+    te->next = eventLoop->timeEventHead;
+    te->refcount = 0;
+    if (te->next)
+        te->next->prev = te;
+    eventLoop->timeEventHead = te;
+    return id;
+}
+```
+
+​		在`Redis`启动的最后，会调用`aeMain`函数，启动事件循环器：
+
+```c++
+// ae.c
+void aeMain(aeEventLoop *eventLoop) {
+    eventLoop->stop = 0;
+    while (!eventLoop->stop) {
+        aeProcessEvents(eventLoop, AE_ALL_EVENTS|
+                                   AE_CALL_BEFORE_SLEEP|
+                                   AE_CALL_AFTER_SLEEP);
+    }
+}
+```
+
+
+
+#### 事件循环器的运行
+
+```c++
+// ae.c
+/**
+	flags：指定 aeProcessEvents 函数处理的事件类型和事件处理策略
+	AE_ALL_EVENTS：处理所有事件
+	AE_FILE_ENENTS：处理文本事件
+	AE_TIME_EVENTS：处理时间事件
+	AE_DONT_WAIT：是否阻塞进程
+	AE_CALL_AFTER_SLEEP：阻塞后是否调用 eventLoop.aftersleep 函数
+	AE_CALL_BEFORE_SLEEP：阻塞前是否调用 eventLoop.beforesleep 函数
+	
+*/
+int aeProcessEvents(aeEventLoop *eventLoop, int flags)
+{
+    int processed = 0, numevents;
+
+    /* Nothing to do? return ASAP */
+    if (!(flags & AE_TIME_EVENTS) && !(flags & AE_FILE_EVENTS)) return 0;
+
+    /* Note that we want to call select() even if there are no
+     * file events to process as long as we want to process time
+     * events, in order to sleep until the next time event is ready
+     * to fire. */
+    // 阻塞进程，等待文本事件就绪或时间事件到达执行时间
+    if (eventLoop->maxfd != -1 ||
+        ((flags & AE_TIME_EVENTS) && !(flags & AE_DONT_WAIT))) {
+        int j;
+        // 计算最大阻塞时间
+        /**
+        	查找最先执行的时间事件，能找到，则将该事件执行时间减去当前时间作为进程的最大阻塞时间
+        	找不到时间事件，检查 flags 参数是否为 AE_DONT_WAIT 标志，不是，进程将一直阻塞，直到有文本事件就绪，否则，进程不阻塞，将不断询问系统是否有已		就绪的文本事件。如果 eventLoop.flags 中为 AE_DONT_WAIT ，进程也不会阻塞
+        */
+        struct timeval tv, *tvp;
+        int64_t usUntilTimer = -1;
+
+        if (flags & AE_TIME_EVENTS && !(flags & AE_DONT_WAIT))
+            usUntilTimer = usUntilEarliestTimer(eventLoop);
+
+        if (usUntilTimer >= 0) {
+            tv.tv_sec = usUntilTimer / 1000000;
+            tv.tv_usec = usUntilTimer % 1000000;
+            tvp = &tv;
+        } else {
+            /* If we have to check for events but need to return
+             * ASAP because of AE_DONT_WAIT we need to set the timeout
+             * to zero */
+            if (flags & AE_DONT_WAIT) {
+                tv.tv_sec = tv.tv_usec = 0;
+                tvp = &tv;
+            } else {
+                /* Otherwise we can block */
+                tvp = NULL; /* wait forever */
+            }
+        }
+
+        if (eventLoop->flags & AE_DONT_WAIT) {
+            tv.tv_sec = tv.tv_usec = 0;
+            tvp = &tv;
+        }
+		// 进程阻塞前，执行钩子函数 beforeSleep
+        if (eventLoop->beforesleep != NULL && flags & AE_CALL_BEFORE_SLEEP)
+            eventLoop->beforesleep(eventLoop);
+
+        /* Call the multiplexing API, will return only on timeout or when
+         * some event fires. */
+        // 由 I/O 复用层实现，负责阻塞当前进程，直到有文本事件就绪或者给定时间到期，该函数返回已就绪文件事件的数量，并将事件存储在 aeEventLoop.fired 中
+        numevents = aeApiPoll(eventLoop, tvp);
+
+        /* After sleep callback. */
+        // 进程阻塞后，执行钩子函数 afterSleep
+        if (eventLoop->aftersleep != NULL && flags & AE_CALL_AFTER_SLEEP)
+            eventLoop->aftersleep(eventLoop);
+		// 处理所有已就绪的文本事件
+        for (j = 0; j < numevents; j++) {
+            aeFileEvent *fe = &eventLoop->events[eventLoop->fired[j].fd];
+            int mask = eventLoop->fired[j].mask;
+            int fd = eventLoop->fired[j].fd;
+            int fired = 0; /* Number of events fired for current fd. */
+
+            // 如果是 AE_READABLE 事件，则调用 rfileProc 函数处理，通常 Redis 会先处理 AE_READABLE 事件，再处理 AE_WRITABLE 事件，有助于服务器尽快			处理请求并回复结果给客户端
+            int invert = fe->mask & AE_BARRIER;
+
+            /* Note the "fe->mask & mask & ..." code: maybe an already
+             * processed event removed an element that fired and we still
+             * didn't processed, so we check if the event is still valid.
+             *
+             * Fire the readable event if the call sequence is not
+             * inverted. */
+            if (!invert && fe->mask & mask & AE_READABLE) {
+                fe->rfileProc(eventLoop,fd,fe->clientData,mask);
+                fired++;
+                fe = &eventLoop->events[fd]; /* Refresh in case of resize. */
+            }
+
+            /* Fire the writable event. */
+            // 如果就绪的是 AE_WRITABLE 事件，则调用 wfileProc 函数处理
+            if (fe->mask & mask & AE_WRITABLE) {
+                if (!fired || fe->wfileProc != fe->rfileProc) {
+                    fe->wfileProc(eventLoop,fd,fe->clientData,mask);
+                    fired++;
+                }
+            }
+
+            /* If we have to invert the call, fire the readable event now
+             * after the writable one. */
+            // 如果 aeFileEvent.mask 中设置了 AE_BARRIER 标志，在这里处理 AE_REABLE 事件
+            if (invert) {
+                fe = &eventLoop->events[fd]; /* Refresh in case of resize. */
+                if ((fe->mask & mask & AE_READABLE) &&
+                    (!fired || fe->wfileProc != fe->rfileProc))
+                {
+                    fe->rfileProc(eventLoop,fd,fe->clientData,mask);
+                    fired++;
+                }
+            }
+
+            processed++;
+        }
+    }
+    /* Check time events */
+    // 处理时间事件
+    if (flags & AE_TIME_EVENTS)
+        processed += processTimeEvents(eventLoop);
+
+    return processed; /* return the number of processed file/time events */
+}
+
+
+static int processTimeEvents(aeEventLoop *eventLoop) {
+    int processed = 0;
+    aeTimeEvent *te;
+    long long maxId;
+	// 遍历时间事件
+    te = eventLoop->timeEventHead;
+    maxId = eventLoop->timeEventNextId-1;
+    monotime now = getMonotonicUs();
+    while(te) {
+        long long id;
+
+        /* Remove events scheduled for deletion. */
+        // 该时间事件已删除，从链表中删除
+        if (te->id == AE_DELETED_EVENT_ID) {
+            aeTimeEvent *next = te->next;
+            /* If a reference exists for this timer event,
+             * don't free it. This is currently incremented
+             * for recursive timerProc calls */
+            if (te->refcount) {
+                te = next;
+                continue;
+            }
+            if (te->prev)
+                te->prev->next = te->next;
+            else
+                eventLoop->timeEventHead = te->next;
+            if (te->next)
+                te->next->prev = te->prev;
+            if (te->finalizerProc) {
+                te->finalizerProc(eventLoop, te->clientData);
+                now = getMonotonicUs();
+            }
+            zfree(te);
+            te = next;
+            continue;
+        }
+
+        if (te->id > maxId) {
+            te = te->next;
+            continue;
+        }
+		// 时间事件到达执行时间，执行 aeTimeEvent.timeProc 函数，该函数执行时间事件的逻辑并返回事件下次执行的间隔时间
+        if (te->when <= now) {
+            int retval;
+
+            id = te->id;
+            te->refcount++;
+            retval = te->timeProc(eventLoop, id, te->clientData);
+            te->refcount--;
+            processed++;
+            now = getMonotonicUs();
+            if (retval != AE_NOMORE) {
+                te->when = now + retval * 1000;
+            } else {
+                // 该事件需删除
+                te->id = AE_DELETED_EVENT_ID;
+            }
+        }
+        // 处理下一个时间事件
+        te = te->next;
+    }
+    return processed;
+}
+```
+
+![](image/QQ截图20220414144346.png)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
