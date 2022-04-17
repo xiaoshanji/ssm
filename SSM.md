@@ -23230,9 +23230,643 @@ static int processTimeEvents(aeEventLoop *eventLoop) {
 
 
 
+### 多路复用与网络通信
+
+​		传统的阻塞`I/O`模型下存在严重的性能问题，在`accept`操作后，只有读缓冲区有数据或写缓冲区有空闲空间时才能进行对应的操作，否则`CPU`不能进行任何
+
+操作只能阻塞等待，严重浪费`CPU`性能。并且如果想在阻塞`I/O`模型下支持高并发，将需要使用大量的进程或线程，会给`CPU`造成压力，导致性能低下。
+
+![](image/QQ截图20220415123647.png)
+
+​		`I/O`多路复用模型，使用一个进程监听大量连接，当某个连接缓冲区状态变化`(`可读、可写`)`时，系统发送事件通知进程处理该连接的数据。当缓冲区数据
+
+未准备好时，进程不会阻塞等待，而是去处理其他任务，当数据准备好后，进程再返回处理当前连接数据，减少进程等待时间，提供性能。
+
+![](image/QQ截图20220415124253.png)
+
+​		`Redis`启动时，在`initServer`函数中调用`listenToPort`函数打开套接字，并绑定端口：
+
+```c++
+// server.c
+int listenToPort(int port, socketFds *sfd) {
+    int j;
+    char **bindaddr = server.bindaddr;
+    int bindaddr_count = server.bindaddr_count;
+    char *default_bindaddr[2] = {"*", "-::*"};
+
+    /* Force binding of 0.0.0.0 if no bind address is specified. */
+    // 如果配置项中没有指定 IP 地址，则将 server.bindaddr[j] 赋值为 NULL
+    if (server.bindaddr_count == 0) {
+        bindaddr_count = 2;
+        bindaddr = default_bindaddr;
+    }
+
+    for (j = 0; j < bindaddr_count; j++) {
+        char* addr = bindaddr[j];
+        int optional = *addr == '-';
+        if (optional) addr++;
+        if (strchr(addr,':')) {
+            // 绑定 IPv6 地址
+            /* Bind IPv6 address. */
+            sfd->fd[sfd->count] = anetTcp6Server(server.neterr,port,addr,server.tcp_backlog);
+        } else {
+            /* Bind IPv4 address. */
+            // 绑定 IPv4 地址
+            sfd->fd[sfd->count] = anetTcpServer(server.neterr,port,addr,server.tcp_backlog);
+        }
+        if (sfd->fd[sfd->count] == ANET_ERR) {
+            int net_errno = errno;
+            serverLog(LL_WARNING,
+                "Warning: Could not create server TCP listening socket %s:%d: %s",
+                addr, port, server.neterr);
+            if (net_errno == EADDRNOTAVAIL && optional)
+                continue;
+            if (net_errno == ENOPROTOOPT     || net_errno == EPROTONOSUPPORT ||
+                net_errno == ESOCKTNOSUPPORT || net_errno == EPFNOSUPPORT ||
+                net_errno == EAFNOSUPPORT)
+                continue;
+
+            /* Rollback successful listens before exiting */
+            closeSocketListeners(sfd);
+            return C_ERR;
+        }
+        // 设置套接字为非阻塞模式
+        anetNonBlock(NULL,sfd->fd[sfd->count]);
+        anetCloexec(sfd->fd[sfd->count]);
+        sfd->count++;
+    }
+    return C_OK;
+}
+```
+
+```c++
+// anet.c
+// anetTcp6Server 与 anetTcpServer 都会调用此函数
+/**
+	err：记录错误信息
+	port：端口
+	bindaddr：地址
+	af：指定 IP 类型为 IPv4 或 IPv6
+*/
+static int _anetTcpServer(char *err, int port, char *bindaddr, int af, int backlog)
+{
+    int s = -1, rv;
+    char _port[6];  /* strlen("65535") */
+    struct addrinfo hints, *servinfo, *p;
+	// getaddrinfo 将 IP 地址解析为数值格式的 IP 地址
+    snprintf(_port,6,"%d",port);
+    memset(&hints,0,sizeof(hints));
+    hints.ai_family = af;
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_flags = AI_PASSIVE;    /* No effect if bindaddr != NULL */
+    if (bindaddr && !strcmp("*", bindaddr))
+        bindaddr = NULL;
+    if (af == AF_INET6 && bindaddr && !strcmp("::*", bindaddr))
+        bindaddr = NULL;
+
+    if ((rv = getaddrinfo(bindaddr,_port,&hints,&servinfo)) != 0) {
+        anetSetError(err, "%s", gai_strerror(rv));
+        return ANET_ERR;
+    }
+    // 处理 getaddrinfo 返回的所有 IP 地址
+    for (p = servinfo; p != NULL; p = p->ai_next) {
+        // 打开套接字
+        if ((s = socket(p->ai_family,p->ai_socktype,p->ai_protocol)) == -1)
+            continue;
+		// anetV6Only 开启 IPv6 连接的 IPV6_V6ONLY 标志，限制该连接仅能发送和接收 IPv6 数据包
+        if (af == AF_INET6 && anetV6Only(err,s) == ANET_ERR) goto error;
+        // anetSetReuseAddr 开启 TCP 的 SO_REUSEADDR 选项，保证端口释放后可以立即被再次使用
+        if (anetSetReuseAddr(err,s) == ANET_ERR) goto error;
+        // 监听端口
+        if (anetListen(err,s,p->ai_addr,p->ai_addrlen,backlog) == ANET_ERR) s = ANET_ERR;
+        goto end;
+    }
+    if (p == NULL) {
+        anetSetError(err, "unable to bind socket, errno: %d", errno);
+        goto error;
+    }
+
+error:
+    if (s != -1) close(s);
+    s = ANET_ERR;
+end:
+    freeaddrinfo(servinfo);
+    return s;
+}
+
+static int anetListen(char *err, int s, struct sockaddr *sa, socklen_t len, int backlog) {
+    // 绑定端口
+    if (bind(s,sa,len) == -1) {
+        anetSetError(err, "bind: %s", strerror(errno));
+        close(s);
+        return ANET_ERR;
+    }
+	// 服务器套接字转换到可接收连接状态
+    if (listen(s, backlog) == -1) {
+        anetSetError(err, "listen: %s", strerror(errno));
+        close(s);
+        return ANET_ERR;
+    }
+    return ANET_OK;
+}
+```
 
 
 
+#### 多路复用
+
+​		`aeApiState`结构体负责存放`epoll`数据：
+
+```c++
+// ae_epoll.c
+typedef struct aeApiState {
+    int epfd; // epoll 专用文件描述符
+    struct epoll_event *events; // epoll 的事件结构体，用于接收已就绪事件
+} aeApiState;
+```
+
+​		在创建事件循环器时，会调用`aeApiCreate`初始化`I/O`多路复用机制的上下文环境：
+
+```c++
+// ae_epoll.c
+static int aeApiCreate(aeEventLoop *eventLoop) {
+    // 创建 aeApiState 结构体
+    aeApiState *state = zmalloc(sizeof(aeApiState));
+
+    if (!state) return -1;
+    state->events = zmalloc(sizeof(struct epoll_event)*eventLoop->setsize);
+    if (!state->events) {
+        zfree(state);
+        return -1;
+    }
+    // 创建 epoll 实例
+    state->epfd = epoll_create(1024); /* 1024 is just a hint for the kernel */
+    if (state->epfd == -1) {
+        zfree(state->events);
+        zfree(state);
+        return -1;
+    }
+    anetCloexec(state->epfd);
+    // 将 aeApiState 赋值给 eventLoop->apidata
+    eventLoop->apidata = state;
+    return 0;
+}
+```
+
+​		在为事件循环器注册文本事件时会调用`aeApiAddEvent`添加对应的监听对象：
+
+```c++
+// ae_epoll.c
+static int aeApiAddEvent(aeEventLoop *eventLoop, int fd, int mask) {
+    aeApiState *state = eventLoop->apidata;
+    struct epoll_event ee = {0}; /* avoid valgrind warning */
+    /* If the fd was already monitored for some event, we need a MOD
+     * operation. Otherwise we need an ADD operation. */
+    // 如果文件描述费已存在监听对象，则使用 EPOLL_CTL_MOD 修改监听对象 ，否则使用 EPOLL_CTL_ADD 添加监听对象
+    int op = eventLoop->events[fd].mask == AE_NONE ?
+            EPOLL_CTL_ADD : EPOLL_CTL_MOD;
+	// 将 AE 抽象层事件转化为 epoll 事件，AE_READABLE 对应 EPOLLIN 事件，AE_WRITABLE 对应 EPOLLOUT 事件
+    ee.events = 0;
+    mask |= eventLoop->events[fd].mask; /* Merge old events */
+    if (mask & AE_READABLE) ee.events |= EPOLLIN;
+    if (mask & AE_WRITABLE) ee.events |= EPOLLOUT;
+    ee.data.fd = fd;
+    // 向 epoll 实例添加或修改监听对象
+    if (epoll_ctl(state->epfd,op,fd,&ee) == -1) return -1;
+    return 0;
+}
+```
+
+​		在循环调用事件循环器时会调用`aeApiPoll`阻塞进程等待时间发生或给定时间到期：
+
+```c++
+// ae_epoll.c
+static int aeApiPoll(aeEventLoop *eventLoop, struct timeval *tvp) {
+    aeApiState *state = eventLoop->apidata;
+    int retval, numevents = 0;
+	// 阻塞等待事件发生或给定时间到期
+    retval = epoll_wait(state->epfd,state->events,eventLoop->setsize,
+            tvp ? (tvp->tv_sec*1000 + (tvp->tv_usec + 999)/1000) : -1);
+    if (retval > 0) {
+        int j;
+
+        numevents = retval;
+        // 如果有就绪事件，则装载到 eventLoop->fired 中
+        for (j = 0; j < numevents; j++) {
+            int mask = 0;
+            struct epoll_event *e = state->events+j;
+			
+            /**
+            	EPOLLIN、EPOLLERR、EPOLLHUP 对应 AE_READABLE
+            	EPOLLOUT、EPOLLERR、EPOLLHUP 对应 AE_WRITABLE
+            */
+            if (e->events & EPOLLIN) mask |= AE_READABLE;
+            if (e->events & EPOLLOUT) mask |= AE_WRITABLE;
+            if (e->events & EPOLLERR) mask |= AE_WRITABLE|AE_READABLE;
+            if (e->events & EPOLLHUP) mask |= AE_WRITABLE|AE_READABLE;
+            eventLoop->fired[j].fd = e->data.fd;
+            eventLoop->fired[j].mask = mask;
+        }
+    }
+    return numevents;
+}
+```
+
+
+
+
+
+### 客户端
+
+​		客户端是指`Redis`服务器将为每个客户连接封装为客户端，`connection`结构体负责存储每个连接的相关信息：
+
+```c++
+// connection.h
+struct connection {
+    ConnectionType *type; // 包含操作连接通道的函数
+    ConnectionState state; // 定义连接状态
+    short int flags;
+    short int refs;
+    int last_errno; // 最新的 errno
+    void *private_data; // 存放附加数据
+    ConnectionCallbackFunc conn_handler; // 执行连接操作的回调函数
+    ConnectionCallbackFunc write_handler; // 执行写入操作的回调函数
+    ConnectionCallbackFunc read_handler; // 执行读取操作的回调函数
+    int fd; // 数据套接字描述符
+};
+```
+
+​		`Redis`在收到新的连接请求时，会调用`connCreateAcceptedSocket`为网络连接创建一个`connection`，这些`connection`的`type`都指向`CT_Socket`，
+
+`CT_Socket`指定了所有操作`Socket`连接的函数，`Redis`通过这些函数操作连接，而不是直接操作连接。
+
+```c++
+// connection.c
+ConnectionType CT_Socket = {
+    .ae_handler = connSocketEventHandler, // 分发函数，根据事件类型，调用真正的回调函数（connection.write_handler、connection.read_handler）
+    .close = connSocketClose,
+    .write = connSocketWrite,
+    .read = connSocketRead,
+    .accept = connSocketAccept,
+    .connect = connSocketConnect,
+    .set_write_handler = connSocketSetWriteHandler, // 为连接注册 write 事件回调函数
+    .set_read_handler = connSocketSetReadHandler, // 为连接注册 read 事件回调函数，这两个函数会将 ae_handler 注册为回调函数
+    ...
+};
+```
+
+​		`client`结构体存储每个客户端的相关信息，连接建立成功后，`Redis`将创建一个`client`结构体维护客户端信息：
+
+```c++
+// server.h
+typedef struct client {
+    uint64_t id;            /* Client incremental unique ID. */
+    connection *conn;
+    int resp;               /* RESP protocol version. Can be 2 or 3. */
+    redisDb *db;            /* Pointer to currently SELECTed DB. */
+    robj *name;             /* As set by CLIENT SETNAME. */
+    sds querybuf; // 查询缓冲区，存放客户端请求数据
+    size_t qb_pos; // 查询缓冲区最新读取位置
+    sds pending_querybuf;   /* If this client is flagged as master, this buffer
+                               represents the yet not applied portion of the
+                               replication stream that we are receiving from
+                               the master. */
+    size_t querybuf_peak; // 客户端单次读取请求数据量的峰值
+    int argc;               /* Num of arguments of current command. */
+    robj **argv;            /* Arguments of current command. */
+    int original_argc;      /* Num of arguments of original command if arguments were rewritten. */
+    robj **original_argv;   /* Arguments of original command if arguments were rewritten. */
+    size_t argv_len_sum;    /* Sum of lengths of objects in argv list. */
+    struct redisCommand *cmd, *lastcmd;  /* Last command executed. */
+    user *user;             /* User associated with this connection. If the
+                               user is set to NULL the connection can do
+                               anything (admin). */
+    int reqtype; // 请求数据协议类型
+    int multibulklen; // 当前解析的命令请求中尚未处理的命令参数数量
+    long bulklen; // 当前读取命令参数长度
+    list *reply; // 链表回复缓冲区
+    unsigned long long reply_bytes; // 链表回复缓冲区字节数
+    size_t sentlen;         /* Amount of bytes already sent in the current
+                               buffer or object being sent. */
+    time_t ctime;           /* Client creation time. */
+    long duration;          /* Current command duration. Used for measuring latency of blocking/non-blocking cmds */
+    time_t lastinteraction; /* Time of the last interaction, used for timeout */
+    time_t obuf_soft_limit_reached_time;
+    uint64_t flags; // 客户端标志
+    int authenticated;      /* Needed when the default user requires auth. */
+    int replstate;          /* Replication state if this is a slave. */
+    int repl_put_online_on_ack; /* Install slave write handler on first ACK. */
+    int repldbfd;           /* Replication DB file descriptor. */
+    off_t repldboff;        /* Replication DB file offset. */
+    off_t repldbsize;       /* Replication DB file size. */
+    sds replpreamble;       /* Replication DB preamble. */
+    long long read_reploff; /* Read replication offset if this is a master. */
+    long long reploff;      /* Applied replication offset if this is a master. */
+    long long repl_ack_off; /* Replication ack offset, if this is a slave. */
+    long long repl_ack_time;/* Replication ack time, if this is a slave. */
+    long long repl_last_partial_write; /* The last time the server did a partial write from the RDB child pipe to this replica  */
+    long long psync_initial_offset; /* FULLRESYNC reply offset other slaves
+                                       copying this slave output buffer
+                                       should use. */
+    char replid[CONFIG_RUN_ID_SIZE+1]; /* Master replication ID (if master). */
+    int slave_listening_port; /* As configured with: REPLCONF listening-port */
+    char *slave_addr;       /* Optionally given by REPLCONF ip-address */
+    int slave_capa;         /* Slave capabilities: SLAVE_CAPA_* bitwise OR. */
+    multiState mstate;      /* MULTI/EXEC state */
+    int btype;              /* Type of blocking op if CLIENT_BLOCKED. */
+    blockingState bpop;     /* blocking state */
+    long long woff;         /* Last write global replication offset. */
+    list *watched_keys;     /* Keys WATCHED for MULTI/EXEC CAS */
+    dict *pubsub_channels;  /* channels a client is interested in (SUBSCRIBE) */
+    list *pubsub_patterns;  /* patterns a client is interested in (SUBSCRIBE) */
+    sds peerid;             /* Cached peer ID. */
+    sds sockname;           /* Cached connection target address. */
+    listNode *client_list_node; /* list node in client list */
+    listNode *paused_list_node; /* list node within the pause list */
+    RedisModuleUserChangedFunc auth_callback; /* Module callback to execute
+                                               * when the authenticated user
+                                               * changes. */
+    void *auth_callback_privdata; /* Private data that is passed when the auth
+                                   * changed callback is executed. Opaque for
+                                   * Redis Core. */
+    void *auth_module;      /* The module that owns the callback, which is used
+                             * to disconnect the client if the module is
+                             * unloaded for cleanup. Opaque for Redis Core.*/
+
+    /* If this client is in tracking mode and this field is non zero,
+     * invalidation messages for keys fetched by this client will be send to
+     * the specified client ID. */
+    uint64_t client_tracking_redirection;
+    rax *client_tracking_prefixes; /* A dictionary of prefixes we are already
+                                      subscribed to in BCAST mode, in the
+                                      context of client side caching. */
+    /* In clientsCronTrackClientsMemUsage() we track the memory usage of
+     * each client and add it to the sum of all the clients of a given type,
+     * however we need to remember what was the old contribution of each
+     * client, and in which categoty the client was, in order to remove it
+     * before adding it the new value. */
+    uint64_t client_cron_last_memory_usage;
+    int      client_cron_last_memory_type;
+    /* Response buffer */
+    int bufpos; // 固定回复缓冲区最新操作位置
+    char buf[PROTO_REPLY_CHUNK_BYTES]; // 固定回复缓冲区
+} client;
+```
+
+​		客户端标志：
+
+|             值              |                             描述                             |
+| :-------------------------: | :----------------------------------------------------------: |
+|        CLIENT_MASTER        |         客户端是主节点客户端（当前服务节点是从节点）         |
+|        CLIENT_SLAVE         |         客户端是从节点客户端（当前服务节点是主节点）         |
+|       CLIENT_BLOCKED        |             客户端正在被 BRPOP、BLPOP 等命令阻塞             |
+|     CLIENT_PENDING_READ     |              客户端请求数据已交给 I/O 线程处理               |
+|   CLIENT_PENDING_COMMAND    |     I/O 线程已处理完成客户端请求数据，主进程可以执行命令     |
+|  CLIENT_CLOSE_AFTER_REPLY   | 不在执行新命令，发送完回复缓冲区的内容后立即关闭客户端。出现该标志通常由于用户对该客户端执行了CLIENT_KILL 命令，或者客户端请求数据包含了错误的协议内容 |
+| CLIENT_CLOSE_AFATER_COMMAND | 执行完当前命令并返回内容后即关闭客户端，通常在 ACL 中删除某一个用户后，Redis 会对该用户客户端打开这个标志 |
+|      CLIENT_CLOSE_ASAP      |                       该客户端正在关闭                       |
+|        CLIENT_MULTI         |                     该客户端正在执行事务                     |
+|         CLIENT_LUA          | 该客户端是在 Lua 脚本中执行 Redis 命令的伪客户端。在 Lua 脚本中通过 redis.call 等函数调用 Redis 命令，Redis 将创建一个伪客户端执行命令 |
+|      CLIENT_FORCE_AOF       |    强制将执行的命令写入 AOF 文件，即使命令并没有变更数据     |
+|      CLIENT_FORCE_REPL      | 强制将当前执行的命令复制给所有从节点，即使命令并没有变更数据 |
+|   CLIENT_PREVENT_AOF_PROP   |    禁止将当前执行的命令写入 AOF 文件，即使命令已变更数据     |
+|  CLIENT_PREVENT_REPL_PROP   |     禁止将当前执行的命令复制给从节点，即使命令已变更数据     |
+|     CLIENT_PREVENT_PROP     | 禁止将当前执行的命令写入 AOF 文件及复制给从节点，即使命令已变更数据 |
+|      CMD_CALL_SLOWLOG       |                          记录慢查询                          |
+|       CMD_CALL_STATS        |                       统计命令执行信息                       |
+|   CLIENT_TRACKING_CACHING   |                  客户端开启了客户端缓存功能                  |
+
+
+
+#### 创建客户端
+
+​		`Redis`启动时，会为`Socket`连接`(`监听套接字`)`注册`AE_READABLE`文件事件的回调函数`acceptTcpHandler`函数，负责接收客户端连接，创建数据交换套接
+
+字，并为数据交换套接字注册文本事件回调函数：
+
+```c++
+// networking.c
+void acceptTcpHandler(aeEventLoop *el, int fd, void *privdata, int mask) {
+    int cport, cfd, max = MAX_ACCEPTS_PER_CALL;
+    char cip[NET_IP_STR_LEN];
+    UNUSED(el);
+    UNUSED(mask);
+    UNUSED(privdata);
+	// 每次事件循环中最多接收 MAX_ACCEPTS_PER_CALL 个客户请求，防止短时间内处理过多客户请求导致进程阻塞
+    while(max--) {
+        // 接收新的客户端连接，并返回数据套接字文件描述符。
+        cfd = anetTcpAccept(server.neterr, fd, cip, sizeof(cip), &cport);
+        // 如果没有连接请求，返回 ANET_ERR，此时退出函数，当有新的连接请求，Redis 事件循环器会重新调用 acceptTcpHandler
+        if (cfd == ANET_ERR) {
+            if (errno != EWOULDBLOCK)
+                serverLog(LL_WARNING,
+                    "Accepting client connection: %s", server.neterr);
+            return;
+        }
+        anetCloexec(cfd);
+        serverLog(LL_VERBOSE,"Accepted %s:%d", cip, cport);
+        // 创建并返回 connection 结构体，为数据套接字注册文本事件回调函数
+        acceptCommonHandler(connCreateAcceptedSocket(cfd),0,cip);
+    }
+}
+
+
+static void acceptCommonHandler(connection *conn, int flags, char *ip) {
+    client *c;
+    char conninfo[100];
+    UNUSED(ip);
+
+    if (connGetState(conn) != CONN_STATE_ACCEPTING) {
+        serverLog(LL_VERBOSE,
+            "Accepted client connection in error state: %s (conn: %s)",
+            connGetLastError(conn),
+            connGetInfo(conn, conninfo, sizeof(conninfo)));
+        connClose(conn);
+        return;
+    }
+    
+    // 如果 client 数量加上 Cluster 连接数量已经超过 server.maxclients 配置项，则返回错误信息并关闭网络连接
+    if (listLength(server.clients) + getClusterConnectionsCount()
+        >= server.maxclients)
+    {
+        char *err;
+        if (server.cluster_enabled)
+            err = "-ERR max number of clients + cluster "
+                  "connections reached\r\n";
+        else
+            err = "-ERR max number of clients reached\r\n";
+
+        if (connWrite(conn,err,strlen(err)) == -1) {
+            /* Nothing to do, Just to avoid the warning... */
+        }
+        server.stat_rejected_conn++;
+        connClose(conn);
+        return;
+    }
+
+    /* Create connection and client */
+    // 创建 client 结构体，存储客户端信息
+    if ((c = createClient(conn)) == NULL) {
+        serverLog(LL_WARNING,
+            "Error registering fd event for the new client: %s (conn: %s)",
+            connGetLastError(conn),
+            connGetInfo(conn, conninfo, sizeof(conninfo)));
+        connClose(conn); /* May be already closed, just ignore errors */
+        return;
+    }
+
+    /* Last chance to keep flags */
+    c->flags |= flags;
+
+  
+    // 设置 clientAcceptHandler 为 Accept 回调函数，该函数会被立即调用，主要检查服务器是否开启 protected 模式，开启了 protected 模式而且客户端连接没有满足要求，则返回错误信息并关闭客户端
+    if (connAccept(conn, clientAcceptHandler) == C_ERR) {
+        char conninfo[100];
+        if (connGetState(conn) == CONN_STATE_ERROR)
+            serverLog(LL_WARNING,
+                    "Error accepting a client connection: %s (conn: %s)",
+                    connGetLastError(conn), connGetInfo(conn, conninfo, sizeof(conninfo)));
+        freeClient(connGetPrivateData(conn));
+        return;
+    }
+}
+
+
+client *createClient(connection *conn) {
+    client *c = zmalloc(sizeof(client));
+    
+    // 如果 conn 为空，则创建伪客户端，伪客户端用于支持命令不在 client 上下文执行的环境
+    if (conn) {
+        // 将文件描述符设置为非阻塞模式
+        connNonBlock(conn);
+        // 关闭 TCP 的 Delay 选项
+        connEnableTcpNoDelay(conn);
+        if (server.tcpkeepalive)
+            // 开启 TCP 的 keepAlive 选项，服务器定时向客户端发送 ACK 进行探测
+            connKeepAlive(conn,server.tcpkeepalive);
+        // 为数据套接字注册 AE_READABLE 文本事件的处理函数 readQueryFromClient，会调用 ConnectionType.set_read_handler 给连接注册回调函数，当连接的 readable 事件就绪后，将触发 readQueryFromClient 函数，它将负责读取客户端发送的请求数据
+        connSetReadHandler(conn, readQueryFromClient);
+        // 将 client 复制给 conn.private_data
+        connSetPrivateData(conn, c);
+    }
+	// 选择 0 号数据库并初始化 client 属性
+    selectDb(c,0);
+    uint64_t client_id;
+    atomicGetIncr(server.next_client_id, client_id, 1);
+    c->id = client_id;
+    c->resp = 2;
+    c->conn = conn;
+    ...
+    // 将 client 添加到 server.client、server.clients_index 中
+    if (conn) linkClient(c);
+    // 初始化 client 事务上下文
+    initClientMultiState(c);
+    return c;
+}
+```
+
+
+
+#### 关闭客户端
+
+​		客户端发送`quit`命令，或者`Socket`连接断开，服务器会调用`freeClientAsync`函数将客户端添加到`server.clients_to_close`中，以便后续关闭客户端。
+
+`freeClientAsyncFreeQueue`函数`(beforeSleep`函数触发`)`会遍历`server.clients_to_close`，调用`freeClient`关闭客户端。
+
+​		`freeClient`逻辑：
+
+​				释放内存空间。
+
+​				如果客户端是主节点客户端，则缓存该客户端信息，并将主从状态转换为待连接状态，以便后续与主节点重新建立连接。
+
+​				取消所有的`Pub/Sub`订阅。
+
+​				如果客户端是从节点客户端，则将其从`server.monitors`或`server.slaves`中剔除，并减少`server.repl_good_slaves_count`计数。
+
+​				调用`unlinkClient`函数，关闭`Socket`连接。
+
+​		`serverCron`时间事件会调用`clientCron`关闭超时未发送命令的客户端：
+
+```c++
+// server.c
+#define CLIENTS_CRON_MIN_ITERATIONS 5
+void clientsCron(void) {
+
+    // 每次处理 numclients(客户端数量) / server.hz 个客户端，由于该函数每秒调用 server.hz 次，所以每秒都会量所有客户端处理一遍
+    int numclients = listLength(server.clients);
+    int iterations = numclients/server.hz;
+    mstime_t now = mstime();
+
+    if (iterations < CLIENTS_CRON_MIN_ITERATIONS)
+        iterations = (numclients < CLIENTS_CRON_MIN_ITERATIONS) ?
+                     numclients : CLIENTS_CRON_MIN_ITERATIONS;
+
+
+    int curr_peak_mem_usage_slot = server.unixtime % CLIENTS_PEAK_MEM_USAGE_SLOTS;
+    
+    int zeroidx = (curr_peak_mem_usage_slot+1) % CLIENTS_PEAK_MEM_USAGE_SLOTS;
+    ClientsPeakMemInput[zeroidx] = 0;
+    ClientsPeakMemOutput[zeroidx] = 0;
+
+    while(listLength(server.clients) && iterations--) {
+        client *c;
+        listNode *head;
+
+        
+        listRotateTailToHead(server.clients);
+        head = listFirst(server.clients);
+        c = listNodeValue(head);
+        // clientsCronHandleTimeout 关闭超过 server.maxidletime 指定时间内没有发送请求的客户端
+        if (clientsCronHandleTimeout(c,now)) continue;
+        // 收缩客户端查询缓冲区以节省内存
+        if (clientsCronResizeQueryBuffer(c)) continue;
+        // 跟踪最近几秒内使用内存量最大的客户端，以便在 INFO 命令中提供此类信息
+        if (clientsCronTrackExpansiveClients(c, curr_peak_mem_usage_slot)) continue;
+        // 统计增加的内存使用量，以便在 INFO 命令中提供此类信息
+        if (clientsCronTrackClientsMemUsage(c)) continue;
+        if (closeClientOnOutputBufferLimitReached(c, 0)) continue;
+    }
+}
+```
+
+```c++
+// server.c
+int clientsCronResizeQueryBuffer(client *c) {
+    size_t querybuf_size = sdsAllocSize(c->querybuf);
+    time_t idletime = server.unixtime - c->lastinteraction;
+
+    if (querybuf_size > PROTO_MBULK_BIG_ARG &&
+         ((querybuf_size/(c->querybuf_peak+1)) > 2 ||
+          idletime > 2))
+    {
+       
+        if (sdsavail(c->querybuf) > 1024*4) {
+            c->querybuf = sdsRemoveFreeSpace(c->querybuf);
+        }
+    }
+   
+    c->querybuf_peak = 0;
+
+    if (c->flags & CLIENT_MASTER) {
+       
+        size_t pending_querybuf_size = sdsAllocSize(c->pending_querybuf);
+        if(pending_querybuf_size > LIMIT_PENDING_QUERYBUF &&
+           sdslen(c->pending_querybuf) < (pending_querybuf_size/2))
+        {
+            c->pending_querybuf = sdsRemoveFreeSpace(c->pending_querybuf);
+        }
+    }
+    return 0;
+}
+```
+
+​		收缩客户端查询缓冲区的条件：
+
+​				查询缓冲区总空间大于`PROTO_MBULK_BIG_ARG`。
+
+​				查询缓冲区总空间大于单次读取数据量峰值`(`大于`2`倍`)`，或者客户端当前处于非活跃状态。
+
+​				查询缓冲区空闲空间大于`4KB`。
 
 
 
