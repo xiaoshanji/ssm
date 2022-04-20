@@ -23870,6 +23870,996 @@ int clientsCronResizeQueryBuffer(client *c) {
 
 
 
+### Redis 命令执行过程
+
+​		`RESP`协议定义了客户端与服务器通信的数据序列化协议。可以序列化整数、错误信息、单行字符串、多行字符串、数组。数据的类型通过第一个字节进行判
+
+断，客户端请求的数据格式都是多行字符串数组。服务器需要根据不同的命令回复不同类型的响应数据。
+
+​		`RESP`使用`\r\n`作为结束标志或者直接记录字符串长度`(`多行字符串`)`，如果没有读取到结束标志或指定长度，则认为参数没有读取完全，需要继续读取数
+
+据，即**支持`TCP`拆包场景**；`Redis`支持客户端`pipeline`机制，即客户端在一个请求中发送多条命令，即**支持`TCP`粘包**。
+
+
+
+#### 解析请求
+
+```c++
+// networking.c
+void readQueryFromClient(connection *conn) {
+    // 从 connection 中获取 client
+    client *c = connGetPrivateData(conn);
+    int nread, readlen;
+    size_t qblen;
+
+    // 如果开启了 I/O 线程，则交给 I/O 线程读取并解析请求数据，postponeClientRead 会将当前客户端添加到 server.clients_pending_read 中，等待 I/O 线程处理
+    if (postponeClientRead(c)) return;
+
+    /* Update total number of reads on server */
+    atomicIncr(server.stat_total_reads_processed, 1);
+	// readlen 为读取请求最大字节数，PROTO_IOBUF_LEN：16 KB
+    readlen = PROTO_IOBUF_LEN;
+    
+    // 如果当前读取的是超大参数，则需要保证查询缓冲区中只有当前参数数据，PROTO_MBULK_BIG_ARG：32 KB
+    // c->multibulklen 不为 0 ，代表发生了 TCP 拆包，此函数上一次并没有读取一个完整命令请求
+    if (c->reqtype == PROTO_REQ_MULTIBULK && c->multibulklen && c->bulklen != -1
+        && c->bulklen >= PROTO_MBULK_BIG_ARG)
+    {
+        ssize_t remaining = (size_t)(c->bulklen+2)-sdslen(c->querybuf);
+
+        /* Note that the 'remaining' variable may be zero in some edge case,
+         * for example once we resume a blocked client after CLIENT PAUSE. */
+        if (remaining > 0 && remaining < readlen) readlen = remaining;
+    }
+	// 更新单次去读数据流峰值 client.querybuf_peak
+    qblen = sdslen(c->querybuf);
+    if (c->querybuf_peak < qblen) c->querybuf_peak = qblen;
+    // sdsMakeRoomFor：扩容查询缓冲区，保证其可用内存不小于读取字节数 readlen
+    c->querybuf = sdsMakeRoomFor(c->querybuf, readlen);
+    // 从 socket 中读取树，该函数返回实际读取字节数
+    nread = connRead(c->conn, c->querybuf+qblen, readlen);
+    if (nread == -1) {
+        if (connGetState(conn) == CONN_STATE_CONNECTED) {
+            return;
+        } else {
+            serverLog(LL_VERBOSE, "Reading from client: %s",connGetLastError(c->conn));
+            freeClientAsync(c);
+            return;
+        }
+    } else if (nread == 0) {
+        serverLog(LL_VERBOSE, "Client closed connection");
+        freeClientAsync(c);
+        return;
+    } else if (c->flags & CLIENT_MASTER) {
+        /* Append the query buffer to the pending (not applied) buffer
+         * of the master. We'll use this buffer later in order to have a
+         * copy of the string applied by the last command executed. */
+        c->pending_querybuf = sdscatlen(c->pending_querybuf,
+                                        c->querybuf+qblen,nread);
+    }
+
+    sdsIncrLen(c->querybuf,nread);
+    c->lastinteraction = server.unixtime;
+    // 如果客户端是主几点，还需要更新 client.read_reploff ，用于主从同步机制
+    if (c->flags & CLIENT_MASTER) c->read_reploff += nread;
+    atomicIncr(server.stat_net_input_bytes, nread);
+    if (sdslen(c->querybuf) > server.client_max_querybuf_len) {
+        sds ci = catClientInfoString(sdsempty(),c), bytes = sdsempty();
+
+        bytes = sdscatrepr(bytes,c->querybuf,64);
+        serverLog(LL_WARNING,"Closing client that reached max query buffer length: %s (qbuf initial bytes: %s)", ci, bytes);
+        sdsfree(ci);
+        sdsfree(bytes);
+        freeClientAsync(c);
+        return;
+    }
+
+    /* There is more data in the client input buffer, continue parsing it
+     * in case to check if there is a full command to execute. */
+    // 处理读取的数据
+     processInputBuffer(c);
+}
+
+
+void processInputBuffer(client *c) {
+    /* Keep processing while there is something in the input buffer */
+    // client.qb_pos 为查询缓冲区最新读取位置，该位置小于查询缓冲区内容长度时， while 继续执行
+    while(c->qb_pos < sdslen(c->querybuf)) {
+        /**
+        	直接退出的情况：
+        		客户端是从服务器，而且当前服务处于 Paused 状态
+        		当前服务器处于阻塞状态
+        		解析数据任务已交给 I/O 线程处理
+        		客户端是主节点客户端，并且当前服务器处于 Lua 脚本超时状态
+        		客户端标志中存在 CLIENT_CLOSE_AFTER_REPLY、CLIENT_CLOSE_ASAP 标志，不再执行命令，尽快关闭客户端
+        */
+        /* Immediately abort if the client is in the middle of something. */
+        if (c->flags & CLIENT_BLOCKED) break;
+
+        /* Don't process more buffers from clients that have already pending
+         * commands to execute in c->argv. */
+        if (c->flags & CLIENT_PENDING_COMMAND) break;
+
+        /* Don't process input from the master while there is a busy script
+         * condition on the slave. We want just to accumulate the replication
+         * stream (instead of replying -BUSY like we do with other clients) and
+         * later resume the processing. */
+        if (server.lua_timedout && c->flags & CLIENT_MASTER) break;
+
+        /* CLIENT_CLOSE_AFTER_REPLY closes the connection once the reply is
+         * written to the client. Make sure to not let the reply grow after
+         * this flag has been set (i.e. don't process more commands).
+         *
+         * The same applies for clients we want to terminate ASAP. */
+        if (c->flags & (CLIENT_CLOSE_AFTER_REPLY|CLIENT_CLOSE_ASAP)) break;
+
+        /* Determine request type when unknown. */
+        // 请求数据类型未确认，代表当前解析的是一个新命令请求，判断请求的数据类型
+        if (!c->reqtype) {
+            if (c->querybuf[c->qb_pos] == '*') {
+                c->reqtype = PROTO_REQ_MULTIBULK;
+            } else {
+                c->reqtype = PROTO_REQ_INLINE; // 该类型用于支持 telnet 客户端发送的请求
+            }
+        }
+
+        if (c->reqtype == PROTO_REQ_INLINE) {
+            if (processInlineBuffer(c) != C_OK) break;
+            /* If the Gopher mode and we got zero or one argument, process
+             * the request in Gopher mode. To avoid data race, Redis won't
+             * support Gopher if enable io threads to read queries. */
+            if (server.gopher_enabled && !server.io_threads_do_reads &&
+                ((c->argc == 1 && ((char*)(c->argv[0]->ptr))[0] == '/') ||
+                  c->argc == 0))
+            {
+                processGopherRequest(c);
+                resetClient(c);
+                c->flags |= CLIENT_CLOSE_AFTER_REPLY;
+                break;
+            }
+        } else if (c->reqtype == PROTO_REQ_MULTIBULK) {
+            // 从请求报文中解析命令参数，如果返回 C_OK ，代表命令参数读取完毕，可以执行命令，否则就是 TCP 拆包场景
+            if (processMultibulkBuffer(c) != C_OK) break;
+        } else {
+            serverPanic("Unknown request type");
+        }
+
+        /* Multibulk processing could see a <= 0 length. */
+        // 重置客户端 ，客户端的 multibulklen、reqtype 属性都置为 0，代表当前命令请求已处理完成
+        if (c->argc == 0) {
+            resetClient(c);
+        } else {
+            /* If we are in the context of an I/O thread, we can't really
+             * execute the command here. All we can do is to flag the client
+             * as one that needs to process the command. */
+            if (c->flags & CLIENT_PENDING_READ) {
+                c->flags |= CLIENT_PENDING_COMMAND;
+                break;
+            }
+
+            /* We are finally ready to execute the command. */
+            // 重置客户端
+            if (processCommandAndResetClient(c) == C_ERR) {
+                /* If the client is no longer valid, we avoid exiting this
+                 * loop and trimming the client buffer later. So we return
+                 * ASAP in that case. */
+                return;
+            }
+        }
+    }
+
+    /* Trim to pos */
+    // 说明命令执行成功，抛弃查询缓冲区已处理的命令请求报文
+    if (c->qb_pos) {
+        sdsrange(c->querybuf,c->qb_pos,-1);
+        c->qb_pos = 0;
+    }
+}
+
+
+int processMultibulkBuffer(client *c) {
+    char *newline = NULL;
+    int ok;
+    long long ll;
+	// 上一个命令请求数据已解析完成，开始一个新的命令请求。通过 \r\n 分隔符从当前请求数据中解析当前命令参数数量，赋值给 client.multibulklen
+    if (c->multibulklen == 0) {
+        /* The client should have been reset */
+        serverAssertWithInfo(c,NULL,c->argc == 0);
+
+        /* Multi bulk length cannot be read without a \r\n */
+        newline = strchr(c->querybuf+c->qb_pos,'\r');
+        if (newline == NULL) {
+            if (sdslen(c->querybuf)-c->qb_pos > PROTO_INLINE_MAX_SIZE) {
+                addReplyError(c,"Protocol error: too big mbulk count string");
+                setProtocolError("too big mbulk count string",c);
+            }
+            return C_ERR;
+        }
+
+        /* Buffer should also contain \n */
+        if (newline-(c->querybuf+c->qb_pos) > (ssize_t)(sdslen(c->querybuf)-c->qb_pos-2))
+            return C_ERR;
+
+        /* We know for sure there is a whole line since newline != NULL,
+         * so go ahead and find out the multi bulk length. */
+        serverAssertWithInfo(c,NULL,c->querybuf[c->qb_pos] == '*');
+        ok = string2ll(c->querybuf+1+c->qb_pos,newline-(c->querybuf+1+c->qb_pos),&ll);
+        if (!ok || ll > 1024*1024) {
+            addReplyError(c,"Protocol error: invalid multibulk length");
+            setProtocolError("invalid mbulk count",c);
+            return C_ERR;
+        } else if (ll > 10 && authRequired(c)) {
+            addReplyError(c, "Protocol error: unauthenticated multibulk length");
+            setProtocolError("unauth mbulk count", c);
+            return C_ERR;
+        }
+
+        c->qb_pos = (newline-c->querybuf)+2;
+
+        if (ll <= 0) return C_OK;
+
+        c->multibulklen = ll;
+
+        /* Setup argv array on client structure */
+        if (c->argv) zfree(c->argv);
+        c->argv = zmalloc(sizeof(robj*)*c->multibulklen);
+        c->argv_len_sum = 0;
+    }
+
+    serverAssertWithInfo(c,NULL,c->multibulklen > 0);
+    // 读取当前命令的所有参数
+    while(c->multibulklen) {
+        /* Read bulk length if unknown */
+        if (c->bulklen == -1) {
+            // 通过 \r\n 分隔符读取当前参数长度，赋值给 client.bulklen
+            newline = strchr(c->querybuf+c->qb_pos,'\r');
+            if (newline == NULL) {
+                if (sdslen(c->querybuf)-c->qb_pos > PROTO_INLINE_MAX_SIZE) {
+                    addReplyError(c,
+                        "Protocol error: too big bulk count string");
+                    setProtocolError("too big bulk count string",c);
+                    return C_ERR;
+                }
+                break;
+            }
+
+            /* Buffer should also contain \n */
+            if (newline-(c->querybuf+c->qb_pos) > (ssize_t)(sdslen(c->querybuf)-c->qb_pos-2))
+                break;
+
+            if (c->querybuf[c->qb_pos] != '$') {
+                addReplyErrorFormat(c,
+                    "Protocol error: expected '$', got '%c'",
+                    c->querybuf[c->qb_pos]);
+                setProtocolError("expected $ but got something else",c);
+                return C_ERR;
+            }
+
+            ok = string2ll(c->querybuf+c->qb_pos+1,newline-(c->querybuf+c->qb_pos+1),&ll);
+            if (!ok || ll < 0 ||
+                (!(c->flags & CLIENT_MASTER) && ll > server.proto_max_bulk_len)) {
+                addReplyError(c,"Protocol error: invalid bulk length");
+                setProtocolError("invalid bulk length",c);
+                return C_ERR;
+            } else if (ll > 16384 && authRequired(c)) {
+                addReplyError(c, "Protocol error: unauthenticated bulk length");
+                setProtocolError("unauth bulk length", c);
+                return C_ERR;
+            }
+
+            c->qb_pos = newline-c->querybuf+2;
+            // 如果当前参数是一个超大参数，则清除查询缓冲区中其他参数的数据，确保查询缓冲区只有当前参数数据，并对查询缓冲区扩容，确保可以容纳当前参数
+            if (ll >= PROTO_MBULK_BIG_ARG) {
+
+                if (sdslen(c->querybuf)-c->qb_pos <= (size_t)ll+2) {
+                    sdsrange(c->querybuf,c->qb_pos,-1);
+                    c->qb_pos = 0;
+                    /* Hint the sds library about the amount of bytes this string is
+                     * going to contain. */
+                    c->querybuf = sdsMakeRoomFor(c->querybuf,ll+2-sdslen(c->querybuf));
+                }
+            }
+            c->bulklen = ll;
+        }
+
+        /* Read bulk argument */
+        if (sdslen(c->querybuf)-c->qb_pos < (size_t)(c->bulklen+2)) {
+            /* Not enough data (+2 == trailing \r\n) */
+            // 当前查询缓冲区字符串长度小于当前参数长度，说明当前参数并没有读取完整，退出，等待下一个被调用继续读取剩余数据
+            break;
+        } else {
+            /* Optimization: if the buffer contains JUST our bulk element
+             * instead of creating a new object by *copying* the sds we
+             * just use the current sds string. */
+            if (c->qb_pos == 0 &&
+                c->bulklen >= PROTO_MBULK_BIG_ARG &&
+                sdslen(c->querybuf) == (size_t)(c->bulklen+2))
+            {
+                // 读取超大参数，直接使用查询缓冲区创建一个 redisObject 作为参数（redisObject.ptr指向查询缓冲区），并申请新的内存空间作为查询缓冲区
+                c->argv[c->argc++] = createObject(OBJ_STRING,c->querybuf);
+                c->argv_len_sum += c->bulklen;
+                sdsIncrLen(c->querybuf,-2); /* remove CRLF */
+                /* Assume that if we saw a fat argument we'll see another one
+                 * likely... */
+                c->querybuf = sdsnewlen(SDS_NOINIT,c->bulklen+2);
+                sdsclear(c->querybuf);
+            } else {
+                // 读取非超大参数，则赋值查询缓冲区中的数据并创建一个 redisObject作为参数
+                c->argv[c->argc++] =
+                    createStringObject(c->querybuf+c->qb_pos,c->bulklen);
+                c->argv_len_sum += c->bulklen;
+                c->qb_pos += c->bulklen+2;
+            }
+            c->bulklen = -1;
+            c->multibulklen--;
+        }
+    }
+
+    /* We're done when c->multibulk == 0 */
+    // 代表当前命令数据已读取完全，返回 C_OK，返回 processInputBuffer 函数后会执行命令
+    if (c->multibulklen == 0) return C_OK;
+
+    /* Still not ready to process the command */
+    // 需要 readQueryFromClient 函数下次执行时继续读取数据
+    return C_ERR;
+}
+```
+
+
+
+#### 返回响应
+
+​		`client`定义了两个回复缓冲区，用于缓存返回给客户端的响应数据。
+
+​				`client.buf`：字符数组，大小为`16KB`，`bufpos`记录最新写入位置。
+
+​				`client.reply`：`clientReplyBlock`结构体链表。
+
+```c++
+typedef struct clientReplyBlock {
+    size_t size, used; // buf 数组总长度和已使用长度
+    char buf[]; // 存储数据
+} clientReplyBlock;
+```
+
+​		响应数据小于`16KB`，使用`client.buf`。`client.buf`和`client`结构体存在同一块内存中，减少内存分配次数及内存碎片。大于`16KB`时，才使用
+
+`client.reply`。
+
+​		响应数据写入回复缓冲区：
+
+​				1、按`RESP`协议处理数据。
+
+​				2、先尝试写入`client.buf`，如果`client.buf`写不下，则写入`client.reply`。
+
+​				3、每次写入前，调用`prepareClientToWrite`函数，将当前`client`添加到`server.clients_pending_write`中。
+
+​		返回响应数据的最后一步是将回复缓冲区数据写入`TCP`发送缓冲区：
+
+```c++
+int handleClientsWithPendingWrites(void) {
+    // 遍历 server.clients_pending_write
+    listIter li;
+    listNode *ln;
+    int processed = listLength(server.clients_pending_write);
+
+    listRewind(server.clients_pending_write,&li);
+    while((ln = listNext(&li))) {
+        client *c = listNodeValue(ln);
+        c->flags &= ~CLIENT_PENDING_WRITE;
+        listDelNode(server.clients_pending_write,ln);
+
+        /* If a client is protected, don't do anything,
+         * that may trigger write error or recreate handler. */
+        if (c->flags & CLIENT_PROTECTED) continue;
+
+        /* Don't write to clients that are going to be closed anyway. */
+        if (c->flags & CLIENT_CLOSE_ASAP) continue;
+
+        /* Try to write buffers to the client socket. */
+        // 将 client 回复缓冲区内容写入 TCP 发送缓冲区
+        if (writeToClient(c,0) == C_ERR) continue;
+
+        // 如果回复缓冲区还有数据，则为当前连接注册 WRITABLE 文件事件回调函数，等到 TCP 发送缓冲区可写后，继续写入数据
+        if (clientHasPendingReplies(c)) {
+            int ae_barrier = 0;
+
+            if (server.aof_state == AOF_ON &&
+                server.aof_fsync == AOF_FSYNC_ALWAYS)
+            {
+                ae_barrier = 1;
+            }
+            if (connSetWriteHandlerWithBarrier(c->conn, sendReplyToClient, ae_barrier) == C_ERR) {
+                freeClientAsync(c);
+            }
+        }
+    }
+    return processed;
+}
+```
+
+
+
+#### 执行命令
+
+​		经过解析后命令参数存储在`client.argv`中，`client.argv[0]`是命令名，后面是执行命令的参数。
+
+​		`redisCommand`存储了`Redis`命令的信息：
+
+```c++
+// server.h
+struct redisCommand {
+    char *name; // 命令名称
+    redisCommandProc *proc; // 命令处理函数
+    int arity; // 命令参数数量
+    char *sflags;   
+    uint64_t flags; 
+    redisGetKeysProc *getkeys_proc;
+    int firstkey; /* The first argument that's a key (0 = no keys) */
+    int lastkey;  /* The last argument that's a key */
+    int keystep;  /* The step between first and last key */
+    long long microseconds, calls, rejected_calls, failed_calls;
+    int id;     
+};
+```
+
+​		`redisCommandTable`数组，存放了服务器所有支持的命令：
+
+```c++
+// server.c
+struct redisCommand redisCommandTable[] = {
+    {"module",moduleCommand,-2,
+     "admin no-script",
+     0,NULL,0,0,0,0,0,0},
+
+    {"get",getCommand,2,
+     "read-only fast @string",
+     0,NULL,1,1,1,0,0,0},
+
+    {"getex",getexCommand,-2,
+     "write fast @string",
+     0,NULL,1,1,1,0,0,0},
+	
+    ...
+}
+```
+
+​		`Redis`启动时，调用`populateCommandTable`加载`redisCommandTable` 数据，将命令名和命令记录到`server.commands`命令字典中。
+
+`processCommandAndResetClient`函数调用`processCommand`函数执行命令，并在命令执行后调用`commandProcessed`执行后续逻辑。
+
+```c++
+// server.c
+int processCommand(client *c) {
+    if (!server.lua_timedout) {
+
+        serverAssert(!server.propagate_in_transaction);
+        serverAssert(!server.in_exec);
+        serverAssert(!server.in_eval);
+    }
+	// 触发 Modle Filter
+    moduleCallCommandFilters(c);
+
+    // 针对 quit 命令处理，给 client 添加 CLIENT_CLOSE_AFTER_REPLY 标志，退出
+    if (!strcasecmp(c->argv[0]->ptr,"quit")) {
+        addReply(c,shared.ok);
+        c->flags |= CLIENT_CLOSE_AFTER_REPLY;
+        return C_ERR;
+    }
+
+    // 使用命令名，从 server.commands 命令字典中查找对应的 redisCommand，并检查参数数量是否满足命令要求
+    c->cmd = c->lastcmd = lookupCommand(c->argv[0]->ptr);
+    if (!c->cmd) {
+        sds args = sdsempty();
+        int i;
+        for (i=1; i < c->argc && sdslen(args) < 128; i++)
+            args = sdscatprintf(args, "`%.*s`, ", 128-(int)sdslen(args), (char*)c->argv[i]->ptr);
+        rejectCommandFormat(c,"unknown command `%s`, with args beginning with: %s",
+            (char*)c->argv[0]->ptr, args);
+        sdsfree(args);
+        return C_OK;
+    } else if ((c->cmd->arity > 0 && c->cmd->arity != c->argc) ||
+               (c->argc < -c->cmd->arity)) {
+        rejectCommandFormat(c,"wrong number of arguments for '%s' command",
+            c->cmd->name);
+        return C_OK;
+    }
+
+    int is_read_command = (c->cmd->flags & CMD_READONLY) ||
+                           (c->cmd->proc == execCommand && (c->mstate.cmd_flags & CMD_READONLY));
+    int is_write_command = (c->cmd->flags & CMD_WRITE) ||
+                           (c->cmd->proc == execCommand && (c->mstate.cmd_flags & CMD_WRITE));
+    int is_denyoom_command = (c->cmd->flags & CMD_DENYOOM) ||
+                             (c->cmd->proc == execCommand && (c->mstate.cmd_flags & CMD_DENYOOM));
+    int is_denystale_command = !(c->cmd->flags & CMD_STALE) ||
+                               (c->cmd->proc == execCommand && (c->mstate.cmd_inv_flags & CMD_STALE));
+    int is_denyloading_command = !(c->cmd->flags & CMD_LOADING) ||
+                                 (c->cmd->proc == execCommand && (c->mstate.cmd_inv_flags & CMD_LOADING));
+    int is_may_replicate_command = (c->cmd->flags & (CMD_WRITE | CMD_MAY_REPLICATE)) ||
+                                   (c->cmd->proc == execCommand && (c->mstate.cmd_flags & (CMD_WRITE | CMD_MAY_REPLICATE)));
+	// 如果服务器要求客户端身份验证，则检查客户端是否通过身份验证，未通过验证的客户端只能执行 auth 命令，将拒绝其他命令
+    if (authRequired(c)) {
+        /* AUTH and HELLO and no auth commands are valid even in
+         * non-authenticated state. */
+        if (!(c->cmd->flags & CMD_NO_AUTH)) {
+            rejectCommand(c,shared.noautherr);
+            return C_OK;
+        }
+    }
+
+	// 根据 ACL 权限控制列表，检查该客户端使用有权限执行该命令
+    int acl_errpos;
+    int acl_retval = ACLCheckAllPerm(c,&acl_errpos);
+    if (acl_retval != ACL_OK) {
+        addACLLogEntry(c,acl_retval,acl_errpos,NULL);
+        switch (acl_retval) {
+        case ACL_DENIED_CMD:
+            rejectCommandFormat(c,
+                "-NOPERM this user has no permissions to run "
+                "the '%s' command or its subcommand", c->cmd->name);
+            break;
+        case ACL_DENIED_KEY:
+            rejectCommandFormat(c,
+                "-NOPERM this user has no permissions to access "
+                "one of the keys used as arguments");
+            break;
+        case ACL_DENIED_CHANNEL:
+            rejectCommandFormat(c,
+                "-NOPERM this user has no permissions to access "
+                "one of the channels used as arguments");
+            break;
+        default:
+            rejectCommandFormat(c, "no permission");
+            break;
+        }
+        return C_OK;
+    }
+
+	// 如果该服务器运行在 Cluster 模式下，并且该节点不是该命令的键的存储节点，则使用 ASK 或 MOVED 通知客户端请求真正的存储节点
+    if (server.cluster_enabled &&
+        !(c->flags & CLIENT_MASTER) &&
+        !(c->flags & CLIENT_LUA &&
+          server.lua_caller->flags & CLIENT_MASTER) &&
+        !(!cmdHasMovableKeys(c->cmd) && c->cmd->firstkey == 0 &&
+          c->cmd->proc != execCommand))
+    {
+        int hashslot;
+        int error_code;
+        clusterNode *n = getNodeByQuery(c,c->cmd,c->argv,c->argc,
+                                        &hashslot,&error_code);
+        if (n == NULL || n != server.cluster->myself) {
+            if (c->cmd->proc == execCommand) {
+                discardTransaction(c);
+            } else {
+                flagTransaction(c);
+            }
+            clusterRedirectClient(c,n,hashslot,error_code);
+            c->cmd->rejected_calls++;
+            return C_OK;
+        }
+    }
+
+    // 如果配置了内存最大限制，则检查内存占用情况，并在有需要时进行数据淘汰，如果数据淘汰失败，则拒绝命令
+    if (server.maxmemory && !server.lua_timedout) {
+        int out_of_memory = (performEvictions() == EVICT_FAIL);
+        /* performEvictions may flush slave output buffers. This may result
+         * in a slave, that may be the active client, to be freed. */
+        if (server.current_client == NULL) return C_ERR;
+
+        int reject_cmd_on_oom = is_denyoom_command;
+        /* If client is in MULTI/EXEC context, queuing may consume an unlimited
+         * amount of memory, so we want to stop that.
+         * However, we never want to reject DISCARD, or even EXEC (unless it
+         * contains denied commands, in which case is_denyoom_command is already
+         * set. */
+        if (c->flags & CLIENT_MULTI &&
+            c->cmd->proc != execCommand &&
+            c->cmd->proc != discardCommand &&
+            c->cmd->proc != resetCommand) {
+            reject_cmd_on_oom = 1;
+        }
+
+        if (out_of_memory && reject_cmd_on_oom) {
+            rejectCommand(c, shared.oomerr);
+            return C_OK;
+        }
+
+        /* Save out_of_memory result at script start, otherwise if we check OOM
+         * until first write within script, memory used by lua stack and
+         * arguments might interfere. */
+        if (c->cmd->proc == evalCommand || c->cmd->proc == evalShaCommand) {
+            server.lua_oom = out_of_memory;
+        }
+    }
+
+    /* Make sure to use a reasonable amount of memory for client side
+     * caching metadata. */
+    // Tracking 机制要求服务记录客户端查询过的键，如果服务器记录的键的数量大于 server.tracking_table_max_keys 配置，那么随机删除其中一些键，并向对应的客户端发送失败消息
+    if (server.tracking_clients) trackingLimitUsedSlots();
+
+    /* Don't accept write commands if there are problems persisting on disk
+     * and if this is a master instance. */
+    // 该服务器是主节点并且当前存在持久化错误，则拒绝命令
+    int deny_write_type = writeCommandsDeniedByDiskError();
+    if (deny_write_type != DISK_ERROR_TYPE_NONE &&
+        server.masterhost == NULL &&
+        (is_write_command ||c->cmd->proc == pingCommand))
+    {
+        if (deny_write_type == DISK_ERROR_TYPE_RDB)
+            rejectCommand(c, shared.bgsaveerr);
+        else
+            rejectCommandFormat(c,
+                "-MISCONF Errors writing to the AOF file: %s",
+                strerror(server.aof_last_write_errno));
+        return C_OK;
+    }
+
+    /* Don't accept write commands if there are not enough good slaves and
+     * user configured the min-slaves-to-write option. */
+    // 如果该服务器是主节点并且正常从服务器数量小于 server.min-replicas-to-write 配置，则拒绝命令
+    if (server.masterhost == NULL &&
+        server.repl_min_slaves_to_write &&
+        server.repl_min_slaves_max_lag &&
+        is_write_command &&
+        server.repl_good_slaves_count < server.repl_min_slaves_to_write)
+    {
+        rejectCommand(c, shared.noreplicaserr);
+        return C_OK;
+    }
+
+    /* Don't accept write commands if this is a read only slave. But
+     * accept write commands if this is our master. */
+    // 该服务器是从节点并且客户端非主节点客户端，则拒绝命令
+    if (server.masterhost && server.repl_slave_ro &&
+        !(c->flags & CLIENT_MASTER) &&
+        is_write_command)
+    {
+        rejectCommand(c, shared.roslaveerr);
+        return C_OK;
+    }
+	
+    // 处于 Pub/Sub 模式下，并且使用 RESP2 协议，只支持 PING、SUBSCRIBE、UNSUBSCRIBE、PSUBSCRIBE、PUNSUBSCRIBE命令，拒绝其他命令
+    if ((c->flags & CLIENT_PUBSUB && c->resp == 2) &&
+        c->cmd->proc != pingCommand &&
+        c->cmd->proc != subscribeCommand &&
+        c->cmd->proc != unsubscribeCommand &&
+        c->cmd->proc != psubscribeCommand &&
+        c->cmd->proc != punsubscribeCommand &&
+        c->cmd->proc != resetCommand) {
+        rejectCommandFormat(c,
+            "Can't execute '%s': only (P)SUBSCRIBE / "
+            "(P)UNSUBSCRIBE / PING / QUIT / RESET are allowed in this context",
+            c->cmd->name);
+        return C_OK;
+    }
+
+    /* Only allow commands with flag "t", such as INFO, SLAVEOF and so on,
+     * when slave-serve-stale-data is no and we are a slave with a broken
+     * link with master. */
+    // 该服务器是从节点并且与主节点处于断连状态，拒绝查询数据的命令。可以通过关闭服务器 server.repl+serve_stable_data 配置跳过该检查，允许从服务器返回过期数据
+    if (server.masterhost && server.repl_state != REPL_STATE_CONNECTED &&
+        server.repl_serve_stale_data == 0 &&
+        is_denystale_command)
+    {
+        rejectCommand(c, shared.masterdownerr);
+        return C_OK;
+    }
+
+    /* Loading DB? Return an error if the command has not the
+     * CMD_LOADING flag. */
+    // 服务正在加载树，只有特定命令能执行
+    if (server.loading && is_denyloading_command) {
+        rejectCommand(c, shared.loadingerr);
+        return C_OK;
+    }
+
+	// 服务器处于 Lua 脚本超时状态，只有特定命令能执行
+    if (server.lua_timedout &&
+          c->cmd->proc != authCommand &&
+          c->cmd->proc != helloCommand &&
+          c->cmd->proc != replconfCommand &&
+          c->cmd->proc != multiCommand &&
+          c->cmd->proc != discardCommand &&
+          c->cmd->proc != watchCommand &&
+          c->cmd->proc != unwatchCommand &&
+          c->cmd->proc != resetCommand &&
+        !(c->cmd->proc == shutdownCommand &&
+          c->argc == 2 &&
+          tolower(((char*)c->argv[1]->ptr)[0]) == 'n') &&
+        !(c->cmd->proc == scriptCommand &&
+          c->argc == 2 &&
+          tolower(((char*)c->argv[1]->ptr)[0]) == 'k'))
+    {
+        rejectCommand(c, shared.slowscripterr);
+        return C_OK;
+    }
+
+    /* Prevent a replica from sending commands that access the keyspace.
+     * The main objective here is to prevent abuse of client pause check
+     * from which replicas are exempt. */
+    if ((c->flags & CLIENT_SLAVE) && (is_may_replicate_command || is_write_command || is_read_command)) {
+        rejectCommandFormat(c, "Replica can't interract with the keyspace");
+        return C_OK;
+    }
+
+    /* If the server is paused, block the client until
+     * the pause has ended. Replicas are never paused. */
+    if (!(c->flags & CLIENT_SLAVE) && 
+        ((server.client_pause_type == CLIENT_PAUSE_ALL) ||
+        (server.client_pause_type == CLIENT_PAUSE_WRITE && is_may_replicate_command)))
+    {
+        c->bpop.timeout = 0;
+        blockClient(c,BLOCKED_PAUSE);
+        return C_OK;       
+    }
+
+    /* Exec the command */
+    // 如果当前 client 处于事务上下文中，则除 exec、discard、multi、watch 外的命令都会被入队到事务队列中，否则执行命令
+    if (c->flags & CLIENT_MULTI &&
+        c->cmd->proc != execCommand && c->cmd->proc != discardCommand &&
+        c->cmd->proc != multiCommand && c->cmd->proc != watchCommand &&
+        c->cmd->proc != resetCommand)
+    {
+        queueMultiCommand(c);
+        addReply(c,shared.queued);
+    } else {
+        call(c,CMD_CALL_FULL);
+        c->woff = server.master_repl_offset;
+        if (listLength(server.ready_keys))
+            handleClientsBlockedOnKeys();
+    }
+
+    return C_OK;
+}
+
+
+void call(client *c, int flags) {
+    long long dirty;
+    monotime call_timer;
+    int client_old_flags = c->flags;
+    struct redisCommand *real_cmd = c->cmd;
+    static long long prev_err_count;
+
+	// 命令执行前，重置传播控制标志
+    c->flags &= ~(CLIENT_FORCE_AOF|CLIENT_FORCE_REPL|CLIENT_PREVENT_PROP);
+    redisOpArray prev_also_propagate = server.also_propagate;
+    redisOpArrayInit(&server.also_propagate);
+
+    /* Call the command. */
+    // 调用命令处理函数 redisCommand.proc ，执行命令处理逻辑
+    dirty = server.dirty;
+    prev_err_count = server.stat_total_error_replies;
+
+    /* Update cache time, in case we have nested calls we want to
+     * update only on the first call*/
+    if (server.fixed_time_expire++ == 0) {
+        updateCachedTime(0);
+    }
+
+    elapsedStart(&call_timer);
+    c->cmd->proc(c);
+    const long duration = elapsedUs(call_timer);
+    c->duration = duration;
+    dirty = server.dirty-dirty;
+    if (dirty < 0) dirty = 0;
+
+    /* Update failed command calls if required.
+     * We leverage a static variable (prev_err_count) to retain
+     * the counter across nested function calls and avoid logging
+     * the same error twice. */
+    if ((server.stat_total_error_replies - prev_err_count) > 0) {
+        real_cmd->failed_calls++;
+    }
+
+    /* After executing command, we will close the client after writing entire
+     * reply if it is set 'CLIENT_CLOSE_AFTER_COMMAND' flag. */
+    // 将 CLIENT_CLOSE_AFTER_COMMAND 替换为 CLIENT_CLOSE_AFTER_REPLY
+    if (c->flags & CLIENT_CLOSE_AFTER_COMMAND) {
+        c->flags &= ~CLIENT_CLOSE_AFTER_COMMAND;
+        c->flags |= CLIENT_CLOSE_AFTER_REPLY;
+    }
+
+    /* When EVAL is called loading the AOF we don't want commands called
+     * from Lua to go into the slowlog or to populate statistics. */
+    // 如果当前正加载数据并且当前命令执行的是 Lua 脚本，则清除慢日志，命令统计这两个客户端标志，即该命令既不输出慢日志，也不添加到命令统计中
+    if (server.loading && c->flags & CLIENT_LUA)
+        flags &= ~(CMD_CALL_SLOWLOG | CMD_CALL_STATS);
+
+    /* If the caller is Lua, we want to force the EVAL caller to propagate
+     * the script if the command flag or client flag are forcing the
+     * propagation. */
+    // 当前客户端是 Lua 脚本伪客户端，将该客户端的 CLIENT_FORCE_REPL、CLIENT_FORCE_AOF 标志转移到只是客户端中
+    if (c->flags & CLIENT_LUA && server.lua_caller) {
+        if (c->flags & CLIENT_FORCE_REPL)
+            server.lua_caller->flags |= CLIENT_FORCE_REPL;
+        if (c->flags & CLIENT_FORCE_AOF)
+            server.lua_caller->flags |= CLIENT_FORCE_AOF;
+    }
+
+    /* Note: the code below uses the real command that was executed
+     * c->cmd and c->lastcmd may be different, in case of MULTI-EXEC or
+     * re-written commands such as EXPIRE, GEOADD, etc. */
+
+    /* Record the latency this command induced on the main thread.
+     * unless instructed by the caller not to log. (happens when processing
+     * a MULTI-EXEC from inside an AOF). */
+    if (flags & CMD_CALL_SLOWLOG) {
+        char *latency_event = (real_cmd->flags & CMD_FAST) ?
+                               "fast-command" : "command";
+        latencyAddSampleIfNeeded(latency_event,duration/1000);
+    }
+
+    /* Log the command into the Slow log if needed.
+     * If the client is blocked we will handle slowlog when it is unblocked. */
+    // 记录慢日志并统计命令信息
+    if ((flags & CMD_CALL_SLOWLOG) && !(c->flags & CLIENT_BLOCKED))
+        slowlogPushCurrentCommand(c, real_cmd, duration);
+
+    // 发送命令信息给监控模式下的客户端
+    if (!(c->cmd->flags & (CMD_SKIP_MONITOR|CMD_ADMIN))) {
+        robj **argv = c->original_argv ? c->original_argv : c->argv;
+        int argc = c->original_argv ? c->original_argc : c->argc;
+        replicationFeedMonitors(c,server.monitors,c->db->id,argv,argc);
+    }
+
+    /* Clear the original argv.
+     * If the client is blocked we will handle slowlog when it is unblocked. */
+    if (!(c->flags & CLIENT_BLOCKED))
+        freeClientOriginalArgv(c);
+
+    /* populate the per-command statistics that we show in INFO commandstats. */
+    if (flags & CMD_CALL_STATS) {
+        real_cmd->microseconds += duration;
+        real_cmd->calls++;
+    }
+
+    /* Propagate the command into the AOF and replication link */
+    if (flags & CMD_CALL_PROPAGATE &&
+        (c->flags & CLIENT_PREVENT_PROP) != CLIENT_PREVENT_PROP)
+    {
+        int propagate_flags = PROPAGATE_NONE;
+
+        // 如果命令修改了数据，则 propagate_flags 添加 PROPAGATE_AOF、PROPAGATE_REPL 标志
+        if (dirty) propagate_flags |= (PROPAGATE_AOF|PROPAGATE_REPL);
+
+        // client 打开了 CLIENT_FORCE_REPL、CLIENT_FORCE_AOF 标志，则 propagate_flags 添加 PROPAGATE_AOF、PROPAGATE_REPL 标志
+        if (c->flags & CLIENT_FORCE_REPL) propagate_flags |= PROPAGATE_REPL;
+        if (c->flags & CLIENT_FORCE_AOF) propagate_flags |= PROPAGATE_AOF;
+
+        /* However prevent AOF / replication propagation if the command
+         * implementation called preventCommandPropagation() or similar,
+         * or if we don't have the call() flags to do so. */
+        // client 被打开了 CLIENT_PREVENT_REPL_PROP、CLIENT_PREVENT_AOF_PROP 标志，则 propagate_flags 清除 PROPAGATE_AOF、PROPAGATE_REPL 标志
+        if (c->flags & CLIENT_PREVENT_REPL_PROP ||
+            !(flags & CMD_CALL_PROPAGATE_REPL))
+                propagate_flags &= ~PROPAGATE_REPL;
+        if (c->flags & CLIENT_PREVENT_AOF_PROP ||
+            !(flags & CMD_CALL_PROPAGATE_AOF))
+                propagate_flags &= ~PROPAGATE_AOF;
+
+        if (propagate_flags != PROPAGATE_NONE && !(c->cmd->flags & CMD_MODULE))
+            /**
+            	根据 propagate_flags，将命令记录到 AOF 文件或复制到从服务器中。
+            */
+            propagate(c->cmd,c->db->id,c->argv,c->argc,propagate_flags);
+    }
+	// 命令执行前清除 client 中的传播控制标志。如果 client.flags 中本来存在这些标志，则将它们重新赋值给 client.flags
+    c->flags &= ~(CLIENT_FORCE_AOF|CLIENT_FORCE_REPL|CLIENT_PREVENT_PROP);
+    c->flags |= client_old_flags &
+        (CLIENT_FORCE_AOF|CLIENT_FORCE_REPL|CLIENT_PREVENT_PROP);
+
+    /* Handle the alsoPropagate() API to handle commands that want to propagate
+     * multiple separated commands. Note that alsoPropagate() is not affected
+     * by CLIENT_PREVENT_PROP flag. */
+    // server.also_propagate.numops 存放了一系列需额外传播的命令，将它记录到 AOF 或复制到从服务器中
+    if (server.also_propagate.numops) {
+        int j;
+        redisOp *rop;
+
+        if (flags & CMD_CALL_PROPAGATE) {
+            int multi_emitted = 0;
+            /* Wrap the commands in server.also_propagate array,
+             * but don't wrap it if we are already in MULTI context,
+             * in case the nested MULTI/EXEC.
+             *
+             * And if the array contains only one command, no need to
+             * wrap it, since the single command is atomic. */
+            if (server.also_propagate.numops > 1 &&
+                !(c->cmd->flags & CMD_MODULE) &&
+                !(c->flags & CLIENT_MULTI) &&
+                !(flags & CMD_CALL_NOWRAP))
+            {
+                execCommandPropagateMulti(c->db->id);
+                multi_emitted = 1;
+            }
+
+            for (j = 0; j < server.also_propagate.numops; j++) {
+                rop = &server.also_propagate.ops[j];
+                int target = rop->target;
+                /* Whatever the command wish is, we honor the call() flags. */
+                if (!(flags&CMD_CALL_PROPAGATE_AOF)) target &= ~PROPAGATE_AOF;
+                if (!(flags&CMD_CALL_PROPAGATE_REPL)) target &= ~PROPAGATE_REPL;
+                if (target)
+                    propagate(rop->cmd,rop->dbid,rop->argv,rop->argc,target);
+            }
+
+            if (multi_emitted) {
+                execCommandPropagateExec(c->db->id);
+            }
+        }
+        redisOpArrayFree(&server.also_propagate);
+    }
+    server.also_propagate = prev_also_propagate;
+
+    /* Client pause takes effect after a transaction has finished. This needs
+     * to be located after everything is propagated. */
+    if (!server.in_exec && server.client_pause_in_transaction) {
+        server.client_pause_in_transaction = 0;
+    }
+
+    /* If the client has keys tracking enabled for client side caching,
+     * make sure to remember the keys it fetched via this command. */
+    // 如果是查询命令，Redis 会记住该命令，后续当查询的键发生变化时，需要通知客户端。Redis 6 新增的 Tracking 机制
+    if (c->cmd->flags & CMD_READONLY) {
+        client *caller = (c->flags & CLIENT_LUA && server.lua_caller) ?
+                            server.lua_caller : c;
+        if (caller->flags & CLIENT_TRACKING &&
+            !(caller->flags & CLIENT_TRACKING_BCAST))
+        {
+            trackingRememberKeys(caller);
+        }
+    }
+
+    server.fixed_time_expire--;
+    server.stat_numcommands++;
+    prev_err_count = server.stat_total_error_replies;
+
+    /* Record peak memory after each command and before the eviction that runs
+     * before the next command. */
+    size_t zmalloc_used = zmalloc_used_memory();
+    if (zmalloc_used > server.stat_peak_memory)
+        server.stat_peak_memory = zmalloc_used;
+}
+```
+
+​		命令执行完成后，`commandProcessed`执行后续逻辑：
+
+```c++
+void commandProcessed(client *c) {
+
+    if (c->flags & CLIENT_BLOCKED) return;
+	// 重置客户端
+    resetClient(c);
+
+    long long prev_offset = c->reploff;
+    // 客户端是主节点客户端，并且客户端不处于事务上下文中，则更新 client.reploff ，该属性记录当前服务器已同步命令偏移量，用于主从同步机制
+    if (c->flags & CLIENT_MASTER && !(c->flags & CLIENT_MULTI)) {
+        /* Update the applied replication offset of our master. */
+        c->reploff = c->read_reploff - sdslen(c->querybuf) + c->qb_pos;
+    }
+
+    if (c->flags & CLIENT_MASTER) {
+        long long applied = c->reploff - prev_offset;
+        if (applied) {
+            // 将接收的命令继续复制到当前服务器的从节点
+            replicationFeedSlavesFromMasterStream(server.slaves,
+                    c->pending_querybuf, applied);
+            sdsrange(c->pending_querybuf,applied,-1);
+        }
+    }
+}
+```
+
+
+
+
+
+
+
+
+
+
+
 
 
 
