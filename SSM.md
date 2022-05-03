@@ -29648,6 +29648,437 @@ cleanup:
 
 
 
+### Cluster
+
+​		`Cluster`通过数据分片实现了`Redis`的分布式存储，将不同分片的数据指派给集群不同的节点，从而将数据分散到集群多个节点中。引入`Hash`槽位，每个槽
+
+位只能指派给一个节点，每个键都映射到一个槽位。
+
+
+
+#### 槽位管理
+
+​		`Cluster`中的每个节点都维护一份自己视角下的当前整个集群的状态，状态信息存储在`clusterState`结构体中：
+
+```c++
+// cluster.h
+typedef struct clusterState {
+    clusterNode *myself; // 自身节点实例
+    uint64_t currentEpoch; // 集群当前任期号，用于实现 Raft 算法，即通过选举 leader 节点完成故障迁移
+    int state; // 集群状态
+    int size;             /* Num of master nodes with at least one slot */
+    dict *nodes; // 集群节点实例字典。键为节点 ID，值指向 clusterNode 结构体
+    dict *nodes_black_list; /* Nodes we don't re-add for a few seconds. */
+    clusterNode *migrating_slots_to[CLUSTER_SLOTS]; // 迁出槽位，数组元素不为空，代表该槽位数据正从当前节点迁移到数组元素指定节点
+    clusterNode *importing_slots_from[CLUSTER_SLOTS];  // 迁入槽位，数组元素不为空，代表该槽位数组正从数组元素指定节点迁入当前节点
+    clusterNode *slots[CLUSTER_SLOTS]; // 槽位指派数组，数组索引对应槽位，数组元素即该槽位的数据存储节点
+    uint64_t slots_keys_count[CLUSTER_SLOTS]; // 每个槽位存储的键的数量
+    rax *slots_to_keys;
+    ...
+} clusterState;
+
+// 存放 Cluster 节点实例的相关信息
+typedef struct clusterNode {
+    mstime_t ctime; /* Node object creation time. */
+    char name[CLUSTER_NAMELEN]; // 节点 ID，每个节点启动时都将该属性初始化为 40 字节随机字符串，作为节点唯一标识
+    /**
+    	节点标志，存储节点的状态、属性
+    		CLUSTER_NODE_MASTER：该节点是主节点
+    		CLUSTER_NODE_SLAVE：该节点是从节点
+    		CLUSTER_NODE_PFAIL：该节点已主观下线
+    		CLUSTER_NODE_FAIL：该节点已客观下线
+    */
+    int flags;
+    uint64_t configEpoch; // 最新写入数据文件的任期号，即最新执行故障迁移成功的任期
+    unsigned char slots[CLUSTER_SLOTS/8]; // 槽位位图，记录该节点负责的槽位
+    sds slots_info; /* Slots info represented by string. */
+    int numslots;   /* Number of slots handled by this node */
+    int numslaves;  /* Number of slave nodes, if this is a master */
+    struct clusterNode **slaves; // 该节点的从节点实例列表
+    struct clusterNode *slaveof; // 该节点的主节点实例
+    mstime_t ping_sent; // 上次给该节点发送 PING 请求的时间
+    mstime_t pong_received; // 上次该节点收到 PONG 响应的时间
+    mstime_t data_received; // 上次该节点收到任何响应数据的时间
+    mstime_t fail_time; // 节点下线时间
+    mstime_t voted_time; // 上一次该节点的投票时间
+    mstime_t repl_offset_time;  /* Unix time we received offset for this node */
+    mstime_t orphaned_time;     /* Starting time of orphaned master condition */
+    long long repl_offset;      /* Last known repl offset for this node. */
+    char ip[NET_IP_STR_LEN]; // 节点 IP 地址
+    int port; // 节点的端口
+    int pport;                  /* Latest known clients plaintext port. Only used
+                                   if the main clients port is for TLS. */
+    int cport; // 节点的 Cluster 端口
+    clusterLink *link; // 当前节点与该节点连接
+    list *fail_reports; // 下线报告列表，记录所有判定该节点主观下线的主节点，用于客观下线的统计
+} clusterNode;
+```
+
+
+
+##### 重定向
+
+​		如果`Cluster`节点收到客户端请求，但请求中查询的键不是由当前节点负责的，则它将通知客户端进行重定向，重定向即客户端重新发送请求给真正的数据存
+
+储节点。
+
+​		当`Redis`节点运行在`Cluster`模式下的时候，`processCommand`函数执行命令前会检查当前节点是不是键的存储节点，如果不是，则拒绝命令并通知客户端重
+
+定向：
+
+```c++
+// server.c
+int processCommand(client *c) {
+	
+    ...
+    // 当前服务运行在 Cluster 模式下，并且该请求不是主节点发送的，请求存在键参数，则检查是否需要重定向
+    if (server.cluster_enabled &&
+        !(c->flags & CLIENT_MASTER) &&
+        !(c->flags & CLIENT_LUA &&
+          server.lua_caller->flags & CLIENT_MASTER) &&
+        !(!cmdHasMovableKeys(c->cmd) && c->cmd->firstkey == 0 &&
+          c->cmd->proc != execCommand))
+    {
+        int hashslot;
+        int error_code;
+        // 查找键真正的存储节点
+        clusterNode *n = getNodeByQuery(c,c->cmd,c->argv,c->argc,
+                                        &hashslot,&error_code);
+        if (n == NULL || n != server.cluster->myself) {
+            if (c->cmd->proc == execCommand) {
+                discardTransaction(c);
+            } else {
+                flagTransaction(c);
+            }
+            // 返回ASK 或 MOVED 转向标志及重定向目标节点，通知客户端重定向
+            /**
+            	如果该键对应槽位数据正在迁出，则返回 ASK 转向标志，提示客户端仅在下一个命令中请求重定向目标节点，
+            	否在返回 MOVED 转向标志，提示客户端该槽位数据可以长期地请求重定向目标节点
+            */
+            clusterRedirectClient(c,n,hashslot,error_code);
+            c->cmd->rejected_calls++;
+            return C_OK;
+        }
+    }
+
+    ...
+}
+```
+
+```c++
+// cluster.c
+clusterNode *getNodeByQuery(client *c, struct redisCommand *cmd, robj **argv, int argc, int *hashslot, int *error_code) {
+    clusterNode *n = NULL;
+    robj *firstkey = NULL;
+    int multiple_keys = 0;
+    multiState *ms, _ms;
+    multiCmd mc;
+    int i, slot = 0, migrating_slot = 0, importing_slot = 0, missing_keys = 0;
+
+    /* Allow any key to be set if a module disabled cluster redirections. */
+    if (server.cluster_module_flags & CLUSTER_MODULE_FLAG_NO_REDIRECTION)
+        return myself;
+
+    /* Set error code optimistically for the base case. */
+    if (error_code) *error_code = CLUSTER_REDIR_NONE;
+
+    if (cmd->proc == execCommand) {
+        if (!(c->flags & CLIENT_MULTI)) return myself;
+        ms = &c->mstate;
+    } else {
+        ms = &_ms;
+        _ms.commands = &mc;
+        _ms.count = 1;
+        mc.argv = argv;
+        mc.argc = argc;
+        mc.cmd = cmd;
+    }
+
+    for (i = 0; i < ms->count; i++) {
+        struct redisCommand *mcmd;
+        robj **margv;
+        int margc, *keyindex, numkeys, j;
+
+        mcmd = ms->commands[i].cmd;
+        margc = ms->commands[i].argc;
+        margv = ms->commands[i].argv;
+
+        getKeysResult result = GETKEYS_RESULT_INIT;
+        // 获取命令中真正的键
+        numkeys = getKeysFromCommand(mcmd,margv,margc,&result);
+        keyindex = result.keys;
+		// 遍历命令中所有的键
+        for (j = 0; j < numkeys; j++) {
+            robj *thiskey = margv[keyindex[j]];
+            // 计算键对应的槽位：对键计算 CRC16 校验值，再使用校验值对 16384 取模得到键对应的槽位
+            int thisslot = keyHashSlot((char*)thiskey->ptr,
+                                       sdslen(thiskey->ptr));
+			// 如果处理的是第一个键，则记录槽位、数据存储节点
+            if (firstkey == NULL) {
+
+                firstkey = thiskey;
+                slot = thisslot;
+                n = server.cluster->slots[slot];
+
+                if (n == NULL) {
+                    getKeysFreeResult(&result);
+                    if (error_code)
+                        *error_code = CLUSTER_REDIR_DOWN_UNBOUND;
+                    return NULL;
+                }
+
+                // 判定数据是否正在迁入或迁出，设置对应迁入、迁出标志变量
+                if (n == myself &&
+                    server.cluster->migrating_slots_to[slot] != NULL)
+                {
+                    migrating_slot = 1; // 代表当前节点是存储节点，但槽位数据正在迁出
+                } else if (server.cluster->importing_slots_from[slot] != NULL) {
+                    importing_slot = 1; // 代表该槽位数据正在迁入当前节点
+                }
+            } else {
+                // 如果处理的不是第一个键，则该键对应的槽位必须和第一个键的槽位相同，否则出错
+                if (!equalStringObjects(firstkey,thiskey)) {
+                    if (slot != thisslot) {
+                        /* Error: multiple keys from different slots. */
+                        getKeysFreeResult(&result);
+                        if (error_code)
+                            *error_code = CLUSTER_REDIR_CROSS_SLOT;
+                        return NULL;
+                    } else {
+                        /* Flag this request as one with multiple different
+                         * keys. */
+                        multiple_keys = 1;
+                    }
+                }
+            }
+
+            // 如果槽位数据正在迁入或迁出，还需要统计数据不存在与当前节点中的键的数量
+            if ((migrating_slot || importing_slot) &&
+                lookupKeyRead(&server.db[0],thiskey) == NULL)
+            {
+                missing_keys++;
+            }
+        }
+        getKeysFreeResult(&result);
+    }
+
+    // 如果命令中没有键，则可以在当前服务器中执行命令，返回当前节点
+    if (n == NULL) return myself;
+
+    /* Cluster is globally down but we got keys? We only serve the request
+     * if it is a read command and when allow_reads_when_down is enabled. */
+    if (server.cluster->state != CLUSTER_OK) {
+        if (!server.cluster_allow_reads_when_down) {
+            /* The cluster is configured to block commands when the
+             * cluster is down. */
+            if (error_code) *error_code = CLUSTER_REDIR_DOWN_STATE;
+            return NULL;
+        } else if (cmd->flags & CMD_WRITE) {
+            /* The cluster is configured to allow read only commands */
+            if (error_code) *error_code = CLUSTER_REDIR_DOWN_RO_STATE;
+            return NULL;
+        } else {
+            /* Fall through and allow the command to be executed:
+             * this happens when server.cluster_allow_reads_when_down is
+             * true and the command is not a write command */
+        }
+    }
+
+    /* Return the hashslot by reference. */
+    if (hashslot) *hashslot = slot;
+
+    /* MIGRATE always works in the context of the local node if the slot
+     * is open (migrating or importing state). We need to be able to freely
+     * move keys among instances in this case. */
+    if ((migrating_slot || importing_slot) && cmd->proc == migrateCommand)
+        return myself;
+
+    /* If we don't have all the keys and we are migrating the slot, send
+     * an ASK redirection. */
+    // 如果键对应的槽位的数据正在迁出，而且该键的数据不存在于当前节点中，则设置转向标志位 ASK，并返回数据迁入节点作为重定向目标节点
+    if (migrating_slot && missing_keys) {
+        if (error_code) *error_code = CLUSTER_REDIR_ASK;
+        return server.cluster->migrating_slots_to[slot];
+    }
+
+    // 如果键对应的数据正在迁出，而且该客户端开始了 CLIENT_ASKING 标志或命令中存在 CMD_ASKING 标志，则返回当前节点，这时如果命令中有些键的数据仍不存在于当前节点中，则直接返回错误
+    if (importing_slot &&
+        (c->flags & CLIENT_ASKING || cmd->flags & CMD_ASKING))
+    {
+        if (multiple_keys && missing_keys) {
+            if (error_code) *error_code = CLUSTER_REDIR_UNSTABLE;
+            return NULL;
+        } else {
+            return myself;
+        }
+    }
+
+    int is_write_command = (c->cmd->flags & CMD_WRITE) ||
+                           (c->cmd->proc == execCommand && (c->mstate.cmd_flags & CMD_WRITE));
+    if (c->flags & CLIENT_READONLY &&
+        !is_write_command &&
+        nodeIsSlave(myself) &&
+        myself->slaveof == n)
+    {
+        return myself;
+    }
+
+
+    if (n != myself && error_code) *error_code = CLUSTER_REDIR_MOVED;
+    return n;
+}
+```
+
+
+
+##### 槽位迁移
+
+​		槽位迁移命令的实现过程：
+
+​				1、发送`CLUSTER SETSLOT <slot> IMPORTING <source-node-id>`命令给迁入节点，指定迁移槽位的迁出节点。迁入节点收到命令后，会设置
+
+​		`server.cluster.importing_slots_from[slot]`指向迁出节点，代表该槽位数据正在从迁出节点迁入当前节点。
+
+​				2、发送`CLUSTER SETSLOT <slot> MIGRATING <D=destination-node-id>`命令给迁出节点，指定迁移槽位的迁入节点。迁出节点收到命令后，会设置
+
+​		`server.cluster.migrating_slots_to[slot]`指向迁入节点，代表该槽位数据正从当前节点迁移到迁入节点。
+
+​				3、发送`MIGRATE host port key ...`命令给迁出节点，开始迁移数据。
+
+​				4、当槽位上所有的键都迁移到迁入节点后，给集群中所有主节点发送`CLUSTER SETSLOT <slot> NODE <node-id>`命令，通知节点更新槽位信息。当主节
+
+​		点收到命令后：
+
+​						如果当前节点是迁出节点，并且槽位数据已经全部迁出，则置空`cluster.migrating_slots_to[slot]`，代表该槽位数据迁出完成。
+
+​						如果当前节点为迁入节点，则置空`cluster_importing_slots_from[slot]`，代表该槽位数据迁入完成。
+
+​						更新槽位指派数组及节点实例的位图信息。
+
+​		当节点`MIGRATE`命令后，将调用`migrateCommand`函数迁移数据：
+
+```c++
+void migrateCommand(client *c) {
+	
+    ...
+    
+    ov = zrealloc(ov,sizeof(robj*)*num_keys);
+    kv = zrealloc(kv,sizeof(robj*)*num_keys);
+    int oi = 0;
+	 // 读取所有的键值对内容，分别存储在 kv、ov 数组中
+    for (j = 0; j < num_keys; j++) {
+        if ((ov[oi] = lookupKeyRead(c->db,c->argv[first_key+j])) != NULL) {
+            kv[oi] = c->argv[first_key+j];
+            oi++;
+        }
+    }
+    num_keys = oi;
+    if (num_keys == 0) {
+        zfree(ov); zfree(kv);
+        addReplySds(c,sdsnew("+NOKEY\r\n"));
+        return;
+    }
+
+try_again:
+    write_error = 0;
+
+    /* Connect */
+    // 获取迁入节点的 Socket 连接
+    cs = migrateGetSocket(c,c->argv[1],c->argv[2],timeout);
+    if (cs == NULL) {
+        zfree(ov); zfree(kv);
+        return; /* error sent to the client by migrateGetSocket() */
+    }
+	// 初始化 cmd 变量，它是一个使用内存数组作为数据存储介质的 rio 结构体，该变量作为数据输出的缓冲区
+    rioInitWithBuffer(&cmd,sdsempty());
+
+    /* Authentication */
+    if (password) {
+        int arity = username ? 3 : 2;
+        serverAssertWithInfo(c,NULL,rioWriteBulkCount(&cmd,'*',arity));
+        serverAssertWithInfo(c,NULL,rioWriteBulkString(&cmd,"AUTH",4));
+        if (username) {
+            serverAssertWithInfo(c,NULL,rioWriteBulkString(&cmd,username,
+                                 sdslen(username)));
+        }
+        serverAssertWithInfo(c,NULL,rioWriteBulkString(&cmd,password,
+            sdslen(password)));
+    }
+
+    /* Send the SELECT command if the current DB is not already selected. */
+    int select = cs->last_dbid != dbid; /* Should we emit SELECT? */
+    if (select) {
+        serverAssertWithInfo(c,NULL,rioWriteBulkCount(&cmd,'*',2));
+        serverAssertWithInfo(c,NULL,rioWriteBulkString(&cmd,"SELECT",6));
+        serverAssertWithInfo(c,NULL,rioWriteBulkLongLong(&cmd,dbid));
+    }
+
+    int non_expired = 0; /* Number of keys that we'll find non expired.
+                            Note that serializing large keys may take some time
+                            so certain keys that were found non expired by the
+                            lookupKey() function, may be expired later. */
+
+    /* Create RESTORE payload and generate the protocol to call the command. */
+    // 写入所有的键值对内容到缓冲区，每个键值对都需要写入一个 RESTORE/RESTORE-ASKING 命令
+    for (j = 0; j < num_keys; j++) {
+        long long ttl = 0;
+        long long expireat = getExpire(c->db,kv[j]);
+
+        if (expireat != -1) {
+            ttl = expireat-mstime();
+            if (ttl < 0) {
+                continue;
+            }
+            if (ttl < 1) ttl = 1;
+        }
+
+        /* Relocate valid (non expired) keys and values into the array in successive
+         * positions to remove holes created by the keys that were present
+         * in the first lookup but are now expired after the second lookup. */
+        ov[non_expired] = ov[j];
+        kv[non_expired++] = kv[j];
+
+        serverAssertWithInfo(c,NULL,
+            rioWriteBulkCount(&cmd,'*',replace ? 5 : 4));
+
+        if (server.cluster_enabled)
+            serverAssertWithInfo(c,NULL,
+                rioWriteBulkString(&cmd,"RESTORE-ASKING",14));
+        else
+            serverAssertWithInfo(c,NULL,rioWriteBulkString(&cmd,"RESTORE",7));
+        // 写入键内容、ttl，如果该键没有设置过期时间，则 ttl 为 0 ，否则 ttl 为大于 0 的数值
+        serverAssertWithInfo(c,NULL,sdsEncodedObject(kv[j]));
+        serverAssertWithInfo(c,NULL,rioWriteBulkString(&cmd,kv[j]->ptr,
+                sdslen(kv[j]->ptr)));
+        serverAssertWithInfo(c,NULL,rioWriteBulkLongLong(&cmd,ttl));
+
+        /* Emit the payload argument, that is the serialized object using
+         * the DUMP format. */
+        // 写入值内容，值的内容使用 DUMP 格式，即在值内容后紧跟 2 字节的 RDB 版本信息、8 字节的 CRC64 校验值，用于目标节点对值内容进行校验
+        createDumpPayload(&payload,ov[j],kv[j]);
+        serverAssertWithInfo(c,NULL,
+            rioWriteBulkString(&cmd,payload.io.buffer.ptr,
+                               sdslen(payload.io.buffer.ptr)));
+        sdsfree(payload.io.buffer.ptr);
+
+        /* Add the REPLACE option to the RESTORE command if it was specified
+         * as a MIGRATE option. */
+        // 将 REPLACE 选项也写入缓冲区
+        if (replace)
+            serverAssertWithInfo(c,NULL,rioWriteBulkString(&cmd,"REPLACE",7));
+    }
+
+	// 将 cmd 缓冲区的内容写入 Socket，并读取每个命令的响应数据，执行对应的处理逻辑，如删除当前节点的数据
+    ...
+}
+```
+
+​		当迁入节点收到`RESTORE-ASKING`或`RESTORE`命令后，调用`restoreCommand`函数进行处理，该函数将读取请求数据，并调用`dbAdd`函数将请求中的键值对存储
+
+数据库。
+
+
+
 
 
 
