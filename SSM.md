@@ -30079,7 +30079,489 @@ try_again:
 
 
 
+#### Cluster启动过程
 
+​		当`Redis`服务以`Cluster`模式启动时，会调用`clusterInit`函数：
+
+```c++
+// cluster.c
+void clusterInit(void) {
+    int saveconf = 0;
+	// 初始化 cluster 变量
+    server.cluster = zmalloc(sizeof(clusterState));
+    server.cluster->myself = NULL;
+    server.cluster->currentEpoch = 0;
+    server.cluster->state = CLUSTER_FAIL;
+    server.cluster->size = 1;
+    server.cluster->todo_before_sleep = 0;
+    server.cluster->nodes = dictCreate(&clusterNodesDictType,NULL);
+    server.cluster->nodes_black_list =
+        dictCreate(&clusterNodesBlackListDictType,NULL);
+    server.cluster->failover_auth_time = 0;
+    server.cluster->failover_auth_count = 0;
+    server.cluster->failover_auth_rank = 0;
+    server.cluster->failover_auth_epoch = 0;
+    server.cluster->cant_failover_reason = CLUSTER_CANT_FAILOVER_NONE;
+    server.cluster->lastVoteEpoch = 0;
+    for (int i = 0; i < CLUSTERMSG_TYPE_COUNT; i++) {
+        server.cluster->stats_bus_messages_sent[i] = 0;
+        server.cluster->stats_bus_messages_received[i] = 0;
+    }
+    server.cluster->stats_pfail_nodes = 0;
+    memset(server.cluster->slots,0, sizeof(server.cluster->slots));
+    clusterCloseAllSlots();
+
+    /* Lock the cluster config file to make sure every node uses
+     * its own nodes.conf. */
+    // 尝试锁住数据文件，确保只有当前节点可以修改数据文件
+    server.cluster_config_file_lock_fd = -1;
+    if (clusterLockConfig(server.cluster_configfile) == C_ERR)
+        exit(1);
+
+    /* Load or create a new nodes configuration. */
+    // 加载 Cluseter 配置，创建自身节点实例 cluseter.myself ，并添加到实例字典 cluseter.nodes 中
+    if (clusterLoadConfig(server.cluster_configfile) == C_ERR) {
+        /* No configuration found. We will just use the random name provided
+         * by the createClusterNode() function. */
+        myself = server.cluster->myself =
+            createClusterNode(NULL,CLUSTER_NODE_MYSELF|CLUSTER_NODE_MASTER);
+        serverLog(LL_NOTICE,"No cluster configuration found, I'm %.40s",
+            myself->name);
+        clusterAddNode(myself);
+        saveconf = 1;
+    }
+    if (saveconf) clusterSaveConfigOrDie(1);
+
+    /* We need a listening TCP port for our cluster messaging needs. */
+    server.cfd.count = 0;
+
+    /* Port sanity check II
+     * The other handshake port check is triggered too late to stop
+     * us from trying to use a too-high cluster port number. */
+    // 将 server.port 数值加上 1000 作为 Cluseter 端口
+    int port = server.tls_cluster ? server.tls_port : server.port;
+    if (port > (65535-CLUSTER_PORT_INCR)) {
+        serverLog(LL_WARNING, "Redis port number too high. "
+                   "Cluster communication port is 10,000 port "
+                   "numbers higher than your Redis port. "
+                   "Your Redis port number must be 55535 or less.");
+        exit(1);
+    }
+    if (listenToPort(port+CLUSTER_PORT_INCR, &server.cfd) == C_ERR) {
+        exit(1);
+    }
+    // 创建一个监听套接字，监控 Cluster 端口，并为套接字连接注册 AE_READABLE 事件回调函数 clusterAcceptHandler，该函数负责处理新连接请求的 accept 操作。
+    // 这些连接专用于 Cluster 机制发送 Cluster 消息，当新的请求连接进来后，clusterAcceptHandler 函数会为新连接注册 AE_READABLE 事件的回调函数 clusterReadHandler，clusterReadHandler 函数负责处理其他节点发送的 Cluster 消息
+    if (createSocketAcceptHandler(&server.cfd, clusterAcceptHandler) != C_OK) {
+        serverPanic("Unrecoverable error creating Redis Cluster socket accept handler.");
+    }
+
+    /* The slots -> keys map is a radix tree. Initialize it here. */
+    server.cluster->slots_to_keys = raxNew();
+    memset(server.cluster->slots_keys_count,0,
+           sizeof(server.cluster->slots_keys_count));
+
+    /* Set myself->port/cport/pport to my listening ports, we'll just need to
+     * discover the IP address via MEET messages. */
+    deriveAnnouncedPorts(&myself->port, &myself->pport, &myself->cport);
+
+    server.cluster->mf_end = 0;
+    resetManualFailover();
+    clusterUpdateMyselfFlags();
+}
+```
+
+
+
+​		创建一个`Cluster`集群，执行`3`个步骤：节点握手、分配槽位、建立主从关系
+
+##### 节点握手
+
+​		使用`CLUSTER MEET`命令可以让两个节点执行握手操作，该命令调用`clusterStartHandshake`函数，创建一个节点实例并添加到`cluster.nodes`实例字典中。最
+
+初会创建一个随机字符串，作为目标节点实例临时的`name`并添加到实例字典中，在当前节点与目标节点建立网络连接成功并相互通信后，当前节点会从目标节点
+
+的响应数据中获取目标节点的`name`，并重命名该节点实例的`name`。
+
+
+
+##### 指派槽位
+
+​		使用`CLUSTER ADDSLOTS`命令批量指派槽位，当`cluster`节点收到命令后，将调用`clusterAddSlot`函数更新实例槽位位图，并将自身实例添加到槽位指派数
+
+组对应的索引中。
+
+
+
+##### 建立主从关系
+
+​		使用`CLUSTER REPLICATE`命令指定集群节点建立主从关系。`Cluster`节点收到该命令后将成为指定节点的从节点，调用`clusterSetMaster`函数：
+
+```c++
+// cluster.c
+void clusterSetMaster(clusterNode *n) {
+    serverAssert(n != myself);
+    serverAssert(myself->numslots == 0);
+	// 如果当前节点是主节点，则切换为从节点，并清除它负责的槽位
+    if (nodeIsMaster(myself)) {
+        myself->flags &= ~(CLUSTER_NODE_MASTER|CLUSTER_NODE_MIGRATE_TO);
+        myself->flags |= CLUSTER_NODE_SLAVE;
+        clusterCloseAllSlots();
+    } else {
+        // 如果当前节点是从节点，则清除实例的 slaveof 属性
+        if (myself->slaveof)
+            clusterNodeRemoveSlave(myself->slaveof,myself);
+    }
+    myself->slaveof = n;
+    clusterNodeAddSlave(n,myself);
+    // 与指定节点建立主从关系
+    replicationSetMaster(n->ip, n->port);
+    // 重置手动故障迁移状态
+    resetManualFailover();
+}
+```
+
+
+
+#### 节点通信
+
+​		`Cluster`集群刚搭建完成时，整个集群的信息并没有完全同步<`Cluster`使用`Gossip`算法在集群内同步信息。`Gossip`是一种去中心化的一致性算法，该算法
+
+的所有节点都是对等节点，无`leader`节点。
+
+​		当集群中某个节点有信息需要更新到其他节点时，它会定时随机地选择周围几个节点发送消息，收到消息的节点也会重复该过程，直到集群中所有的几点都收
+
+到消息。这个过程可能需要一定的时间，虽然不能保证某个时刻所有节点都收到消息，但最终所有节点都会收到消息。即它是一个最终一致性算法。
+
+​		`Cluster`机制的每个节点会随机选择集群中的一个节点作为消息接收节点，并从自身实例字典中随机选择部分节点实例放入消息，在发送给目标节点，从而使
+
+整个集群中所有节点都相互认识。
+
+
+
+##### 消息定义
+
+​		`Cluster`为所有`Cluster`消息定义了一个消息结构体：
+
+```c++
+// cluster.h
+typedef struct {
+    char sig[4]; // 固定为 RCmb，代表是 Cluster 消息
+    uint32_t totlen; // 消息总长度
+    uint16_t ver; // Cluster 消息协议版本，当前是 1
+    uint16_t port;      /* TCP base port number. */
+    /**
+    	消息类型：
+    		CLUSTER_NODE_MEET：要求进行握手操作的消息
+    		CLUSTERMSG_TYPE_PING：定时心跳消息
+    		CLUSTERMSG_TYPE_PONG：心跳响应消息或广播消息
+    		CLUSTERMSG_TYPE_FAIL：节点客观下线的广播消息
+    		CLUSTERMSG_TYPE_FAILOVER_AUTH_REQUEST：故障迁移选举时的投票请求消息
+    		CLUSTERMSG_TYPE_FAILOVER_AUTH_ACK：故障迁移选举时的同意投票响应消息
+    */
+    uint16_t type;
+    uint16_t count;     /* Only used for some kind of messages. */
+    uint64_t currentEpoch; // 发送节点最新任期
+    uint64_t configEpoch; // 发送节点最新写入文件的任期
+    uint64_t offset;    /* Master replication offset if node is a master or
+                           processed replication offset if node is a slave. */
+    char sender[CLUSTER_NAMELEN]; // 发送节点 name
+    unsigned char myslots[CLUSTER_SLOTS/8]; // 发送节点槽位位图
+    char slaveof[CLUSTER_NAMELEN]; // 发送节点主节点
+    char myip[NET_IP_STR_LEN]; // 发送节点 IP 地址
+    char notused1[32];  /* 32 bytes reserved for future usage. */
+    uint16_t pport;      /* Sender TCP plaintext port, if base port is TLS */
+    uint16_t cport; // 发送节点端口
+    uint16_t flags; // 发送节点标志
+    unsigned char state; /* Cluster state from the POV of the sender */
+    unsigned char mflags[3]; /* Message flags: CLUSTERMSG_FLAG[012]_... */
+    union clusterMsgData data; // 消息体
+} clusterMsg;
+
+union clusterMsgData {
+    /* PING, MEET and PONG */
+    struct {
+        /* Array of N clusterMsgDataGossip structures */
+        clusterMsgDataGossip gossip[1];
+    } ping; // 存放随机实例和主观下线节点的实例信息，用于 CLUSTERMSG_TYPE_PONG、CLUSTER_NODE_MEET、CLUSTERMSG_TYPE_PING 消息
+
+    /* FAIL */
+    struct {
+        clusterMsgDataFail about;
+    } fail; // 节点客观下线通知，存放客观下线节点 name，用于 CLUSTERMSG_TYPE_FAIL 消息
+
+    /* PUBLISH */
+    struct {
+        clusterMsgDataPublish msg;
+    } publish;
+
+    /* UPDATE */
+    struct {
+        clusterMsgDataUpdate nodecfg;
+    } update;
+
+    /* MODULE */
+    struct {
+        clusterMsgModule msg;
+    } module;
+};
+```
+
+
+
+##### 建立连接
+
+​		`cluster`是`Cluster`机制的定时逻辑函数，如果当前节点运行在`Cluster`模式下，`serverCron`时间事件会每隔`100`毫秒触发一次`clusterCron`函数。
+
+`cluster`函数会为当前节点与集群其他节点建立网络连接`(`包括首次建立连接和连接断开后重建连接`)`：
+
+```c++
+// cluster.c
+void clusterCron(void) {
+
+    ...
+    // 遍历实例字典中的实例，如果其中某个连接信息为空，则与该节点建立连接
+    di = dictGetSafeIterator(server.cluster->nodes);
+    server.cluster->stats_pfail_nodes = 0;
+    while((de = dictNext(di)) != NULL) {
+        clusterNode *node = dictGetVal(de);
+
+        /* Not interested in reconnecting the link with myself or nodes
+         * for which we have no address. */
+        if (node->flags & (CLUSTER_NODE_MYSELF|CLUSTER_NODE_NOADDR)) continue;
+
+        if (node->flags & CLUSTER_NODE_PFAIL)
+            server.cluster->stats_pfail_nodes++;
+
+        /* A Node in HANDSHAKE state has a limited lifespan equal to the
+         * configured node timeout. */
+        if (nodeInHandshake(node) && now - node->ctime > handshake_timeout) {
+            clusterDelNode(node);
+            continue;
+        }
+
+        if (node->link == NULL) {
+            clusterLink *link = createClusterLink(node);
+            // 创建 Socket 套接字
+            link->conn = server.tls_cluster ? connCreateTLS() : connCreateSocket();
+            connSetPrivateData(link->conn, link);
+            // 与目标节点建立网络连接，在连接成功后调用回调函数 clusterLinkConnectHandler，clusterLinkConnectHandler 函数会为该连接注册 READ 事件			的回调函数 clusterReadHandler，并给目标节点发送 CLUSTER_NODE_MEET 或 CLUSTERMSG_TYPE_MEET 消息
+            if (connConnect(link->conn, node->ip, node->cport, NET_FIRST_BIND_ADDR,
+                        clusterLinkConnectHandler) == -1) {
+
+                if (node->ping_sent == 0) node->ping_sent = mstime();
+                serverLog(LL_DEBUG, "Unable to connect to "
+                    "Cluster Node [%s]:%d -> %s", node->ip,
+                    node->cport, server.neterr);
+
+                freeClusterLink(link);
+                continue;
+            }
+            node->link = link;
+        }
+    }
+    dictReleaseIterator(di);
+
+    ...
+}
+```
+
+
+
+##### 握手过程
+
+​		某个节点收到`CLUSTER MEET`命令，并将目标节点实例添加到自身实例字典后，当前节点与目标节点处于握手阶段。
+
+​		当两个节点建立连接后，`clusterLinkConnectHandler`函数会发送`CLUSTER_NODE_MEET`消息给目标节点。当目标节点收到`CLUSTER_NODE_MEET`消息后会返回
+
+`CLUSTERMSG_TYPE_PONG`消息。`clusterReadHandler`函数负责处理`Cluster`消息。该函数会读取`Socket`数据，并调用`clusterProcessPacket`函数处理数据：
+
+```c++
+// cluster.c
+int clusterProcessPacket(clusterLink *link) {
+    // 处理 TCP 拆包，粘包的场景
+    ...
+    // 收到 CLUSTERMSG_TYPE_PING、CLUSTERMSG_TYPE_MEET 的消息，总是会回复 CLUSTERMSG_TYPE_PONG 消息
+    if (type == CLUSTERMSG_TYPE_PING || type == CLUSTERMSG_TYPE_MEET) {
+        
+        ...
+        
+        clusterSendPing(link,CLUSTERMSG_TYPE_PONG);
+    }
+
+    if (type == CLUSTERMSG_TYPE_PING || type == CLUSTERMSG_TYPE_PONG ||
+        type == CLUSTERMSG_TYPE_MEET)
+    {
+        serverLog(LL_DEBUG,"%s packet received: %p",
+            type == CLUSTERMSG_TYPE_PING ? "ping" : "pong",
+            (void*)link->node);
+        if (link->node) {
+            if (nodeInHandshake(link->node)) {
+                
+                ...
+                // 收到 CLUSTERMSG_TYPE_PING、CLUSTERMSG_TYPE_PONG、CLUSTERMSG_TYPE_MEET 信息，并且发送消息的节点与当前节点正在握手，则使用消息数据中发送节点的 name 更新对应节点实例的 name，并清除 CLUSTER_NODE_HANDSHAKE 标志，代表握手完成
+                clusterRenameNode(link->node, hdr->sender);
+                serverLog(LL_DEBUG,"Handshake with node %.40s completed.",
+                    link->node->name);
+                link->node->flags &= ~CLUSTER_NODE_HANDSHAKE;
+                link->node->flags |= flags&(CLUSTER_NODE_MASTER|CLUSTER_NODE_SLAVE);
+                clusterDoBeforeSleep(CLUSTER_TODO_SAVE_CONFIG);
+            } 
+            ...
+        }
+
+        ...
+        // 处理 clusterMsgDataGossip 内容
+        if (sender) clusterProcessGossipSection(hdr,link);
+    } 
+    ...
+}
+```
+
+
+
+##### 定时消息
+
+​		`clusterCron`函数会定时给集群其他节点发送`CLUSTERMSG_TYPE_PING`消息：
+
+```c++
+// cluster.c
+void clusterCron(void) {
+
+    ...
+    // iteration 负责统计 clusterCron 函数执行的次数，每执行 10 次 clusterCron 函数便发送一次 Cluster 消息，即每秒发送一次 Cluster 消息
+    if (!(iteration % 10)) {
+        int j;
+
+        /* Check a few random nodes and ping the one with the oldest
+         * pong_received time. */
+        // 随机取 5 个目标节点，并从中选择上次收到 PONG  响应时间最早的节点
+        for (j = 0; j < 5; j++) {
+            de = dictGetRandomKey(server.cluster->nodes);
+            clusterNode *this = dictGetVal(de);
+
+            /* Don't ping nodes disconnected or with a ping currently active. */
+            // 过滤连接已断开，发送 PING 信息未收到响应，处于握手阶段的节点
+            if (this->link == NULL || this->ping_sent != 0) continue;
+            if (this->flags & (CLUSTER_NODE_MYSELF|CLUSTER_NODE_HANDSHAKE))
+                continue;
+            if (min_pong_node == NULL || min_pong > this->pong_received) {
+                min_pong_node = this;
+                min_pong = this->pong_received;
+            }
+        }
+        // 发送 CLUSTERMSG_TYPE_PING 消息给选择的节点
+        if (min_pong_node) {
+            serverLog(LL_DEBUG,"Pinging node %.40s", min_pong_node->name);
+            clusterSendPing(min_pong_node->link, CLUSTERMSG_TYPE_PING);
+        }
+    }
+	...
+}
+
+
+/**
+	link：目标节点连接
+	type：消息类型
+*/
+void clusterSendPing(clusterLink *link, int type) {
+    unsigned char *buf;
+    clusterMsg *hdr;
+    int gossipcount = 0; /* Number of gossip sections added so far. */
+    int wanted; /* Number of gossip sections we want to append if possible. */
+    int totlen; /* Total packet length. */
+
+    int freshnodes = dictSize(server.cluster->nodes)-2;
+	// wanted 是 clusterMsgDataGossip 内容中的随机实例数量，为集群节点数量的 1/10 ，并且不小于 3
+    wanted = floor(dictSize(server.cluster->nodes)/10);
+    if (wanted < 3) wanted = 3;
+    if (wanted > freshnodes) wanted = freshnodes;
+
+    int pfail_wanted = server.cluster->stats_pfail_nodes;
+
+    // 计算消息总长度，申请内存空间，并初始化消息结构体
+    totlen = sizeof(clusterMsg)-sizeof(union clusterMsgData);
+    totlen += (sizeof(clusterMsgDataGossip)*(wanted+pfail_wanted));
+
+    if (totlen < (int)sizeof(clusterMsg)) totlen = sizeof(clusterMsg);
+    buf = zcalloc(totlen);
+    hdr = (clusterMsg*) buf;
+
+    /* Populate the header. */
+    // 填充消息头属性，并将自身节点信息添加到消息中
+    if (link->node && type == CLUSTERMSG_TYPE_PING)
+        link->node->ping_sent = mstime();
+    clusterBuildMessageHdr(hdr,type);
+
+    /* Populate the gossip fields */
+    // 从当前节点的实例字典中随机取 wanted 个节点实例并添加到消息中
+    int maxiterations = wanted*3;
+    while(freshnodes > 0 && gossipcount < wanted && maxiterations--) {
+        dictEntry *de = dictGetRandomKey(server.cluster->nodes);
+        clusterNode *this = dictGetVal(de);
+
+        /* Don't include this node: the whole packet header is about us
+         * already, so we just gossip about other nodes. */
+        // 过滤自身实例
+        if (this == myself) continue;
+
+        /* PFAIL nodes will be added later. */
+        // 过滤主观下线的节点
+        if (this->flags & CLUSTER_NODE_PFAIL) continue;
+		// 过滤处于握手阶段或连接已断开的节点
+        if (this->flags & (CLUSTER_NODE_HANDSHAKE|CLUSTER_NODE_NOADDR) ||
+            (this->link == NULL && this->numslots == 0))
+        {
+            freshnodes--; /* Technically not correct, but saves CPU. */
+            continue;
+        }
+
+        /* Do not add a node we already have. */
+        if (clusterNodeIsInGossipSection(hdr,gossipcount,this)) continue;
+
+        /* Add it */
+        clusterSetGossipEntry(hdr,gossipcount,this);
+        freshnodes--;
+        gossipcount++;
+    }
+
+    /* If there are PFAIL nodes, add them at the end. */
+    // 将当前节点实例字典中所有主观下线的节点添加到消息中，以便更快地传播下线报告，使节点从主观下线状态转变为客观下线状态
+    if (pfail_wanted) {
+        dictIterator *di;
+        dictEntry *de;
+
+        di = dictGetSafeIterator(server.cluster->nodes);
+        while((de = dictNext(di)) != NULL && pfail_wanted > 0) {
+            clusterNode *node = dictGetVal(de);
+            // 过滤处于握手阶段的节点
+            if (node->flags & CLUSTER_NODE_HANDSHAKE) continue;
+            if (node->flags & CLUSTER_NODE_NOADDR) continue;
+            // 过滤连接已断开的节点
+            if (!(node->flags & CLUSTER_NODE_PFAIL)) continue;
+            clusterSetGossipEntry(hdr,gossipcount,node);
+            freshnodes--;
+            gossipcount++;
+            /* We take the count of the slots we allocated, since the
+             * PFAIL stats may not match perfectly with the current number
+             * of PFAIL nodes. */
+            pfail_wanted--;
+        }
+        dictReleaseIterator(di);
+    }
+
+    /* Ready to send... fix the totlen fiend and queue the message in the
+     * output buffer. */
+    // 重新计算消息长度
+    totlen = sizeof(clusterMsg)-sizeof(union clusterMsgData);
+    totlen += (sizeof(clusterMsgDataGossip)*gossipcount);
+    hdr->count = htons(gossipcount);
+    hdr->totlen = htonl(totlen);
+    // 发送信息
+    clusterSendMessage(link,buf,totlen);
+    zfree(buf);
+}
+```
 
 
 
