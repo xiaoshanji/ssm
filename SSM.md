@@ -31183,6 +31183,244 @@ void clusterUpdateSlotsConfigWith(clusterNode *sender, uint64_t senderConfigEpoc
 
 
 
+### 事务
+
+​		`Redis`事务的本质是一组命令的集合。事务可以一次执行多个命令：
+
+​				事务中的所有命令都按顺序执行，事务执行过程中，其他客户端提交的命令请求需要等待当前事务执行完成后再处理，不会插入当前事务命令队列中。
+
+​				事务中的命令要么都执行，要么都不执行，即使事务中有些命令执行失败，后续命令依然被执行。因此`Redis`事务也是原子的。
+
+​		`Redis`事务不支持回滚，如果事务中有命令执行失败了，那么`Redis`会继续执行后续命令而不是回滚。
+
+​		`multiState`结构体负责存放事务信息：
+
+```c++
+// server.h
+typedef struct multiState {
+    multiCmd *commands; // 事务命令队列，存放当前事务所有的命令
+    int count;
+    int cmd_flags;
+    int cmd_inv_flags;
+} multiState;
+```
+
+​		客户端属性`client.mstate`指向一个`multiState`变量，该`multiState`作为客户端的事务上下文，负责存放该客户端当前的事务信息。
+
+
+
+#### watch
+
+​		`redisDb`中定义了字典属性`watched_keys`，该字典的键是数据库中被监视的`Redis`键，字典的值是监视字典键的所有客户端列表。
+
+​		`client`中定义了列表属性`watched_keys`，记录该客户端所有监视的键，`watchCommand`负责处理`watch`命令，该函数会调用`watchForKey`：
+
+```c++
+// multi.c
+void watchForKey(client *c, robj *key) {
+    list *clients = NULL;
+    listIter li;
+    listNode *ln;
+    watchedKey *wk;
+
+    /* Check if we are already watching for this key */
+    listRewind(c->watched_keys,&li);
+    while((ln = listNext(&li))) {
+        wk = listNodeValue(ln);
+        if (wk->db == c->db && equalStringObjects(key,wk->key))
+            return; /* Key already watched */
+    }
+    /* This key is not already watched in this DB. Let's add it */
+    // 将客户端添加到 redisDb.watched_keys 字典中该 Redis 键对应的客户端列表中
+    clients = dictFetchValue(c->db->watched_keys,key);
+    if (!clients) {
+        clients = listCreate();
+        dictAdd(c->db->watched_keys,key,clients);
+        incrRefCount(key);
+    }
+    listAddNodeTail(clients,c);
+    /* Add the new key to the list of keys watched by this client */
+    // 初始化 watchedKey 结构体，该结构体可以存储被监视键和对应的数据库
+    wk = zmalloc(sizeof(*wk));
+    wk->key = key;
+    wk->db = c->db;
+    incrRefCount(key);
+    listAddNodeTail(c->watched_keys,wk);
+}
+```
+
+​		`Redis`中每次修改数据时，都会调用`signalModifiedKey`函数，将该数据标志为已修改。`signalModifiedKey`会调用`touchWatchedKey`，通知监视该键的客户
+
+端数据已修改：
+
+```c++
+// multi.c
+void touchWatchedKey(redisDb *db, robj *key) {
+    list *clients;
+    listIter li;
+    listNode *ln;
+
+    if (dictSize(db->watched_keys) == 0) return;
+    // 获取所有监视该键的客户端
+    clients = dictFetchValue(db->watched_keys, key);
+    if (!clients) return;
+
+    /* Mark all the clients watching this key as CLIENT_DIRTY_CAS */
+    /* Check if we are already watching for this key */
+    listRewind(clients,&li);
+    while((ln = listNext(&li))) {
+        client *c = listNodeValue(ln);
+		// 给客户端添加 CLIENT_DIRTY_CAS 标志，代表客户端监视的键已被修改
+        c->flags |= CLIENT_DIRTY_CAS;
+    }
+}
+```
+
+
+
+#### multi、exec
+
+​		`multi`命令由`multiCommand`处理，其就是打开客户端`CLIENT_MULTI`标志，代表该客户端已开启事务。
+
+​		`processCommand`执行命令时，会检查客户端是否已开启事务，如果客户端已开启事务，则调用`queueMultiCommand`，将命令请求添加到客户端事务命令队列
+
+`client.mstate.commands`中：
+
+```c++
+// server.c
+int processCommand(client *c) {
+
+    ...
+    
+    if (c->flags & CLIENT_MULTI &&
+        c->cmd->proc != execCommand && c->cmd->proc != discardCommand &&
+        c->cmd->proc != multiCommand && c->cmd->proc != watchCommand &&
+        c->cmd->proc != resetCommand)
+    {
+        queueMultiCommand(c);
+        addReply(c,shared.queued);
+    } else {
+        call(c,CMD_CALL_FULL);
+        c->woff = server.master_repl_offset;
+        if (listLength(server.ready_keys))
+            handleClientsBlockedOnKeys();
+    }
+
+    return C_OK;
+}
+```
+
+​		`exec`命令由`execCommand`处理：
+
+```c++
+// multi.c
+void execCommand(client *c) {
+	
+    ...
+    
+    // 当客户端监视的键被修改或者客户端已拒绝事务中的命令时，直接抛弃事务命令队列中的命令，并进行错误处理
+    if (c->flags & (CLIENT_DIRTY_CAS | CLIENT_DIRTY_EXEC)) {
+        if (c->flags & CLIENT_DIRTY_EXEC) {
+            addReplyErrorObject(c, shared.execaborterr);
+        } else {
+            addReply(c, shared.nullarray[c->resp]);
+        }
+
+        discardTransaction(c);
+        return;
+    }
+
+    uint64_t old_flags = c->flags;
+
+    /* we do not want to allow blocking commands inside multi */
+    c->flags |= CLIENT_DENY_BLOCKING;
+
+    /* Exec all the queued commands */
+    // 取消当前客户端对所有键的监视，即 watch 命令只能作用于后续的一个事务
+    unwatchAllKeys(c); /* Unwatch ASAP otherwise we'll waste CPU cycles */
+
+    server.in_exec = 1;
+
+    orig_argv = c->argv;
+    orig_argc = c->argc;
+    orig_cmd = c->cmd;
+    addReplyArrayLen(c,c->mstate.count);
+    for (j = 0; j < c->mstate.count; j++) {
+        c->argc = c->mstate.commands[j].argc;
+        c->argv = c->mstate.commands[j].argv;
+        c->cmd = c->mstate.commands[j].cmd;
+
+        /* ACL permissions are also checked at the time of execution in case
+         * they were changed after the commands were queued. */
+        // 检查用户的 ACL 权限，检查通过后执行命令
+        int acl_errpos;
+        int acl_retval = ACLCheckAllPerm(c,&acl_errpos);
+        if (acl_retval != ACL_OK) {
+            char *reason;
+            switch (acl_retval) {
+            case ACL_DENIED_CMD:
+                reason = "no permission to execute the command or subcommand";
+                break;
+            case ACL_DENIED_KEY:
+                reason = "no permission to touch the specified keys";
+                break;
+            case ACL_DENIED_CHANNEL:
+                reason = "no permission to access one of the channels used "
+                         "as arguments";
+                break;
+            default:
+                reason = "no permission";
+                break;
+            }
+            addACLLogEntry(c,acl_retval,acl_errpos,NULL);
+            addReplyErrorFormat(c,
+                "-NOPERM ACLs rules changed between the moment the "
+                "transaction was accumulated and the EXEC call. "
+                "This command is no longer allowed for the "
+                "following reason: %s", reason);
+        } else {
+            call(c,server.loading ? CMD_CALL_NONE : CMD_CALL_FULL);
+            serverAssert((c->flags & CLIENT_BLOCKED) == 0);
+        }
+
+        /* Commands may alter argc/argv, restore mstate. */
+        c->mstate.commands[j].argc = c->argc;
+        c->mstate.commands[j].argv = c->argv;
+        c->mstate.commands[j].cmd = c->cmd;
+    }
+
+    // restore old DENY_BLOCKING value
+    if (!(old_flags & CLIENT_DENY_BLOCKING))
+        c->flags &= ~CLIENT_DENY_BLOCKING;
+	
+    c->argv = orig_argv;
+    c->argc = orig_argc;
+    c->cmd = orig_cmd;
+    // 重置客户端事务上下文 client.mstate，并删除 CLIENT_MULTI、CLIENT_DIRTY_CAS、CCLIENT_DIRTY_EXEC 标志，代表当前事务已经处理完成
+    discardTransaction(c);
+
+    /* Make sure the EXEC command will be propagated as well if MULTI
+     * was already propagated. */
+    // 如果事务中执行了写命令，则修改 server.diry，然后 server.c/call 函数将 exec 命令传播到 AOF 文件和从节点，从而保证一个事务的 multi、exec 命令都被传播
+    if (server.propagate_in_transaction) {
+        int is_master = server.masterhost == NULL;
+        server.dirty++;
+
+        if (server.repl_backlog && was_master && !is_master) {
+            char *execcmd = "*1\r\n$4\r\nEXEC\r\n";
+            feedReplicationBacklog(execcmd,strlen(execcmd));
+        }
+        afterPropagateExec();
+    }
+
+    server.in_exec = 0;
+}
+```
+
+
+
+
+
 
 
 
