@@ -31419,6 +31419,236 @@ void execCommand(client *c) {
 
 
 
+### 后台线程
+
+​		`Redis 4`引入了后台线程，用来执行比较耗时的操作，避免阻塞主线程。即`Redis 4`开始，`Redis`已不是单线程。
+
+​		`Redis`后台线程中除了使用`UNIX`互斥量，还使用了`UNIX`条件变量：
+
+​				条件状态：指某个条件是否成立。
+
+​				条件变量：指`UNIX`系统提供用于阻塞或唤醒线程的条件变量。
+
+​		通常一个条件状态会使用一个条件变量控制线程。
+
+​		`main`函数触发`bioInit`函数初始化后台线程：
+
+```c++
+// bio.c
+void bioInit(void) {
+    pthread_attr_t attr;
+    pthread_t thread;
+    size_t stacksize;
+    int j;
+
+    /* Initialization of state vars and objects */
+    // BIO_NUM_OPS 为 3，即 Redis 中定义了 3 类后台任务：文件关闭、磁盘同步、非阻塞删除
+    for (j = 0; j < BIO_NUM_OPS; j++) {
+        // 为每一类后台任务创建互斥量(bio_mutex)、条件变量(bio_newjob_cond、bio_step_cond)、任务队列(bio_jobs)
+        pthread_mutex_init(&bio_mutex[j],NULL);
+        pthread_cond_init(&bio_newjob_cond[j],NULL);
+        pthread_cond_init(&bio_step_cond[j],NULL);
+        bio_jobs[j] = listCreate();
+        bio_pending[j] = 0;
+    }
+
+    /* Set the stack size as by default it may be small in some system */
+    // 设置线程栈大小，避免在某些系统中线程栈太小导致出错
+    pthread_attr_init(&attr);
+    pthread_attr_getstacksize(&attr,&stacksize);
+    if (!stacksize) stacksize = 1; /* The world is full of Solaris Fixes */
+    while (stacksize < REDIS_THREAD_STACK_SIZE) stacksize *= 2;
+    pthread_attr_setstacksize(&attr, stacksize);
+
+    /* Ready to spawn our threads. We use the single argument the thread
+     * function accepts in order to pass the job ID the thread is
+     * responsible of. */
+    // 创建后台线程，并指定 bioProcessBackgroundJobs 为线程执行函数
+    for (j = 0; j < BIO_NUM_OPS; j++) {
+        void *arg = (void*)(unsigned long) j;
+        // pthread_create 的最后一个参数指定了该线程负责执行的是哪一类后台任务
+        if (pthread_create(&thread,&attr,bioProcessBackgroundJobs,arg) != 0) {
+            serverLog(LL_WARNING,"Fatal: Can't initialize Background Jobs.");
+            exit(1);
+        }
+        bio_threads[j] = thread;
+    }
+}
+```
+
+​		`bioSubmitJob`负责添加一个后台任务，通常由主线程调用：
+
+```c++
+// bio.c
+void bioSubmitJob(int type, struct bio_job *job) {
+
+    job->time = time(NULL);
+    // 抢占该类任务对应的互斥量，在将该任务添加到对应的队列中
+    pthread_mutex_lock(&bio_mutex[type]);
+    listAddNodeTail(bio_jobs[type],job);
+    bio_pending[type]++;
+    // 唤醒阻塞在条件变量 bio_newjob_cond 上的线程（该线程负责处理任务）
+    pthread_cond_signal(&bio_newjob_cond[type]);
+    // 释放互斥量
+    pthread_mutex_unlock(&bio_mutex[type]);
+}
+```
+
+​		`bioProcessBackgroundJobs`负责执行后台线程的主逻辑：
+
+```c++
+// bio.c
+void *bioProcessBackgroundJobs(void *arg) {
+    struct bio_job *job;
+    unsigned long type = (unsigned long) arg;
+    sigset_t sigset;
+
+    /* Check that the type is within the right interval. */
+    if (type >= BIO_NUM_OPS) {
+        serverLog(LL_WARNING,
+            "Warning: bio thread started with wrong type %lu",type);
+        return NULL;
+    }
+
+    switch (type) {
+    case BIO_CLOSE_FILE:
+        redis_set_thread_title("bio_close_file");
+        break;
+    case BIO_AOF_FSYNC:
+        redis_set_thread_title("bio_aof_fsync");
+        break;
+    case BIO_LAZY_FREE:
+        redis_set_thread_title("bio_lazy_free");
+        break;
+    }
+
+    redisSetCpuAffinity(server.bio_cpulist);
+
+    makeThreadKillable();
+	// 抢占任务类型对应的互斥量
+    pthread_mutex_lock(&bio_mutex[type]);
+    /* Block SIGALRM so we are sure that only the main thread will
+     * receive the watchdog signal. */
+    sigemptyset(&sigset);
+    sigaddset(&sigset, SIGALRM);
+    if (pthread_sigmask(SIG_BLOCK, &sigset, NULL))
+        serverLog(LL_WARNING,
+            "Warning: can't mask SIGALRM in bio.c thread: %s", strerror(errno));
+
+    while(1) {
+        listNode *ln;
+
+        /* The loop always starts with the lock hold. */
+        // 待处理任务为空，将当前线程阻塞在条件变量 bio_newjob_cond 上
+        if (listLength(bio_jobs[type]) == 0) {
+            pthread_cond_wait(&bio_newjob_cond[type],&bio_mutex[type]);
+            continue;
+        }
+        /* Pop the job from the queue. */
+        // 存在待处理的任务，获取一个任务，并释放互斥量
+        ln = listFirst(bio_jobs[type]);
+        job = ln->value;
+        /* It is now possible to unlock the background system as we know have
+         * a stand alone job structure to process.*/
+        pthread_mutex_unlock(&bio_mutex[type]);
+
+        /* Process the job accordingly to its type. */
+        // 删除对象，删除数据库，删除基数树 Rax ，根据不同的任务类型执行对应的逻辑
+        if (type == BIO_CLOSE_FILE) {
+            close(job->fd);
+        } else if (type == BIO_AOF_FSYNC) {
+            /* The fd may be closed by main thread and reused for another
+             * socket, pipe, or file. We just ignore these errno because
+             * aof fsync did not really fail. */
+            if (redis_fsync(job->fd) == -1 &&
+                errno != EBADF && errno != EINVAL)
+            {
+                int last_status;
+                atomicGet(server.aof_bio_fsync_status,last_status);
+                atomicSet(server.aof_bio_fsync_status,C_ERR);
+                atomicSet(server.aof_bio_fsync_errno,errno);
+                if (last_status == C_OK) {
+                    serverLog(LL_WARNING,
+                        "Fail to fsync the AOF file: %s",strerror(errno));
+                }
+            } else {
+                atomicSet(server.aof_bio_fsync_status,C_OK);
+            }
+        } else if (type == BIO_LAZY_FREE) {
+            job->free_fn(job->free_args);
+        } else {
+            serverPanic("Wrong job type in bioProcessBackgroundJobs().");
+        }
+        zfree(job);
+
+        /* Lock again before reiterating the loop, if there are no longer
+         * jobs to process we'll block again in pthread_cond_wait(). */
+        // 重新抢占互斥量，并删除该任务
+        pthread_mutex_lock(&bio_mutex[type]);
+        listDelNode(bio_jobs[type],ln);
+        bio_pending[type]--;
+
+        /* Unblock threads blocked on bioWaitStepOfType() if any. */
+        pthread_cond_broadcast(&bio_step_cond[type]);
+    }
+}
+```
+
+​		后台线程中抢占和释放互斥量是比较频繁的，主线程每添加一个任务都需要抢占和释放互斥量一次，后台线程每处理一个任务都抢占和释放互斥量两次。
+
+
+
+#### 非阻塞删除
+
+​		`unlink`命令实现非阻塞删除，该命令由`unlinkCommand`处理。`unlinkCommand`会调用`delGenericCommand`最后调用`dbAsyncDelete`执行非阻塞删除：
+
+```c++
+// lazyfree.c
+int dbAsyncDelete(redisDb *db, robj *key) {
+    /* Deleting an entry from the expires dict will not free the sds of
+     * the key, because it is shared with the main dictionary. */
+    // 如果过期字典中存在该键，则先从过期字典中删除该键
+    if (dictSize(db->expires) > 0) dictDelete(db->expires,key->ptr);
+
+    /* If the value is composed of a few allocations, to free in a lazy way
+     * is actually just slower... So under a certain limit we just free
+     * the object synchronously. */
+    // 将该键从数据库字典中删除，返回键值对，此时并没有删除键值对对象
+    dictEntry *de = dictUnlink(db->dict,key->ptr);
+    if (de) {
+        // 计算该键值对的值对象占用的字节数
+        robj *val = dictGetVal(de);
+
+        /* Tells the module that the key has been unlinked from the database. */
+        moduleNotifyKeyUnlink(key,val);
+
+        size_t free_effort = lazyfreeGetFreeEffort(key,val);
+
+        // 值对象占用的字节数大于 LAZYFREE_THRESHOLD（64 字节），并且该值对象只被当前一处引用
+        if (free_effort > LAZYFREE_THRESHOLD && val->refcount == 1) {
+            atomicIncr(lazyfree_objects,1);
+            // 创建一个后台任务负责删除值对象
+            bioCreateLazyFreeJob(lazyfreeFreeObject,1, val);
+            // 将该键值对的值对象引用设置为 NULL，保证主线程无法再访问该值对象，此时只有后台线程可以访问该值对象
+            dictSetVal(db->dict,de,NULL);
+        }
+    }
+
+    /* Release the key-val pair, or just the key if we set the val
+     * field to NULL in order to lazy free it later. */
+    if (de) {
+        // 删除键值对对象，并释放其内存空间，如果是非阻塞删除，这里值对象引用已经被设置为 NULL，并不会阻塞主线程
+        dictFreeUnlinkedEntry(db->dict,de);
+        if (server.cluster_enabled) slotToKeyDel(key->ptr);
+        return 1;
+    } else {
+        return 0;
+    }
+}
+```
+
+
+
 
 
 
