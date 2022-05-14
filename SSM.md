@@ -31649,7 +31649,421 @@ int dbAsyncDelete(redisDb *db, robj *key) {
 
 
 
+### 内存管理
 
+​		`Redis`提供了`expire`等命令可以为键设置过期时间，到达过期时间后，这些键会被自动删除。它们通过`expireGenericCommand`函数处理，调用`setExpire`函
+
+数将键、过期时间添加到数据库的过期字典`redisDb.expires`中。
+
+
+
+#### 定时删除
+
+​		`serverCron`会定时触发`activeExpireCycle`清除数据库中的过期数据，直到数据库过期数据比例达到指定比例：
+
+```c++
+// expire.c
+/**
+	type：指定 activeExpireCycle 的执行模式，取值为 ACTIVE_EXPIRE_CYCLE_FAST 或者 ACTIVE_EXPIRE_CYCLE_SLOW
+*/
+void activeExpireCycle(int type) {
+    
+    // 控制函数执行时间，避免长时间阻塞主进程
+    ...
+	
+    // 遍历指定数量的数据库，dbs_per_call 变量取数据库数量与 CRON_DBS_PER_CALL（16）中的较小值，timelimit_exit 不为 0，代表该函数处理时间超出限制
+    for (j = 0; j < dbs_per_call && timelimit_exit == 0; j++) {
+        /* Expired and checked in a single loop. */
+        unsigned long expired, sampled;
+		// 获取数据库，current_db 记录当前正在处理的数据库
+        redisDb *db = server.db+(current_db % server.dbnum);
+
+        current_db++;
+
+        // 处理该数据库中的过期字典
+        do {
+            unsigned long num, slots;
+            long long now, ttl_sum;
+            int ttl_samples;
+            iteration++;
+
+            if ((num = dictSize(db->expires)) == 0) {
+                db->avg_ttl = 0;
+                break;
+            }
+            slots = dictSlots(db->expires);
+            now = mstime();
+
+            if (slots > DICT_HT_INITIAL_SIZE &&
+                (num*100/slots < 1)) break;
+
+            expired = 0;
+            sampled = 0;
+            ttl_sum = 0;
+            ttl_samples = 0;
+
+            if (num > config_keys_per_loop)
+                num = config_keys_per_loop;
+
+            long max_buckets = num*20;
+            long checked_buckets = 0;
+			// 执行一次采样删除操作，采样数据量为 config_keys_per_loop ，通过统计采样数据量中已过期键的比例，预估整个数据库中已过期键的比例
+            while (sampled < num && checked_buckets < max_buckets) {
+                for (int table = 0; table < 2; table++) {
+                    if (table == 1 && !dictIsRehashing(db->expires)) break;
+					// 计算待处理的 Hash 表数组索引
+                    unsigned long idx = db->expires_cursor;
+                    idx &= db->expires->ht[table].sizemask;
+                    // 检查该索引上所有的键
+                    dictEntry *de = db->expires->ht[table].table[idx];
+                    long long ttl;
+
+                    /* Scan the current bucket of the current table. */
+                    checked_buckets++;
+                    while(de) {
+                        /* Get the next entry now since this entry may get
+                         * deleted. */
+                        dictEntry *e = de;
+                        de = de->next;
+
+                        ttl = dictGetSignedIntegerVal(e)-now;
+                        // 删除过期的键，采样键数量加 1
+                        if (activeExpireCycleTryExpire(db,e,now)) expired++;
+                        if (ttl > 0) {
+                            /* We want the average TTL of keys yet
+                             * not expired. */
+                            ttl_sum += ttl;
+                            ttl_samples++;
+                        }
+                        sampled++;
+                    }
+                }
+                db->expires_cursor++;
+            }
+            total_expired += expired;
+            total_sampled += sampled;
+
+            /* Update the average TTL stats for this database. */
+            if (ttl_samples) {
+                long long avg_ttl = ttl_sum/ttl_samples;
+
+                if (db->avg_ttl == 0) db->avg_ttl = avg_ttl;
+                db->avg_ttl = (db->avg_ttl/50)*49 + (avg_ttl/50);
+            }
+
+            // 每执行 16 次采样删除操作，就检查该函数处理时间是否超过限制
+            if ((iteration & 0xf) == 0) { /* check once every 16 iterations. */
+                elapsed = ustime()-start;
+                if (elapsed > timelimit) {
+                    timelimit_exit = 1;
+                    server.stat_expired_time_cap_reached_count++;
+                    break;
+                }
+            }
+            // 统计采样结果中已过期键所占的比例，小于 config_cycle_acceptable_stale ，则认为当前数据库过期键的比例达到要求，不在继续处理该数据库
+        } while (sampled == 0 ||
+                 (expired*100/sampled) > config_cycle_acceptable_stale);
+    }
+
+    elapsed = ustime()-start;
+    server.stat_expire_cycle_time_used += elapsed;
+    latencyAddSampleIfNeeded("expire-cycle",elapsed/1000);
+
+    double current_perc;
+    if (total_sampled) {
+        current_perc = (double)total_expired/total_sampled;
+    } else
+        current_perc = 0;
+    server.stat_expired_stale_perc = (current_perc*0.05)+
+                                     (server.stat_expired_stale_perc*0.95);
+}
+```
+
+
+
+#### 惰性删除
+
+​		在用户查询键时，检测键是否过期，如果该键已过期，则删除该键。该操作由`expireIfNeeded`完成。
+
+
+
+​		不管是定时删除还是惰性删除，删除数据后，还需要生成删除命令并传播到`AOF`和从节点。
+
+
+
+#### 数据淘汰机制
+
+​		当内存不够时，`Redis`可以主动删除一些数据，以保证`Redis`服务正常运行。
+
+​		数据淘汰算法：
+
+​				`volatile-lru/allkeys-lru`：在数据库字典`/`过期字典中挑选最近最少使用的数据淘汰。
+
+​				`volatile-lfu/allkeys-lfu`：在数据库字典`/`过期字典中挑选最不经常使用的数据淘汰。
+
+​				`volatile-random/allkeys-random`：在数据库字典`/`过期字典中随机挑选数据淘汰。
+
+​				`volatile-ttl`：在过期字典中淘汰最快过期的数据。
+
+​				`noeviction`：不淘汰任何数据，内存不足时执行写命令会返回错误，默认的内存淘汰算法。
+
+​		`Redis`使用的是`LRU/LFU`近似算法，从数据中获取部分随机数据作为样本数据，并将样本数据中最合适的数据淘汰。为了实现`LRU/LFU`近似算法，`Redis`使
+
+用`redisObject.lru`记录键的最新访问时间`(LRU`时间戳`)`或键的访问频率`(LFU`计数`)`。
+
+​		`lookupKey`负责从数据库中查找键，每次查找键都会更新`redisObject.lru`属性：
+
+```c++
+// db.c
+robj *lookupKey(redisDb *db, robj *key, int flags) {
+    dictEntry *de = dictFind(db->dict,key->ptr);
+    if (de) {
+        robj *val = dictGetVal(de);
+
+        /* Update the access time for the ageing algorithm.
+         * Don't do it if we have a saving child, as this will trigger
+         * a copy on write madness. */
+        if (!hasActiveChildProcess() && !(flags & LOOKUP_NOTOUCH)){
+            // 如果使用 LFU 算法淘汰数据，则调用 updateLFU 函数更新 LFU 计数
+            if (server.maxmemory_policy & MAXMEMORY_FLAG_LFU) {
+                updateLFU(val);
+            } else {
+                // 更新 LRU 时间戳
+                val->lru = LRU_CLOCK();
+            }
+        }
+        return val;
+    } else {
+        return NULL;
+    }
+}
+```
+
+
+
+##### LRU时间戳
+
+​		每次查询键后，都将`redisObject.lru`更新为`server.lruclock`。
+
+​		`server.lruclock`是`Redis`中的`LRU`时间戳，`serverCron`会定时更新`server.lruclock`：取秒级时间戳的低`24`个`bit`位。使用`server.lruclock`可以避免每
+
+次都调用`mstime()`函数来获取时间戳，提高了性能。
+
+​		`redisObject.lru`只有`24`位，无法保存完整的`UNIX`时间戳，大约`194`天就会有一个轮回。
+
+
+
+##### LFU计数
+
+​		`updateLFU`负责更新`LFU`计数：
+
+```c++
+// db.c
+void updateLFU(robj *val) {
+    // 根据键的空闲时间对技术进行衰减
+    unsigned long counter = LFUDecrAndReturn(val);
+    // 增加计数
+    counter = LFULogIncr(counter);
+    // 更新时间信息
+    val->lru = (LFUGetTimeInMinutes()<<8) | counter;
+}
+```
+
+​		`redisObject.lru`分为`2`部分，高`16`为用于存储时间信息，低`8`位用于存储键的访问频率。
+
+​		`Redis`会根据键的空闲时间对`LFU`计数进行衰减，保证过期的热点数据能够被及时淘汰。默认配置下，如果有`N`分钟没有访问该键，那么`LFU`技术就减`N`：
+
+```c++
+// evict.c
+unsigned long LFUDecrAndReturn(robj *o) {
+    unsigned long ldt = o->lru >> 8;
+    unsigned long counter = o->lru & 255;
+    // server.lfu_decay_time 默认为 1，指定 LFU 的衰减速度。LFUTimeElapsed 计算该键上次访问后过去的分钟数
+    unsigned long num_periods = server.lfu_decay_time ? LFUTimeElapsed(ldt) / server.lfu_decay_time : 0;
+    if (num_periods)
+        counter = (num_periods > counter) ? 0 : counter - num_periods;
+    return counter;
+}
+```
+
+​		`redisObject.lru`实现了一种概率计数器，使`8 bit`可以存储上百万次的访问频率：
+
+```c++
+// evict.c
+uint8_t LFULogIncr(uint8_t counter) {
+    if (counter == 255) return 255;
+    // 生成 0 ~ 1 范围内的随机数
+    double r = (double)rand()/RAND_MAX;
+    // 真正的访问频率
+    double baseval = counter - LFU_INIT_VAL;
+    if (baseval < 0) baseval = 0;
+    // server.lfu_log_factor 默认为 10
+    double p = 1.0/(baseval*server.lfu_log_factor+1);
+    // 此处判断，使得访问次数越多，redisObject.lru增长的越来越慢
+    if (r < p) counter++;
+    return counter;
+}
+```
+
+
+
+##### 淘汰算法
+
+​		`processCommand`执行`Redis`命令之前，调用`performEvictions`淘汰数据：
+
+```c++
+// evict.c
+int performEvictions(void) {
+    
+    ...
+	
+    // 获取当前内存使用量并判断是否需要淘汰数据
+    if (getMaxmemoryState(&mem_reported,NULL,&mem_tofree,NULL) == C_OK)
+        return EVICT_OK;
+
+    ...
+
+    while (mem_freed < (long long)mem_tofree) {
+        
+        ...
+
+        // 处理 LRU、LFU 或 MAXMEMORY_VOLATILE_TTL 算法
+        if (server.maxmemory_policy & (MAXMEMORY_FLAG_LRU|MAXMEMORY_FLAG_LFU) ||
+            server.maxmemory_policy == MAXMEMORY_VOLATILE_TTL)
+        {
+            struct evictionPoolEntry *pool = EvictionPoolLRU;
+
+            while(bestkey == NULL) {
+                unsigned long total_keys = 0, keys;
+                for (i = 0; i < server.dbnum; i++) {
+                    db = server.db+i;
+                    dict = (server.maxmemory_policy & MAXMEMORY_FLAG_ALLKEYS) ?
+                            db->dict : db->expires;
+                    if ((keys = dictSize(dict)) != 0) {
+                        // 从给定的数据库（数据字典或过期字典）中采取样本集填充到样本池中。样本池中的数据按淘汰优先级排序，越优先淘汰的数据越在后面
+                        evictionPoolPopulate(i, dict, db->dict, pool);
+                        total_keys += keys;
+                    }
+                }
+                if (!total_keys) break; /* No keys to evict. */
+
+                /* Go backward from best to worst element to evict. */
+                // 从样本池中获取淘汰优先级最高的数据作为待淘汰键
+                for (k = EVPOOL_SIZE-1; k >= 0; k--) {
+                    if (pool[k].key == NULL) continue;
+                    bestdbid = pool[k].dbid;
+
+                    if (server.maxmemory_policy & MAXMEMORY_FLAG_ALLKEYS) {
+                        de = dictFind(server.db[pool[k].dbid].dict,
+                            pool[k].key);
+                    } else {
+                        de = dictFind(server.db[pool[k].dbid].expires,
+                            pool[k].key);
+                    }
+
+                    /* Remove the entry from the pool. */
+                    if (pool[k].key != pool[k].cached)
+                        sdsfree(pool[k].key);
+                    pool[k].key = NULL;
+                    pool[k].idle = 0;
+
+                    /* If the key exists, is our pick. Otherwise it is
+                     * a ghost and we need to try the next element. */
+                    if (de) {
+                        bestkey = dictGetKey(de);
+                        break;
+                    } else {
+                        /* Ghost... Iterate again. */
+                    }
+                }
+            }
+        }
+
+        /* volatile-random and allkeys-random policy */
+        // 如果使用的是随机淘汰算法，则从指定的数据集中随机选择一个键作为待淘汰键
+        else if (server.maxmemory_policy == MAXMEMORY_ALLKEYS_RANDOM ||
+                 server.maxmemory_policy == MAXMEMORY_VOLATILE_RANDOM)
+        {
+            /* When evicting a random key, we try to evict a key for
+             * each DB, so we use the static 'next_db' variable to
+             * incrementally visit all DBs. */
+            for (i = 0; i < server.dbnum; i++) {
+                j = (++next_db) % server.dbnum;
+                db = server.db+j;
+                dict = (server.maxmemory_policy == MAXMEMORY_ALLKEYS_RANDOM) ?
+                        db->dict : db->expires;
+                if (dictSize(dict) != 0) {
+                    de = dictGetRandomKey(dict);
+                    bestkey = dictGetKey(de);
+                    bestdbid = j;
+                    break;
+                }
+            }
+        }
+
+        /* Finally remove the selected key. */
+        // 删除待淘汰键
+        if (bestkey) {
+            db = server.db+bestdbid;
+            robj *keyobj = createStringObject(bestkey,sdslen(bestkey));
+            propagateExpire(db,keyobj,server.lazyfree_lazy_eviction);
+            
+            delta = (long long) zmalloc_used_memory();
+            latencyStartMonitor(eviction_latency);
+            if (server.lazyfree_lazy_eviction)
+                dbAsyncDelete(db,keyobj);
+            else
+                dbSyncDelete(db,keyobj);
+            ...            
+        } else {
+            goto cant_free; /* nothing to free... */
+        }
+    }
+    /* at this point, the memory is OK, or we have reached the time limit */
+    result = (isEvictionProcRunning) ? EVICT_RUNNING : EVICT_OK;
+	...
+}
+
+
+void evictionPoolPopulate(int dbid, dict *sampledict, dict *keydict, struct evictionPoolEntry *pool) {
+    int j, k, count;
+    dictEntry *samples[server.maxmemory_samples];
+	// 从数据集中获取随机采样数据，server.maxmemory_samples 指定采样数据的数量，默认为 5，在 server.maxmemory_samples 等于 10 的情况下，Redis 的LRU 算法已经很接近于理想 LRU 算法的表现
+    count = dictGetSomeKeys(sampledict,samples,server.maxmemory_samples);
+    for (j = 0; j < count; j++) {
+        unsigned long long idle;
+        sds key;
+        robj *o;
+        dictEntry *de;
+		// 获取样本数据对应的键值对
+        de = samples[j];
+        key = dictGetKey(de);
+
+        if (server.maxmemory_policy != MAXMEMORY_VOLATILE_TTL) {
+            if (sampledict != keydict) de = dictFind(keydict, key);
+            o = dictGetVal(de);
+        }
+
+        // 计算淘汰优先级 idle，idle 越大，淘汰优先级越高
+        if (server.maxmemory_policy & MAXMEMORY_FLAG_LRU) {
+            // 使用 LRU 算法，idle 为键空闲时间
+            idle = estimateObjectIdleTime(o);
+        } else if (server.maxmemory_policy & MAXMEMORY_FLAG_LFU) {
+			// 使用 LFU 算法，idle 为 255 减去 LFU 计数
+            idle = 255-LFUDecrAndReturn(o);
+        } else if (server.maxmemory_policy == MAXMEMORY_VOLATILE_TTL) {
+            /* In this case the sooner the expire the better. */
+            // 使用 MAXMEMORY_VOLATILE_TTL 算法，则 sampledict 字典为过期字典，此时键值对的值时该键的过期时间
+            idle = ULLONG_MAX - (long)dictGetVal(de);
+        } else {
+            serverPanic("Unknown eviction policy in evictionPoolPopulate()");
+        }
+
+        // 将样本数据加入样本池
+        ...
+    }
+}
+```
 
 
 
