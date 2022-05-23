@@ -32067,6 +32067,497 @@ void evictionPoolPopulate(int dbid, dict *sampledict, dict *keydict, struct evic
 
 
 
+### Stream
+
+#### listpack
+
+​		`listpack`是对`ziplist`结构的优化，也是类似数组的紧凑型链表格式，它会申请一整块内存，在该内存区域上存放链表的所有数据：
+
+```xml
+<lpbytes><lpnumbers><entry><entry>...<entry>
+```
+
+​		`lpbytes`：`listpack`占用的字节数量。
+
+​		`lpnumbers`：`listpack`中存储的元素数量。
+
+​		`entry`：`listpack`节点，内容为：`<encode><val><backlen>`。
+
+​				`encode`：节点编码格式，包含编码类型及节点元素长度或节点元素`(LP_ENCODING_INT`编码的节点元素保存在`encode`中`)`。
+
+​				`val`：节点元素，即节点存储的数据。
+
+​				`backlen`：反向遍历时使用的节点长度。
+
+​		`ziplist`中，每个节点都会记录前驱节点长度，以便支持反向遍历链表，而在`listpack`中，在节点尾部使用`backlen`属性记录当前节点长度，从而支持反向
+
+遍历链表。
+
+​		`lpInsert`负责将元素插入到`listpack`中：
+
+```c++
+// listpack.c
+unsigned char *lpInsert(unsigned char *lp, unsigned char *ele, uint32_t size, unsigned char *p, int where, unsigned char **newp) {
+    unsigned char intenc[LP_MAX_INT_ENCODING_LEN];
+    unsigned char backlen[LP_MAX_BACKLEN_SIZE];
+
+    uint64_t enclen; /* The length of the encoded element. */
+
+    // 如果插入元素为 NULL，实际上是删除元素
+    if (ele == NULL) where = LP_REPLACE;
+	// 在插入位置的后面插入元素，则找到后驱节点，将插入操作调整为 LP_BEFORE
+    if (where == LP_AFTER) {
+        p = lpSkip(p);
+        where = LP_BEFORE;
+        ASSERT_INTEGRITY(lp, p);
+    }
+
+    unsigned long poff = p-lp;
+
+    // 对插入内容进行编码，编码存储在 intenc，元素长度存储在 enclen
+    int enctype;
+    if (ele) {
+        enctype = lpEncodeGetType(ele,size,intenc,&enclen);
+    } else {
+        enctype = -1;
+        enclen = 0;
+    }
+
+    // 将 enclen 转化为 backlen 属性，并将其记录在 backlen 参数中，返回 backlen 属性占用的字节数
+    unsigned long backlen_size = ele ? lpEncodeBacklen(backlen,enclen) : 0;
+    // 计算新的 listpack 占用的空间 new_listpack_bytes
+    uint64_t old_listpack_bytes = lpGetTotalBytes(lp);
+    uint32_t replaced_len  = 0;
+    if (where == LP_REPLACE) {
+        replaced_len = lpCurrentEncodedSizeUnsafe(p);
+        replaced_len += lpEncodeBacklen(NULL,replaced_len);
+        ASSERT_INTEGRITY_LEN(lp, p, replaced_len);
+    }
+
+    uint64_t new_listpack_bytes = old_listpack_bytes + enclen + backlen_size
+                                  - replaced_len;
+    if (new_listpack_bytes > UINT32_MAX) return NULL;
+
+    unsigned char *dst = lp + poff; /* May be updated after reallocation. */
+
+    /* Realloc before: we need more room. */
+    // 如果新的空间大于原来的空间
+    if (new_listpack_bytes > old_listpack_bytes &&
+        new_listpack_bytes > lp_malloc_size(lp)) {
+        // 申请新的空间
+        if ((lp = lp_realloc(lp,new_listpack_bytes)) == NULL) return NULL;
+        dst = lp + poff;
+    }
+
+    // 如果是插入元素，则将插入位置后面的元素后移
+    if (where == LP_BEFORE) {
+        memmove(dst+enclen+backlen_size,dst,old_listpack_bytes-poff);
+    } else { /* LP_REPLACE. */
+        // 替换元素，调整替换元素的大小
+        long lendiff = (enclen+backlen_size)-replaced_len;
+        memmove(dst+replaced_len+lendiff,
+                dst+replaced_len,
+                old_listpack_bytes-poff-replaced_len);
+    }
+
+    /* Realloc after: we need to free space. */
+    // 新的空间小于原来的空间
+    if (new_listpack_bytes < old_listpack_bytes) {
+        // 调整 listpack 的大小
+        if ((lp = lp_realloc(lp,new_listpack_bytes)) == NULL) return NULL;
+        dst = lp + poff;
+    }
+
+    /* Store the entry. */
+    // 将新元素插入 des 位置
+    if (newp) {
+        *newp = dst;
+        /* In case of deletion, set 'newp' to NULL if the next element is
+         * the EOF element. */
+        if (!ele && dst[0] == LP_EOF) *newp = NULL;
+    }
+    if (ele) {
+        // 将插入元素内容保存到 listpack 中
+        // 如果插入内容是数值编码，插入元素已经保存到 intenc 变量中，直接将 intenc 变量写入 listpack
+        if (enctype == LP_ENCODING_INT) {
+            memcpy(dst,intenc,enclen);
+        } else {
+            // 依次写入元素编码和元素内容
+            lpEncodeString(dst,ele,size);
+        }
+        // 写入 backlen 属性
+        dst += enclen;
+        memcpy(dst,backlen,backlen_size);
+        dst += backlen_size;
+    }
+
+    /* Update header. */
+    // 更新 listpack 中的 lpbytes、lpnumbers 属性
+    if (where != LP_REPLACE || ele == NULL) {
+        uint32_t num_elements = lpGetNumElements(lp);
+        if (num_elements != LP_HDR_NUMELE_UNKNOWN) {
+            if (ele)
+                lpSetNumElements(lp,num_elements+1);
+            else
+                lpSetNumElements(lp,num_elements-1);
+        }
+    }
+    lpSetTotalBytes(lp,new_listpack_bytes);
+	
+    ...
+    
+    return lp;
+}
+```
+
+
+
+##### 编码
+
+|               元素内容               |      编码类型      |   intenc格式   |     enclen     |
+| :----------------------------------: | :----------------: | :------------: | :------------: |
+|         数值范围（0 ~ 127）          |  LP_ENCODING_INT   |     0XXXXX     |       1        |
+|       数值范围（-4096 ~ 4095）       |  LP_ENCODING_INT   |  110XXXXX...   |       2        |
+|      数值范围（-32768 ~ 32767）      |  LP_ENCODING_INT   | 11110001XXX... |       3        |
+|    数值范围（-8388608 ~ 8388607）    |  LP_ENCODING_INT   | 11110010XXX... |       4        |
+| 数值范围（-2147483648 ~ 2147483647） |  LP_ENCODING_INT   | 11110011XXX... |       5        |
+|           数值范围（其他）           |  LP_ENCODING_INT   | 11110111XXX... |       6        |
+|           字符串长度 < 64            | LP_ENCODING_STRING |    10XXXXXX    | 字符串长度 + 1 |
+|          字符串长度 < 4096           | LP_ENCODING_STRING | 1110XXXXXXX... | 字符串长度 + 2 |
+|          字符串长度 >= 4096          | LP_ENCODING_STRING | 11110000XXX... | 字符串长度 + 5 |
+
+​		`lpEncodeBacklen`将`enclen`转换为`backlen`，将`enclen`的每`7`个`bit`划分为一组，保存到`backlen`的一个字节中，并且将字节序倒转。
+
+
+
+#### Rax
+
+​		`Rax`也称为基数树，可以存放键值对，并且可以对键的内容进行压缩。如果多个节点中只有一个子节点`(`并且这些节点只有第一个节点可以错位键`)`，则将
+
+它们压缩到一个节点中。
+
+```c++
+// rax.h
+typedef struct raxNode {
+    uint32_t iskey:1; // 该节点是否为键
+    uint32_t isnull:1; // 该节点的值是否指向 NULL
+    uint32_t iscompr:1; // 该节点是否为压缩节点
+    uint32_t size:29; // 子节点数量或者压缩字符数量
+    unsigned char data[]; // 存放节点字符，子节点指针，值指针
+} raxNode;
+```
+
+​		非压缩节点，`data`的内容：
+
+```c++
+[header][abc][a-ptr][b-ptr][c-prt](value-ptr?)
+```
+
+​		压缩节点只有一个子节点，`data`的内容：
+
+```c++
+[header][xyz][ptr](value-ptr?)
+```
+
+
+
+##### 插入
+
+​		插入节点：插入键与`Rax`键第一个不匹配字符所在节点。
+
+​		冲突位置：该不匹配字符在插入节点中的索引。如果插入节点不是压缩节点，则冲突位置固定为`0`。
+
+​		`4`种情况：
+
+​				1、`Rax`中已存在插入键内容，并且插入节点不是压缩节点`(`或者插入节点是压缩节点，但冲突位置为`0)`。
+
+​				2、`Rax`中已存在插入键内容，但插入节点是压缩节点`(`并且冲突位置不等于`0)`。
+
+​				3、`Rax`中不存在插入键内容，并且冲突位置在压缩节点中。
+
+​				4、`Rax`中不存在插入键内容，但冲突位置不在压缩节点中。
+
+```c++
+int raxGenericInsert(rax *rax, unsigned char *s, size_t len, void *data, void **old, int overwrite) {
+    size_t i;
+    int j = 0; 
+    raxNode *h, **parentlink;
+
+    debugf("### Insert %.*s with value %p\n", (int)len, s, data);
+    // 查找 Rax 中是否存在插入键，返回匹配字节的数量，h：插入节点；j：冲突位置；parentlink：插入节点的父节点必然存在一个子节点指针指向插入节点，parentlink指向该子节点指针。修改该位置的内容，可以变成父节点的子节点
+    i = raxLowWalk(rax,s,len,&h,&parentlink,&j,NULL);
+
+    // 处理第 1 种情况
+    if (i == len && (!h->iscompr || j == 0 /* not in the middle if j is 0 */)) {
+        debugf("### Insert: node representing key exists\n");
+        /* Make space for the value pointer if needed. */
+        // 如果插入节点不是键，则为该节点重新分配内存空间，将插入值设置为该节点的值
+        if (!h->iskey || (h->isnull && overwrite)) {
+            h = raxReallocForData(h,data);
+            if (h) memcpy(parentlink,&h,sizeof(h));
+        }
+        if (h == NULL) {
+            errno = ENOMEM;
+            return 0;
+        }
+
+        /* Update the existing key if there is already one. */
+        // 如果插入节点本来就是键，则根据 overwrite 参数替换节点值
+        if (h->iskey) {
+            if (old) *old = raxGetData(h);
+            if (overwrite) raxSetData(h,data);
+            errno = 0;
+            return 0; /* Element already exists. */
+        }
+
+        /* Otherwise set the node as a key. Note that raxSetData()
+         * will set h->iskey. */
+        raxSetData(h,data);
+        rax->numele++;
+        return 1; /* Element inserted. */
+    }
+
+    /* ------------------------- ALGORITHM 1 --------------------------- */
+    if (h->iscompr && i != len) {
+        debugf("ALGO 1: Stopped at compressed node %.*s (%p)\n",
+            h->size, h->data, (void*)h);
+        debugf("Still to insert: %.*s\n", (int)(len-i), s+i);
+        debugf("Splitting at %d: '%c'\n", j, ((char*)h->data)[j]);
+        debugf("Other (key) letter is '%c'\n", s[i]);
+
+        /* 1: Save next pointer. */
+        // 处理第 3 种情况
+        raxNode **childfield = raxNodeLastChildPtr(h);
+        raxNode *next; // 记录插入节点的子节点，压缩节点只有一个子节点（其父节点也只有一个子节点）
+        memcpy(&next,childfield,sizeof(next));
+        debugf("Next is %p\n", (void*)next);
+        debugf("iskey %d\n", h->iskey);
+        if (h->iskey) {
+            debugf("key value is %p\n", raxGetData(h));
+        }
+
+        /* Set the length of the additional nodes we will need. */
+        // trimmedlen 为前缀节点的长度，0 代表不存在前缀节点；postfixlen 为后缀节点的长度，0 代表不存在后缀节点
+        size_t trimmedlen = j;
+        size_t postfixlen = h->size - j - 1;
+        int split_node_is_key = !trimmedlen && h->iskey && !h->isnull;
+        size_t nodesize;
+
+        /* 2: Create the split node. Also allocate the other nodes we'll need
+         *    ASAP, so that it will be simpler to handle OOM. */
+        // 初始化拆分节点 splitnode 、前缀节点 trimmed、后缀节点 postfix
+        raxNode *splitnode = raxNewNode(1, split_node_is_key);
+        raxNode *trimmed = NULL;
+        raxNode *postfix = NULL;
+
+        if (trimmedlen) {
+            nodesize = sizeof(raxNode)+trimmedlen+raxPadding(trimmedlen)+
+                       sizeof(raxNode*);
+            if (h->iskey && !h->isnull) nodesize += sizeof(void*);
+            trimmed = rax_malloc(nodesize);
+        }
+
+        if (postfixlen) {
+            nodesize = sizeof(raxNode)+postfixlen+raxPadding(postfixlen)+
+                       sizeof(raxNode*);
+            postfix = rax_malloc(nodesize);
+        }
+
+        /* OOM? Abort now that the tree is untouched. */
+        if (splitnode == NULL ||
+            (trimmedlen && trimmed == NULL) ||
+            (postfixlen && postfix == NULL))
+        {
+            rax_free(splitnode);
+            rax_free(trimmed);
+            rax_free(postfix);
+            errno = ENOMEM;
+            return 0;
+        }
+        splitnode->data[0] = h->data[j];
+
+        if (j == 0) {
+            /* 3a: Replace the old node with the split node. */
+            // 不存在前缀节点，使用拆分节点替换原来的插入节点。修改 parentlink 位置的指针就可以变更父节点对应的子节点
+            if (h->iskey) {
+                void *ndata = raxGetData(h);
+                raxSetData(splitnode,ndata);
+            }
+            memcpy(parentlink,&splitnode,sizeof(splitnode));
+        } else {
+            /* 3b: Trim the compressed node. */
+            // 存在前缀节点，给前缀节点赋值，并将拆分节点作为前缀节点的子节点，使用前缀节点替换原来的插入节点。如果插入节点是一个键，则将插入节点的节点值设置为前缀节点的节点值
+            trimmed->size = j;
+            memcpy(trimmed->data,h->data,j);
+            trimmed->iscompr = j > 1 ? 1 : 0;
+            trimmed->iskey = h->iskey;
+            trimmed->isnull = h->isnull;
+            if (h->iskey && !h->isnull) {
+                void *ndata = raxGetData(h);
+                raxSetData(trimmed,ndata);
+            }
+            raxNode **cp = raxNodeLastChildPtr(trimmed);
+            memcpy(cp,&splitnode,sizeof(splitnode));
+            memcpy(parentlink,&trimmed,sizeof(trimmed));
+            parentlink = cp; /* Set parentlink to splitnode parent. */
+            rax->numnodes++;
+        }
+
+        /* 4: Create the postfix node: what remains of the original
+         * compressed node after the split. */
+        if (postfixlen) {
+            /* 4a: create a postfix node. */
+            // 存在后缀节点，给后缀节点赋值，并将 next 节点作为后缀节点的子节点
+            postfix->iskey = 0;
+            postfix->isnull = 0;
+            postfix->size = postfixlen;
+            postfix->iscompr = postfixlen > 1;
+            memcpy(postfix->data,h->data+j+1,postfixlen);
+            raxNode **cp = raxNodeLastChildPtr(postfix);
+            memcpy(cp,&next,sizeof(next));
+            rax->numnodes++;
+        } else {
+            /* 4b: just use next as postfix node. */
+            // 不存在后缀节点，直接将 next 节点作为后缀节点
+            postfix = next;
+        }
+
+        /* 5: Set splitnode first child as the postfix node. */
+        // 将后缀节点设置为拆分节点的第一个子节点
+        raxNode **splitchild = raxNodeLastChildPtr(splitnode);
+        memcpy(splitchild,&postfix,sizeof(postfix));
+
+        /* 6. Continue insertion: this will cause the splitnode to
+         * get a new child (the non common character at the currently
+         * inserted key). */
+        rax_free(h);
+        h = splitnode;
+    } else if (h->iscompr && i == len) {
+    /* ------------------------- ALGORITHM 2 --------------------------- */
+        // 第 2 种情况
+        debugf("ALGO 2: Stopped at compressed node %.*s (%p) j = %d\n",
+            h->size, h->data, (void*)h, j);
+
+        /* Allocate postfix & trimmed nodes ASAP to fail for OOM gracefully. */
+        size_t postfixlen = h->size - j;
+        size_t nodesize = sizeof(raxNode)+postfixlen+raxPadding(postfixlen)+
+                          sizeof(raxNode*);
+        if (data != NULL) nodesize += sizeof(void*);
+        raxNode *postfix = rax_malloc(nodesize);
+
+        nodesize = sizeof(raxNode)+j+raxPadding(j)+sizeof(raxNode*);
+        if (h->iskey && !h->isnull) nodesize += sizeof(void*);
+        raxNode *trimmed = rax_malloc(nodesize);
+
+        if (postfix == NULL || trimmed == NULL) {
+            rax_free(postfix);
+            rax_free(trimmed);
+            errno = ENOMEM;
+            return 0;
+        }
+
+        /* 1: Save next pointer. */
+        raxNode **childfield = raxNodeLastChildPtr(h);
+        raxNode *next;
+        memcpy(&next,childfield,sizeof(next));
+
+        /* 2: Create the postfix node. */
+        postfix->size = postfixlen;
+        postfix->iscompr = postfixlen > 1;
+        postfix->iskey = 1;
+        postfix->isnull = 0;
+        memcpy(postfix->data,h->data+j,postfixlen);
+        raxSetData(postfix,data);
+        raxNode **cp = raxNodeLastChildPtr(postfix);
+        memcpy(cp,&next,sizeof(next));
+        rax->numnodes++;
+
+        /* 3: Trim the compressed node. */
+        trimmed->size = j;
+        trimmed->iscompr = j > 1;
+        trimmed->iskey = 0;
+        trimmed->isnull = 0;
+        memcpy(trimmed->data,h->data,j);
+        memcpy(parentlink,&trimmed,sizeof(trimmed));
+        if (h->iskey) {
+            void *aux = raxGetData(h);
+            raxSetData(trimmed,aux);
+        }
+
+        /* Fix the trimmed node child pointer to point to
+         * the postfix node. */
+        cp = raxNodeLastChildPtr(trimmed);
+        memcpy(cp,&postfix,sizeof(postfix));
+
+        /* Finish! We don't need to continue with the insertion
+         * algorithm for ALGO 2. The key is already inserted. */
+        rax->numele++;
+        rax_free(h);
+        return 1; /* Key inserted. */
+    }
+
+    /* We walked the radix tree as far as we could, but still there are left
+     * chars in our string. We need to insert the missing nodes. */
+    while(i < len) {
+        raxNode *child;
+
+        /* If this node is going to have a single child, and there
+         * are other characters, so that that would result in a chain
+         * of single-childed nodes, turn it into a compressed node. */
+        // 插入节点 h 是空节点（即没有哦子节点的节点，通常为新节点），并且待插入的字符大于 1，将所有待插入字符插入到节点 h 中（h 节点成为压缩节点），并生成新的空子节点
+        if (h->size == 0 && len-i > 1) {
+            debugf("Inserting compressed node\n");
+            size_t comprsize = len-i;
+            if (comprsize > RAX_NODE_MAX_SIZE)
+                comprsize = RAX_NODE_MAX_SIZE;
+            raxNode *newh = raxCompressNode(h,s+i,comprsize,&child);
+            if (newh == NULL) goto oom;
+            h = newh;
+            memcpy(parentlink,&h,sizeof(h));
+            parentlink = raxNodeLastChildPtr(h);
+            i += comprsize;
+        } else {
+            debugf("Inserting normal node\n");
+            // 给插入节点 h 添加一个节点字符 s[i]，并生成新的子节点， child 指向生成的子节点
+            raxNode **new_parentlink;
+            raxNode *newh = raxAddChild(h,s[i],&child,&new_parentlink);
+            if (newh == NULL) goto oom;
+            h = newh;
+            memcpy(parentlink,&h,sizeof(h));
+            // 将 h 节点重新设置为插入节点父节点的子节点，因为插入过程中要重新申请内存空间，h 指针会变化
+            parentlink = new_parentlink;
+            i++;
+        }
+        rax->numnodes++;
+        // 将插入节点 h 指向新的空节点，继续处理插入键的剩余字符
+        h = child;
+    }
+    // 插入键不匹配的内容已经插入完成，h 指向最后生成的空节点，此时将插入值设置为空节点的节点值
+    raxNode *newh = raxReallocForData(h,data);
+    if (newh == NULL) goto oom;
+    h = newh;
+    if (!h->iskey) rax->numele++;
+    raxSetData(h,data);
+    memcpy(parentlink,&h,sizeof(h));
+    return 1; /* Element inserted. */
+
+oom:
+    /* This code path handles out of memory after part of the sub-tree was
+     * already modified. Set the node as a key, and then remove it. However we
+     * do that only if the node is a terminal node, otherwise if the OOM
+     * happened reallocating a node in the middle, we don't need to free
+     * anything. */
+    if (h->size == 0) {
+        h->isnull = 1;
+        h->iskey = 1;
+        rax->numele++; /* Compensate the next remove. */
+        assert(raxRemove(rax,s,i,NULL) != 0);
+    }
+    errno = ENOMEM;
+    return 0;
+}
+```
+
 
 
 
