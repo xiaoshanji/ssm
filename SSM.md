@@ -32091,7 +32091,7 @@ void evictionPoolPopulate(int dbid, dict *sampledict, dict *keydict, struct evic
 
 ​		`ziplist`中，每个节点都会记录前驱节点长度，以便支持反向遍历链表，而在`listpack`中，在节点尾部使用`backlen`属性记录当前节点长度，从而支持反向
 
-遍历链表。
+遍历链表，避免级联更新。
 
 ​		`lpInsert`负责将元素插入到`listpack`中：
 
@@ -32542,11 +32542,7 @@ int raxGenericInsert(rax *rax, unsigned char *s, size_t len, void *data, void **
     return 1; /* Element inserted. */
 
 oom:
-    /* This code path handles out of memory after part of the sub-tree was
-     * already modified. Set the node as a key, and then remove it. However we
-     * do that only if the node is a terminal node, otherwise if the OOM
-     * happened reallocating a node in the middle, we don't need to free
-     * anything. */
+
     if (h->size == 0) {
         h->isnull = 1;
         h->iskey = 1;
@@ -32559,6 +32555,418 @@ oom:
 ```
 
 
+
+#### Stream结构 
+
+​		消息流类型也是在`redisObject`中存储的，`redisObject.ptr`指向`stream`结构体：
+
+```c++
+// stream.h
+typedef struct stream {
+    rax *rax; // 存放消息内容，键为消息 ID，值指向 listpack
+    uint64_t length; // 消息流中消息的数量
+    streamID last_id; // 最新的消息 ID
+    rax *cgroups; // 存放消费组，键为消费者名，值指向 streamCG 变量
+} stream;
+```
+
+​		`stream.rax`中的`Rax`键存放消息`ID`，由于消息`ID`以时间戳开头，前缀会大量重复，所以可以大量节省内存。值指向`listpack`，而键是`listpack`中最小的
+
+消息`ID`。
+
+​		`steramID`结构体负责存储消息`ID`：
+
+```c++
+// stream.h
+typedef struct streamID {
+    uint64_t ms; // 毫秒级别的时间戳
+    uint64_t seq; // 序号，如果一毫秒内添加多条消息，则增加序号
+} streamID;
+```
+
+```c++
+// stream.h
+typedef struct streamCG {
+    streamID last_id; // 该消费组最新读取的消息 ID
+    rax *pel; // 该消费组中所有待确认的消息
+    rax *consumers; // 该消费组中所有消费者，键为消费者名称，值指向 streamConsumer
+} streamCG;
+```
+
+```c++
+// stream.h
+typedef struct streamConsumer {
+    mstime_t seen_time; // 该消费者上次活跃时间
+    sds name; // 消费者名称
+    rax *pel; // 归属该消费者的所有待确认消息
+} streamConsumer;
+```
+
+​		`streamCG.pel`与`streamConsumer.pel`的键是消息`ID`，值指向`streamNACK`：
+
+```c++
+// stream.h
+typedef struct streamNACK {
+    mstime_t delivery_time; // 消息发送给消费者的最新时间
+    uint64_t delivery_count; // 消息发送给消费者的次数
+    streamConsumer *consumer; // 消息属于哪个消费者
+} streamNACK;
+```
+
+
+
+##### 插入
+
+​		`XADD`会将新的消息追加到`stream.rax`中的`listpack`中，该命令由`xaddCommand`处理：
+
+```c++
+// t_stream.c
+void xaddCommand(client *c) {
+    /* Parse options. */
+    streamAddTrimArgs parsed_args;
+    int idpos = streamParseAddOrTrimArgsOrReply(c, &parsed_args, 1);
+    if (idpos < 0)
+        return; /* streamParseAddOrTrimArgsOrReply already replied. */
+    int field_pos = idpos+1; /* The ID is always one argument before the first field */
+
+    /* Check arity. */
+    if ((c->argc - field_pos) < 2 || ((c->argc-field_pos) % 2) == 1) {
+        addReplyError(c,"wrong number of arguments for XADD");
+        return;
+    }
+
+    /* Return ASAP if minimal ID (0-0) was given so we avoid possibly creating
+     * a new stream and have streamAppendItem fail, leaving an empty key in the
+     * database. */
+    if (parsed_args.id_given &&
+        parsed_args.id.ms == 0 && parsed_args.id.seq == 0)
+    {
+        addReplyError(c,"The ID specified in XADD must be greater than 0-0");
+        return;
+    }
+
+    /* Lookup the stream at key. */
+    robj *o;
+    stream *s;
+    if ((o = streamTypeLookupWriteOrCreate(c,c->argv[1],parsed_args.no_mkstream)) == NULL) return;
+    s = o->ptr;
+
+    /* Return ASAP if the stream has reached the last possible ID */
+    if (s->last_id.ms == UINT64_MAX && s->last_id.seq == UINT64_MAX) {
+        addReplyError(c,"The stream has exhausted the last possible ID, "
+                        "unable to add more items");
+        return;
+    }
+
+    /* Append using the low level function and return the ID. */
+    // 插入一个消息到消息流中，s 为消息流对应的 stream 结构体
+    streamID id;
+    if (streamAppendItem(s,c->argv+field_pos,(c->argc-field_pos)/2,
+        &id, parsed_args.id_given ? &parsed_args.id : NULL) == C_ERR)
+    {
+        if (errno == EDOM)
+            addReplyError(c,"The ID specified in XADD is equal or smaller than "
+                            "the target stream top item");
+        else
+            addReplyError(c,"Elements are too large to be stored");
+        return;
+    }
+    addReplyStreamID(c,&id);
+
+    signalModifiedKey(c,c->db,c->argv[1]);
+    notifyKeyspaceEvent(NOTIFY_STREAM,"xadd",c->argv[1],c->db->id);
+    server.dirty++;
+
+    /* Trim if needed. */
+    if (parsed_args.trim_strategy != TRIM_STRATEGY_NONE) {
+        if (streamTrim(s, &parsed_args)) {
+            notifyKeyspaceEvent(NOTIFY_STREAM,"xtrim",c->argv[1],c->db->id);
+        }
+        if (parsed_args.approx_trim) {
+            
+            streamRewriteApproxSpecifier(c,parsed_args.trim_strategy_arg_idx-1);
+            streamRewriteTrimArgument(c,s,parsed_args.trim_strategy,parsed_args.trim_strategy_arg_idx);
+        }
+    }
+
+    /* Let's rewrite the ID argument with the one actually generated for
+     * AOF/replication propagation. */
+    robj *idarg = createObjectFromStreamID(&id);
+    rewriteClientCommandArgument(c,idpos,idarg);
+    decrRefCount(idarg);
+
+    /* We need to signal to blocked clients that there is new data on this
+     * stream. */
+    signalKeyAsReady(c->db, c->argv[1], OBJ_STREAM);
+}
+```
+
+​		`Stream`认为一个消息流中所有消息的属性基本是相同的，所以在每个`listpack`的开始位置记录一个**主条目**，该主条目包含了第一个消息的所有属性名，如果
+
+后续消息属性与主条目中的属性相同，则只需要记录这些消息的值，不需要记录属性名，从而节省了内存。
+
+```c++
+// t_steam.c
+int streamAppendItem(stream *s, robj **argv, int64_t numfields, streamID *added_id, streamID *use_id) {
+
+    /* Generate the new entry ID. */
+    // 如果用户指定了消息 ID，则使用指定的 ID，否则生成消息 ID
+    streamID id;
+    if (use_id)
+        id = *use_id;
+    else
+        streamNextID(&s->last_id,&id);
+
+    // 检查新消息 ID 是否比之前的消息 ID 都大，如果不是，则不允许插入
+    if (streamCompareID(&id,&s->last_id) <= 0) {
+        errno = EDOM;
+        return C_ERR;
+    }
+
+    size_t totelelen = 0;
+    for (int64_t i = 0; i < numfields*2; i++) {
+        sds ele = argv[i]->ptr;
+        totelelen += sdslen(ele);
+    }
+    if (totelelen > STREAM_LISTPACK_MAX_SIZE) {
+        errno = ERANGE;
+        return C_ERR;
+    }
+
+    /* Add the new entry. */
+    // 从 stream.rax 中找到最大的键，以及对应的 listpack
+    raxIterator ri;
+    raxStart(&ri,s->rax); // 初始化一个 Rax 迭代器
+    raxSeek(&ri,"$",NULL,0); // 定位特定的 Rax 节点，此时会给 Rax 迭代器添加一个 RAX_ITER_JUST_SEEKED 标志
+
+    size_t lp_bytes = 0;        /* Total bytes in the tail listpack. */
+    unsigned char *lp = NULL;   /* Tail listpack pointer. */
+
+	// 查找下一个节点，如果发现 RAX_ITER_JUST_SEEKED 则清除该标志，并退出，不会查找下一个节点
+    if (raxNext(&ri)) {
+        lp = ri.data;
+        lp_bytes = lpBytes(lp);
+    }
+    raxStop(&ri);
+
+    uint64_t rax_key[2];    /* Key in the radix tree containing the listpack.*/
+    streamID master_id;     /* ID of the master entry in the listpack. */
+
+    // 如果 listpack 的大小大于或等于 server.stream_node_max_bytes，或者 listpack 存放消息的数量大于或等于 server.stream_node_max_entries ，则认为该 listpck 已满，需要将新消息放置到新的 listpack 中
+    if (lp != NULL) {
+        size_t node_max_bytes = server.stream_node_max_bytes;
+        if (node_max_bytes == 0 || node_max_bytes > STREAM_LISTPACK_MAX_SIZE)
+            node_max_bytes = STREAM_LISTPACK_MAX_SIZE;
+        if (lp_bytes + totelelen >= node_max_bytes) {
+            lp = NULL;
+        } else if (server.stream_node_max_entries) {
+            unsigned char *lp_ele = lpFirst(lp);
+            /* Count both live entries and deleted ones. */
+            int64_t count = lpGetInteger(lp_ele) + lpGetInteger(lpNext(lp,lp_ele));
+            if (count >= server.stream_node_max_entries) {
+                /* Shrink extra pre-allocated memory */
+                lp = lpShrinkToFit(lp);
+                if (ri.data != lp)
+                    raxInsert(s->rax,ri.key,ri.key_len,lp,NULL);
+                lp = NULL;
+            }
+        }
+    }
+
+    // 如果 listpack 为空，则创建一个新的 listpack ，并生成主条目
+    int flags = STREAM_ITEM_FLAG_NONE;
+    if (lp == NULL) {
+        master_id = id;
+        streamEncodeID(rax_key,&id);
+
+        size_t prealloc = STREAM_LISTPACK_MAX_PRE_ALLOCATE;
+        if (server.stream_node_max_bytes > 0 && server.stream_node_max_bytes < prealloc) {
+            prealloc = server.stream_node_max_bytes;
+        }
+        lp = lpNew(prealloc);
+        lp = lpAppendInteger(lp,1); /* One item, the one we are adding. */
+        lp = lpAppendInteger(lp,0); /* Zero deleted so far. */
+        lp = lpAppendInteger(lp,numfields);
+        for (int64_t i = 0; i < numfields; i++) {
+            sds field = argv[i*2]->ptr;
+            lp = lpAppend(lp,(unsigned char*)field,sdslen(field));
+        }
+        lp = lpAppendInteger(lp,0); /* Master entry zero terminator. */
+        raxInsert(s->rax,(unsigned char*)&rax_key,sizeof(rax_key),lp,NULL);
+
+        // 代表当前插入消息属性与主条目一致
+        flags |= STREAM_ITEM_FLAG_SAMEFIELDS;
+    } else {
+        // 将消息添加到当前 listpack 中
+        serverAssert(ri.key_len == sizeof(rax_key));
+        memcpy(rax_key,ri.key,sizeof(rax_key));
+
+        /* Read the master ID from the radix tree key. */
+        // 获取 master_id，即 Rax 中指向当前 listpack 的键，该键是当前 listpack 中最小的消息 ID
+        streamDecodeID(rax_key,&master_id);
+        unsigned char *lp_ele = lpFirst(lp);
+
+        /* Update count and skip the deleted fields. */
+        int64_t count = lpGetInteger(lp_ele);
+        lp = lpReplaceInteger(lp,&lp_ele,count+1); // 将主条目中的 count 属性加 1，代表新增了一个消息
+        lp_ele = lpNext(lp,lp_ele); /* seek deleted. */
+        lp_ele = lpNext(lp,lp_ele); /* seek master entry num fields. */
+
+        /* Check if the entry we are adding, have the same fields
+         * as the master entry. */
+        int64_t master_fields_count = lpGetInteger(lp_ele);
+        lp_ele = lpNext(lp,lp_ele);
+        if (numfields == master_fields_count) {
+            int64_t i;
+            // 将插入消息的所有属性与主条目的属性进行对比
+            for (i = 0; i < master_fields_count; i++) {
+                sds field = argv[i*2]->ptr;
+                int64_t e_len;
+                unsigned char buf[LP_INTBUF_SIZE];
+                unsigned char *e = lpGet(lp_ele,&e_len,buf);
+                /* Stop if there is a mismatch. */
+                if (sdslen(field) != (size_t)e_len ||
+                    memcmp(e,field,e_len) != 0) break;
+                lp_ele = lpNext(lp,lp_ele);
+            }
+            /* All fields are the same! We can compress the field names
+             * setting a single bit in the flags. */
+            // 如果属性完全相等
+            if (i == master_fields_count) flags |= STREAM_ITEM_FLAG_SAMEFIELDS;
+        }
+    }
+
+	// 将信息内容写到 listpack 中
+    lp = lpAppendInteger(lp,flags);
+    lp = lpAppendInteger(lp,id.ms - master_id.ms);
+    lp = lpAppendInteger(lp,id.seq - master_id.seq);
+    if (!(flags & STREAM_ITEM_FLAG_SAMEFIELDS))
+        lp = lpAppendInteger(lp,numfields);
+    for (int64_t i = 0; i < numfields; i++) {
+        sds field = argv[i*2]->ptr, value = argv[i*2+1]->ptr;
+        if (!(flags & STREAM_ITEM_FLAG_SAMEFIELDS))
+            lp = lpAppend(lp,(unsigned char*)field,sdslen(field));
+        lp = lpAppend(lp,(unsigned char*)value,sdslen(value));
+    }
+    /* Compute and store the lp-count field. */
+    // 计算 lp_count
+    int64_t lp_count = numfields;
+    lp_count += 3; /* Add the 3 fixed fields flags + ms-diff + seq-diff. */
+    if (!(flags & STREAM_ITEM_FLAG_SAMEFIELDS)) {
+        /* If the item is not compressed, it also has the fields other than
+         * the values, and an additional num-fileds field. */
+        lp_count += numfields+1;
+    }
+    lp = lpAppendInteger(lp,lp_count);
+
+
+    // 如果 lp 与原来的 Rax 值不一致，则将消息 ID、listpack 的最新指针插入 Rax 中
+    if (ri.data != lp)
+        raxInsert(s->rax,(unsigned char*)&rax_key,sizeof(rax_key),lp,NULL);
+    s->length++;
+    s->last_id = id;
+    if (added_id) *added_id = id;
+    return C_OK;
+}
+```
+
+
+
+##### 读取
+
+```c++
+// t_stream.c
+size_t streamReplyWithRange(client *c, stream *s, streamID *start, streamID *end, size_t count, int rev, streamCG *group, streamConsumer *consumer, int flags, streamPropInfo *spi) {
+    void *arraylen_ptr = NULL;
+    size_t arraylen = 0;
+    streamIterator si;
+    int64_t numfields;
+    streamID id;
+    int propagate_last_id = 0;
+    int noack = flags & STREAM_RWR_NOACK;
+
+	// STREAM_RWR_HISTORY 代表 xreadgroup 命令中使用具体的消息 ID
+    if (group && (flags & STREAM_RWR_HISTORY)) {
+        // 从 streamCG.pel 中读取待确认消息
+        return streamReplyWithRangeFromConsumerPEL(c,s,start,end,count,
+                                                   consumer);
+    }
+
+    if (!(flags & STREAM_RWR_RAWENTRIES))
+        arraylen_ptr = addReplyDeferredLen(c);
+    // 从 stream.rax 中读取对应的消息内容
+    streamIteratorStart(&si,s,start,end,rev);
+    // stream.rax 中键指向 listpack 中最小的消息 ID，所以只需要找到小于或等于目标消息 ID 的最大 Rax 键，在其指向的 listpack 中遍历查找，直到找到目标消息 ID
+    while(streamIteratorGetID(&si,&id,&numfields)) {
+        /* Update the group last_id if needed. */
+        // 更新消费组的 last_id
+        if (group && streamCompareID(&id,&group->last_id) > 0) {
+            group->last_id = id;
+
+            if (noack) propagate_last_id = 1;
+        }
+
+        // 将查询消息内容写入回复缓冲区
+        addReplyArrayLen(c,2);
+        addReplyStreamID(c,&id);
+
+        addReplyArrayLen(c,numfields*2);
+
+        /* Emit the field-value pairs. */
+        while(numfields--) {
+            unsigned char *key, *value;
+            int64_t key_len, value_len;
+            streamIteratorGetField(&si,&key,&value,&key_len,&value_len);
+            addReplyBulkCBuffer(c,key,key_len);
+            addReplyBulkCBuffer(c,value,value_len);
+        }
+
+        // 创建对应的 streamNACK 并添加到 streamCG.pel、consumer.pel 中，并将 streamNACK 转换为写命令，传播到 AOF 和从节点
+        if (group && !noack) {
+            unsigned char buf[sizeof(streamID)];
+            streamEncodeID(buf,&id);
+
+            streamNACK *nack = streamCreateNACK(consumer);
+            int group_inserted =
+                raxTryInsert(group->pel,buf,sizeof(buf),nack,NULL);
+            int consumer_inserted =
+                raxTryInsert(consumer->pel,buf,sizeof(buf),nack,NULL);
+
+            if (group_inserted == 0) {
+                streamFreeNACK(nack);
+                nack = raxFind(group->pel,buf,sizeof(buf));
+                serverAssert(nack != raxNotFound);
+                raxRemove(nack->consumer->pel,buf,sizeof(buf),NULL);
+                /* Update the consumer and NACK metadata. */
+                nack->consumer = consumer;
+                nack->delivery_time = mstime();
+                nack->delivery_count = 1;
+                /* Add the entry in the new consumer local PEL. */
+                raxInsert(consumer->pel,buf,sizeof(buf),nack,NULL);
+            } else if (group_inserted == 1 && consumer_inserted == 0) {
+                serverPanic("NACK half-created. Should not be possible.");
+            }
+
+            /* Propagate as XCLAIM. */
+            if (spi) {
+                robj *idarg = createObjectFromStreamID(&id);
+                streamPropagateXCLAIM(c,spi->keyname,group,spi->groupname,idarg,nack);
+                decrRefCount(idarg);
+            }
+        }
+
+        arraylen++;
+        if (count && count == arraylen) break;
+    }
+	// 使用最新的消费组 last_id 生成写命令并传播到 AOF 和从节点
+    if (spi && propagate_last_id)
+        streamPropagateGroupID(c,spi->keyname,group,spi->groupname);
+
+    streamIteratorStop(&si);
+    if (arraylen_ptr) setDeferredArrayLen(c,arraylen_ptr,arraylen);
+    return arraylen;
+}
+```
 
 
 
