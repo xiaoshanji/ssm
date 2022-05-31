@@ -32970,6 +32970,329 @@ size_t streamReplyWithRange(client *c, stream *s, streamID *start, streamID *end
 
 
 
+### ACL
+
+​		`Redis 6`之前没有权限的概念，所有连接的客户端都可以对`Redis`中的数据进行任意操作，并使用所有高危命令。`Redis 6`开始提供访问空指针列表`ACL`，
+
+并引入用户的概念，通过管理用户可执行的命令和可访问的键，对用户权限进行细致的控制。
+
+​		`user`结构体负责存储用户信息：
+
+```c++
+// server.h
+typedef struct {
+    sds name; // 用户名
+    uint64_t flags; // 用户标识。USER_FLAG_ALLKEYS：可以访问所有的键；USER_FLAG_ALLCOMMANDS：用户可以执行所有的命令；USER_FLAG_ENABLED/USER_FLAG_DISABLED：该用户是否启用/禁用；USER_FLAG_NOPASS：用户是否可以使用任意密码认证
+
+    uint64_t allowed_commands[USER_COMMAND_BITS_COUNT/64]; // 可执行命令位图，位图中 bit 位的索引对应命令 id
+
+    sds **allowed_subcommands; // 存储可执行的子命令
+    list *passwords; // 密码列表，一个用户可以设置多个密码
+    list *patterns; // 可访问的键模式列表
+    list *channels;
+} user;
+```
+
+​		`acl.c`中定义了`Rax`类型的全局变量`Users`，键为用户名，值指向`user`变量；`client.user`属性也指向`user`变量，代表该客户端关联的用户。
+
+
+
+#### 初始化 ACL 环境
+
+​		`Redis`启动时会调用`ACLInit`函数初始化`ACL`的执行环境：
+
+```c++
+// acl.c
+void ACLInit(void) {
+    Users = raxNew();
+    UsersToLoad = listCreate();
+    ACLLog = listCreate();
+    ACLInitDefaultUser();
+}
+```
+
+​		`config.c`负责解析配置，当读取到用户规则配置时，会调用`ACLAppendUserForLoading`函数将这些配置内容添加到`acl.c/UsersToLoad`中，最后在
+
+`ACLLoadUsersAtStartup`中解析`UsersToLoad`的内容。如果`aclfile`配置项中指定了单独的用户规则的配置文件，那么`ACLLoadUsersAtStartup`也会读取并解析该
+
+文件，`ACLLoadUsersAtStartup`会调用`ACLLoadConfiguredUsers`解析用户规则配置：
+
+```c++
+// acl.c
+int ACLLoadConfiguredUsers(void) {
+    listIter li;
+    listNode *ln;
+    // 遍历并处理所有用户规则配置
+    listRewind(UsersToLoad,&li);
+    while ((ln = listNext(&li)) != NULL) {
+        sds *aclrules = listNodeValue(ln);
+        sds username = aclrules[0];
+
+        if (ACLStringHasSpaces(aclrules[0],sdslen(aclrules[0]))) {
+            serverLog(LL_WARNING,"Spaces not allowed in ACL usernames");
+            return C_ERR;
+        }
+		// 创建用户
+        user *u = ACLCreateUser(username,sdslen(username));
+        if (!u) {
+            u = ACLGetUserByName(username,sdslen(username));
+            serverAssert(u != NULL);
+            ACLSetUser(u,"reset",-1);
+        }
+
+        /* Load every rule defined for this user. */
+        // 针对该用户所有的规则配置，调用 ACLSetUser 进行处理
+        for (int j = 1; aclrules[j]; j++) {
+            if (ACLSetUser(u,aclrules[j],sdslen(aclrules[j])) != C_OK) {
+                const char *errmsg = ACLSetUserStringError();
+                serverLog(LL_WARNING,"Error loading ACL rule '%s' for "
+                                     "the user named '%s': %s",
+                          aclrules[j],aclrules[0],errmsg);
+                return C_ERR;
+            }
+        }
+
+        /* Having a disabled user in the configuration may be an error,
+         * warn about it without returning any error to the caller. */
+        if (u->flags & USER_FLAG_DISABLED) {
+            serverLog(LL_NOTICE, "The user '%s' is disabled (there is no "
+                                 "'on' modifier in the user description). Make "
+                                 "sure this is not a configuration error.",
+                      aclrules[0]);
+        }
+    }
+    return C_OK;
+}
+```
+
+​		`ACL`命令由`aclCommand`函数处理：
+
+```c++
+// acl.c
+void aclCommand(client *c) {
+    char *sub = c->argv[1]->ptr;
+    // 处理 acl setuser 子命令
+    if (!strcasecmp(sub,"setuser") && c->argc >= 3) {
+        sds username = c->argv[2]->ptr;
+        /* Check username validity. */
+        if (ACLStringHasSpaces(username,sdslen(username))) {
+            addReplyErrorFormat(c,
+                "Usernames can't contain spaces or null characters");
+            return;
+        }
+
+        // 创建一个临时用户，用户执行 acl setuser 子命令设置的所有规则，如果所有规则都执行成功，那么在应用到真实用户上，避免 setuser 子命令中只有一部分规则应用成功
+        user *tempu = ACLCreateUnlinkedUser();
+        user *u = ACLGetUserByName(username,sdslen(username));
+        if (u) ACLCopyUser(tempu, u);
+
+        /* Initially redact all of the arguments to not leak any information
+         * about the user. */
+        for (int j = 2; j < c->argc; j++) {
+            redactClientCommandArgument(c, j);
+        }
+		// 调用 ACLSetUser 应用 acl setuser 子命令的所有规则，如果某个规则处理失败，则退出函数
+        for (int j = 3; j < c->argc; j++) {
+            if (ACLSetUser(tempu,c->argv[j]->ptr,sdslen(c->argv[j]->ptr)) != C_OK) {
+                const char *errmsg = ACLSetUserStringError();
+                addReplyErrorFormat(c,
+                    "Error in ACL SETUSER modifier '%s': %s",
+                    (char*)c->argv[j]->ptr, errmsg);
+
+                ACLFreeUser(tempu);
+                return;
+            }
+        }
+
+        /* Existing pub/sub clients authenticated with the user may need to be
+         * disconnected if (some of) their channel permissions were revoked. */
+        if (u && !(tempu->flags & USER_FLAG_ALLCHANNELS))
+            ACLKillPubsubClientsIfNeeded(u,tempu->channels);
+
+        /* Overwrite the user with the temporary user we modified above. */
+        // 将临时用户信息复制到真实用户信息上，如果用户不存在，则创建一个用户
+        if (!u) u = ACLCreateUser(username,sdslen(username));
+        serverAssert(u != NULL);
+        ACLCopyUser(u, tempu);
+        ACLFreeUser(tempu);
+        addReply(c,shared.ok);
+    } 
+    ...
+}
+```
+
+```c++
+// acl.c
+// 针对 acl setuser 不同的参数进行处理
+int ACLSetUser(user *u, const char *op, ssize_t oplen) {
+    if (oplen == -1) oplen = strlen(op);
+    if (oplen == 0) return C_OK; /* Empty string is a no-operation. */
+    if (!strcasecmp(op,"on")) {
+        u->flags |= USER_FLAG_ENABLED;
+        u->flags &= ~USER_FLAG_DISABLED;
+    } else if (!strcasecmp(op,"off")) {
+        u->flags |= USER_FLAG_DISABLED;
+        u->flags &= ~USER_FLAG_ENABLED;
+    } else if (!strcasecmp(op,"skip-sanitize-payload")) {
+        u->flags |= USER_FLAG_SANITIZE_PAYLOAD_SKIP;
+        u->flags &= ~USER_FLAG_SANITIZE_PAYLOAD;
+    } else if (!strcasecmp(op,"sanitize-payload")) {
+        u->flags &= ~USER_FLAG_SANITIZE_PAYLOAD_SKIP;
+        u->flags |= USER_FLAG_SANITIZE_PAYLOAD;
+    } else if (!strcasecmp(op,"allkeys") ||
+               !strcasecmp(op,"~*"))
+    {
+        u->flags |= USER_FLAG_ALLKEYS;
+        listEmpty(u->patterns);
+    } else if (!strcasecmp(op,"resetkeys")) {
+        u->flags &= ~USER_FLAG_ALLKEYS;
+        listEmpty(u->patterns);
+    } 
+    ...
+    return C_OK;
+}
+```
+
+
+
+#### 用户权限检查
+
+​		`processCommand`在执行命令之前，会调用`ACLCheckAllPerm`检查用户权限，如果客户端关联的用户没有执行命令或访问命令键的权限，将拒绝命令并返回错
+
+误信息：
+
+```c++
+int processCommand(client *c) {
+    
+    ...
+	// 检查用户是否拥有权限执行命令或访问命令的键    
+    int acl_retval = ACLCheckAllPerm(c,&acl_errpos);
+	// 用户权限检查不通过，拒绝命令并返回错误信息
+    if (acl_retval != ACL_OK) {
+        addACLLogEntry(c,acl_retval,acl_errpos,NULL);
+        switch (acl_retval) {
+        case ACL_DENIED_CMD:
+            rejectCommandFormat(c,
+                "-NOPERM this user has no permissions to run "
+                "the '%s' command or its subcommand", c->cmd->name);
+            break;
+        case ACL_DENIED_KEY:
+            rejectCommandFormat(c,
+                "-NOPERM this user has no permissions to access "
+                "one of the keys used as arguments");
+            break;
+        case ACL_DENIED_CHANNEL:
+            rejectCommandFormat(c,
+                "-NOPERM this user has no permissions to access "
+                "one of the channels used as arguments");
+            break;
+        default:
+            rejectCommandFormat(c, "no permission");
+            break;
+        }
+        return C_OK;
+    }
+    ...
+}
+```
+
+```c++
+// acl.c
+int ACLCheckAllPerm(client *c, int *idxptr) {
+    int acl_retval = ACLCheckCommandPerm(c,idxptr);
+    if (acl_retval != ACL_OK)
+        return acl_retval;
+    if (c->cmd->proc == publishCommand)
+        acl_retval = ACLCheckPubsubPerm(c,1,1,0,idxptr);
+    else if (c->cmd->proc == subscribeCommand)
+        acl_retval = ACLCheckPubsubPerm(c,1,c->argc-1,0,idxptr);
+    else if (c->cmd->proc == psubscribeCommand)
+        acl_retval = ACLCheckPubsubPerm(c,1,c->argc-1,1,idxptr);
+    return acl_retval;
+}
+
+int ACLCheckCommandPerm(client *c, int *keyidxptr) {
+    user *u = c->user;
+    uint64_t id = c->cmd->id;
+
+    /* If there is no associated user, the connection can run anything. */
+    if (u == NULL) return ACL_OK;
+
+
+    // USER_FLAG_ALLCOMMANDS 代表用户可以执行所有命令
+    if (!(u->flags & USER_FLAG_ALLCOMMANDS) && !(c->cmd->flags & CMD_NO_AUTH))
+    {
+        /* If the bit is not set we have to check further, in case the
+         * command is allowed just with that specific subcommand. */
+        // 检查用户是否有执行该命令权限，对应的 bit 为 1 ，代表拥有权限
+        if (ACLGetUserCommandBit(u,id) == 0) {
+            /* Check if the subcommand matches. */
+            if (c->argc < 2 ||
+                u->allowed_subcommands == NULL ||
+                u->allowed_subcommands[id] == NULL)
+            {
+                return ACL_DENIED_CMD;
+            }
+			// 如果客户端发送的是子命令，则检查用户是否有执行该子命令的权限
+            long subid = 0;
+            while (1) {
+                // 遍历 allowed_subcommands ，如果找到子命令名，则允许执行子命令
+                if (u->allowed_subcommands[id][subid] == NULL)
+                    return ACL_DENIED_CMD;
+                if (!strcasecmp(c->argv[1]->ptr,
+                                u->allowed_subcommands[id][subid]))
+                    break; /* Subcommand match found. Stop here. */
+                subid++;
+            }
+        }
+    }
+
+    /* Check if the user can execute commands explicitly touching the keys
+     * mentioned in the command arguments. */
+    // USER_FLAG_ALLKEYS 代表用户可以访问所有键
+    if (!(c->user->flags & USER_FLAG_ALLKEYS) &&
+        (c->cmd->getkeys_proc || c->cmd->firstkey))
+    {
+        getKeysResult result = GETKEYS_RESULT_INIT;
+        int numkeys = getKeysFromCommand(c->cmd,c->argv,c->argc,&result);
+        int *keyidx = result.keys;
+        // 遍历命令访问的全部键，检查用户是否拥有访问权限
+        for (int j = 0; j < numkeys; j++) {
+            listIter li;
+            listNode *ln;
+            listRewind(u->patterns,&li);
+
+            /* Test this key against every pattern. */
+            int match = 0;
+            // 遍历 user.patterns 中所有的键模式，检查键是否匹配其中某个键模式
+            while((ln = listNext(&li))) {
+                sds pattern = listNodeValue(ln);
+                size_t plen = sdslen(pattern);
+                int idx = keyidx[j];
+                if (stringmatchlen(pattern,plen,c->argv[idx]->ptr,
+                                   sdslen(c->argv[idx]->ptr),0))
+                {
+                    match = 1;
+                    break;
+                }
+            }
+            if (!match) {
+                if (keyidxptr) *keyidxptr = keyidx[j];
+                getKeysFreeResult(&result);
+                return ACL_DENIED_KEY;
+            }
+        }
+        getKeysFreeResult(&result);
+    }
+
+    /* If we survived all the above checks, the user can execute the
+     * command. */
+    return ACL_OK;
+}
+```
+
+
+
 
 
 
