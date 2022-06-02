@@ -33293,6 +33293,436 @@ int ACLCheckCommandPerm(client *c, int *keyidxptr) {
 
 
 
+### Redis Tracking
+
+​		由于`Redis` 是远程服务，查询`Redis`需要通过网络请求，在高并发查询情景中难免造成性能损耗。所以，高并发应用通常引入本地缓存，在查询`Redis`前会
+
+检查本地缓存是否存在数据。
+
+​		引入多端缓存后，修改数据时，各数据端缓存保证数据一致的做法是修改`MySQL`数据，并删除`Redis`缓存、本地缓存。当发现缓存不存在时，会重新查询
+
+`MySQL`数据，并设置`Redis`缓存、本地缓存。
+
+​		分布式系统中，某个节点修改数据后不仅要删除当前节点的本地缓存，还需要发送请求给集群中的其他节点，要求它们删除该数据的本地缓存。开启`Redis `
+
+`Tracking`后，`Redis`服务器会记录客户端查询的所有键，并在这些键发生变更后，发送失败消息通知客户端这些键已变成，此时客户端需要将这些键的本地缓存
+
+删除。基于`Redis Tracking`机制，某个节点修改数据后，不需要再在集群广播删除本地缓存的请求，从而降低了系统复杂度，并提高了性能。
+
+
+
+​		`client.flags`标志记录客户端的`Redis Tracking`相关设置：
+
+​				`CLIENT_TRACKING`：客户端开启了`Redis Tracking`。
+
+​				`CLIENT_TRACKING_BROKEN_REDIR`：在转发模式下发现转发目标客户端无效则添加该标志。
+
+​				`CLIENT_TRACKING_BCAST`：客户端开启了广播模式。
+
+​				`CLIENT_TRACKING_NOLOOP`：客户端开启了`NOLOOP`模式。
+
+​				`CLIENT_TRACKING_OPTIN`、`CLIENT_TRACKING_OPTOUT`：客户端开启了`OPTIN`、`OPTOUT`模式。
+
+​				`CLIENT_TRACKING_CACHING`：客户端调用了`client caching yes/no`命令。
+
+
+
+​		`tracking.c`定义了`Rax`变量`TrackingTable`，用于非广播模式。`TrackingTable`的键记录了客户端查询过的`Redis`键，`TrackingTable`值也是`Rax`变量，该
+
+`Rax`键存放了`client id`，值为`NULL`。
+
+​		`Rax`变量`PrefixTable`用于广播模式。`PrefixTable`键记录被关注的前缀，值指向`bcastState`结构体：
+
+```c++
+// tracking.c
+typedef struct bcastState {
+    rax *keys; // 键记录当前已变成的 Redis 键，值指向变成 Redis 键的客户端
+    rax *clients; // 键记录所有关注该前缀的客户端，值为 NULL
+} bcastState;
+```
+
+
+
+​		`client tracking on`将调用`enableTracking`开启`Redis Tracking`机制：
+
+```c++
+// tracking.c
+void enableTracking(client *c, uint64_t redirect_to, uint64_t options, robj **prefix, size_t numprefix) {
+    if (!(c->flags & CLIENT_TRACKING)) server.tracking_clients++;
+    // 客户端添加 CLIENT_TRACKING 标志
+    c->flags |= CLIENT_TRACKING;
+    // 请求其他 Tracking 相关标志
+    c->flags &= ~(CLIENT_TRACKING_BROKEN_REDIR|CLIENT_TRACKING_BCAST|
+                  CLIENT_TRACKING_OPTIN|CLIENT_TRACKING_OPTOUT|
+                  CLIENT_TRACKING_NOLOOP);
+    c->client_tracking_redirection = redirect_to;
+
+    if (TrackingTable == NULL) {
+        // 初始化
+        TrackingTable = raxNew();
+        PrefixTable = raxNew();
+        TrackingChannelName = createStringObject("__redis__:invalidate",20);
+    }
+
+    /* For broadcasting, set the list of prefixes in the client. */
+    // 如果命令开启了广播模式，则将客户端关注的前缀添加到 PrefixTable 中
+    if (options & CLIENT_TRACKING_BCAST) {
+        c->flags |= CLIENT_TRACKING_BCAST;
+        if (numprefix == 0) enableBcastTrackingForPrefix(c,"",0);
+        for (size_t j = 0; j < numprefix; j++) {
+            sds sdsprefix = prefix[j]->ptr;
+            enableBcastTrackingForPrefix(c,sdsprefix,sdslen(sdsprefix));
+        }
+    }
+
+    /* Set the remaining flags that don't need any special handling. */
+    // 使用命令选项修改当前客户端标志
+    c->flags |= options & (CLIENT_TRACKING_OPTIN|CLIENT_TRACKING_OPTOUT|
+                           CLIENT_TRACKING_NOLOOP);
+}
+```
+
+
+
+​		`enableBcastTrackingForPrefix`负责添加客户端关注的前缀到`PrefixTable`中：
+
+```c++
+// tracking.c
+void enableBcastTrackingForPrefix(client *c, char *prefix, size_t plen) {
+    // 从 PrefixTable 中查找该前缀对应的 bcastState
+    bcastState *bs = raxFind(PrefixTable,(unsigned char*)prefix,plen);
+	
+    // 不存在，则创建 bcastState，并添加到 PrefixTable 中
+    if (bs == raxNotFound) {
+        bs = zmalloc(sizeof(*bs));
+        bs->keys = raxNew();
+        bs->clients = raxNew();
+        raxInsert(PrefixTable,(unsigned char*)prefix,plen,bs,NULL);
+    }
+    // 将当前客户端添加到 bcastState.clients 中
+    if (raxTryInsert(bs->clients,(unsigned char*)&c,sizeof(c),NULL,NULL)) {
+        if (c->client_tracking_prefixes == NULL)
+            c->client_tracking_prefixes = raxNew();
+        raxInsert(c->client_tracking_prefixes,
+                  (unsigned char*)prefix,plen,NULL,NULL);
+    }
+}
+```
+
+
+
+#### 记录查询键
+
+​		`call`函数执行`Redis`命令后，如果执行的是查询命令并且客户端开启了`Redis Tracking`机制，则会记录命中的键，以便这些键变更时通知客户端：
+
+```c++
+// server.c
+void call(client *c, int flags) {
+
+    ...
+    // 如果是查询命令，并且客户端开启了 Redis Tracking 机制
+    if (c->cmd->flags & CMD_READONLY) {
+        client *caller = (c->flags & CLIENT_LUA && server.lua_caller) ?
+                            server.lua_caller : c;
+        // 使用非广播方式，则需要记录命令中的键。广播模式，不需要记录查询过的键
+        if (caller->flags & CLIENT_TRACKING &&
+            !(caller->flags & CLIENT_TRACKING_BCAST))
+        {
+            trackingRememberKeys(caller);
+        }
+    }
+
+    ...
+}
+```
+
+```c++
+// tracking.c
+void trackingRememberKeys(client *c) {
+    /* Return if we are in optin/out mode and the right CACHING command
+     * was/wasn't given in order to modify the default behavior. */
+    // 如果客户端开启了 OPTIN 或 OPTOUT 模式，则需要检查 CLIENT_TRACKING_CACHING 标志是否打开，如果没有打开，则不需要记录命令键
+    uint64_t optin = c->flags & CLIENT_TRACKING_OPTIN;
+    uint64_t optout = c->flags & CLIENT_TRACKING_OPTOUT;
+    uint64_t caching_given = c->flags & CLIENT_TRACKING_CACHING;
+    if ((optin && !caching_given) || (optout && caching_given)) return;
+
+    getKeysResult result = GETKEYS_RESULT_INIT;
+    int numkeys = getKeysFromCommand(c->cmd,c->argv,c->argc,&result);
+    if (!numkeys) {
+        getKeysFreeResult(&result);
+        return;
+    }
+
+    int *keys = result.keys;
+	// 遍历命令中所有的键
+    for(int j = 0; j < numkeys; j++) {
+        int idx = keys[j];
+        sds sdskey = c->argv[idx]->ptr;
+        // 从 TrackingTable 中查找该 Redis 键对应的客户端 Rax，如果没有找到则创建客户端 Rax ，在插入 TrackingTable 中
+        rax *ids = raxFind(TrackingTable,(unsigned char*)sdskey,sdslen(sdskey));
+        if (ids == raxNotFound) {
+            ids = raxNew();
+            int inserted = raxTryInsert(TrackingTable,(unsigned char*)sdskey,
+                                        sdslen(sdskey),ids, NULL);
+            serverAssert(inserted == 1);
+        }
+        // 将客户端 id 插入客户端 Rax 中
+        if (raxTryInsert(ids,(unsigned char*)&c->id,sizeof(c->id),NULL,NULL))
+            TrackingTableTotalItems++;
+    }
+    getKeysFreeResult(&result);
+}
+```
+
+
+
+#### 非广播模式
+
+​		`watch`机制，在每次修改键后，会调用`signalModifiedKey`，标志`Redis`键已经变更，该函数会调用`trackingInvalidateKeyRaw`检查修改的键是否被缓存，
+
+如果是，则发送失效消息通知客户端：
+
+```c++
+// tracking.c
+/**
+	bcast：是否需要发送失效消息给广播模式下的客户端，变更键时固定为 1
+*/
+void trackingInvalidateKeyRaw(client *c, char *key, size_t keylen, int bcast) {
+    if (TrackingTable == NULL) return;
+	// 记录广播模式下待发送失败消息键
+    if (bcast && raxSize(PrefixTable) > 0)
+        trackingRememberKeyToBroadcast(c,key,keylen);
+	// 从 TrackingTable 中找到 Redis 键对应的客户端 Rax，该 Rax 存放了所有查询过该键的客户端
+    rax *ids = raxFind(TrackingTable,(unsigned char*)key,keylen);
+    if (ids == raxNotFound) return;
+	// 遍历客户端 Rax
+    raxIterator ri;
+    raxStart(&ri,ids);
+    raxSeek(&ri,"^",NULL,0);
+    while(raxNext(&ri)) {
+        uint64_t id;
+        memcpy(&id,ri.key,sizeof(id));
+        client *target = lookupClientByID(id);
+
+        // 如果某个客户端已经断开连接，关闭 Tracking 机制，或者开启了广播模式，则不发送失效消息
+        if (target == NULL ||
+            !(target->flags & CLIENT_TRACKING)||
+            target->flags & CLIENT_TRACKING_BCAST)
+        {
+            continue;
+        }
+
+        // 客户端开启了 NOLOOP 选项，并且该客户端就是变更 Redis 键的客户端，则不发送失效消息
+        if (target->flags & CLIENT_TRACKING_NOLOOP &&
+            target == c)
+        {
+            continue;
+        }
+		// 发送失效消息
+        sendTrackingMessage(target,key,keylen,0);
+    }
+    raxStop(&ri);
+
+    /* Free the tracking table: we'll create the radix tree and populate it
+     * again if more keys will be modified in this caching slot. */
+    TrackingTableTotalItems -= raxSize(ids);
+    raxFree(ids);
+    // 从 TrackingTable 中删除该变更键内容
+    raxRemove(TrackingTable,(unsigned char*)key,keylen,NULL);
+}
+
+void sendTrackingMessage(client *c, char *keyname, size_t keylen, int proto) {
+    int using_redirection = 0;
+    // 客户端开启了转发模式
+    if (c->client_tracking_redirection) {
+        // 查找转发客户端
+        client *redir = lookupClientByID(c->client_tracking_redirection);
+        // 转发客户端不存在
+        if (!redir) {
+            // 打开客户端 CLIENT_TRACKING_BROKEN_REDIR 标志
+            c->flags |= CLIENT_TRACKING_BROKEN_REDIR;
+			// 返回错误信息
+            if (c->resp > 2) {
+                addReplyPushLen(c,2);
+                addReplyBulkCBuffer(c,"tracking-redir-broken",21);
+                addReplyLongLong(c,c->client_tracking_redirection);
+            }
+            return;
+        }
+        c = redir;
+        using_redirection = 1;
+    }
+
+	// 使用的是 RESP3 协议，直接发送失效消息
+    if (c->resp > 2) {
+        addReplyPushLen(c,2);
+        addReplyBulkCBuffer(c,"invalidate",10);
+    } else if (using_redirection && c->flags & CLIENT_PUBSUB) {
+		// 使用的是 RESP2 协议，并且转发客户端处于 Pub/Sub 上下文中（转发客户端正调用 SUBSCRIBE 命令等待消息），则发送频道消息到转发客户端
+        addReplyPubsubMessage(c,TrackingChannelName,NULL);
+    } else {
+
+        return;
+    }
+
+    // 此处写入 Redis 键的内容
+    if (proto) {
+        addReplyProto(c,keyname,keylen);
+    } else {
+        addReplyArrayLen(c,1);
+        addReplyBulkCBuffer(c,keyname,keylen);
+    }
+}
+```
+
+
+
+#### 广播模式
+
+​		广播模式下，不需要记录用户查询过的键，当某个`Redis`键变更后，`trackingInvalidateKeyRaw`会调用`trackingRememberKeyToBroadcast`记录广播模式下打
+
+发送失效消息的键：
+
+```c++
+// tracking.c
+void trackingRememberKeyToBroadcast(client *c, char *keyname, size_t keylen) {
+    raxIterator ri;
+    raxStart(&ri,PrefixTable);
+    raxSeek(&ri,"^",NULL,0);
+    // 遍历 PrefixTable
+    while(raxNext(&ri)) {
+        // 检查变更的 Redis 是否以某个客户端关注的前缀开头，如果是，则添加该键到对应的 bcastState 中
+        if (ri.key_len > keylen) continue;
+        if (ri.key_len != 0 && memcmp(ri.key,keyname,ri.key_len) != 0)
+            continue;
+        bcastState *bs = ri.data;
+        raxInsert(bs->keys,(unsigned char*)keyname,keylen,c,NULL);
+    }
+    raxStop(&ri);
+}
+```
+
+​		经过上面的处理后，`bcastState.keys`中保存了待发送失效消息的键。但广播模式下，`Redis`不会在键变更时立即发送失效消息，而是在`beforeSleep`函数中
+
+触发`trackingBroadcastInvalidationMessages`定时发送失效消息：
+
+```c++
+// tracking.c
+void trackingBroadcastInvalidationMessages(void) {
+    raxIterator ri, ri2;
+
+    /* Return ASAP if there is nothing to do here. */
+    if (TrackingTable == NULL || !server.tracking_clients) return;
+
+    raxStart(&ri,PrefixTable);
+    raxSeek(&ri,"^",NULL,0);
+
+    /* For each prefix... */
+    // 遍历 PrefixTable
+    while(raxNext(&ri)) {
+        bcastState *bs = ri.data;
+		// 如果某个 bcastState.keys 中存在已变更的键，则需要发送失效消息
+        if (raxSize(bs->keys)) {
+            /* Generate the common protocol for all the clients that are
+             * not using the NOLOOP option. */
+            sds proto = trackingBuildBroadcastReply(NULL,bs->keys);
+
+            /* Send this array of keys to every client in the list. */
+            // 遍历该 bcastState.clients所有客户端，广播发送失效消息
+            raxStart(&ri2,bs->clients);
+            raxSeek(&ri2,"^",NULL,0);
+            while(raxNext(&ri2)) {
+                client *c;
+                memcpy(&c,ri2.key,sizeof(c));
+                if (c->flags & CLIENT_TRACKING_NOLOOP) {
+                    /* This client may have certain keys excluded. */
+                    sds adhoc = trackingBuildBroadcastReply(c,bs->keys);
+                    if (adhoc) {
+                        sendTrackingMessage(c,adhoc,sdslen(adhoc),1);
+                        sdsfree(adhoc);
+                    }
+                } else {
+                    sendTrackingMessage(c,proto,sdslen(proto),1);
+                }
+            }
+            raxStop(&ri2);
+
+            sdsfree(proto);
+        }
+        // 重置 bcastState.keys
+        raxFree(bs->keys);
+        bs->keys = raxNew();
+    }
+    raxStop(&ri);
+}
+```
+
+
+
+#### 清除记录键
+
+​		非广播模式下，如果某些键在查询后长期不变更，则这些键一直会保存在`TrackingTable`中，导致`TrackingTable`的内容不断增长，最后占用大量内存空间，
+
+`Redis`提供了主动清除记录键的机制，防止`TrackingTable`占用过多内存。
+
+​		广播模式下，`bcastState.keys`的内容是在键变更时添加的，在`beforeSleep`函数中定时清除，时间间隔通常不会很长，不需要定时清除。
+
+​		`processCommand`执行`Redis`命令之前，会调用`trackingLimitUsedSlots`检查`TrackingTable`中记录键的数量，如果超过
+
+`server.tracking_table_max_keys`，则需要清除记录键。而且，`serverCron`中也会定时调用`trackingLimitUsedSlots`清除`TrackingTable`中的记录键：
+
+```c++
+// tracking.c
+void trackingLimitUsedSlots(void) {
+    
+    static unsigned int timeout_counter = 0;
+    if (TrackingTable == NULL) return;
+    // server.tracking_table_max_keys 为 0 ，则不主动清除记录键，默认为 1000000
+    if (server.tracking_table_max_keys == 0) return; /* No limits set. */
+
+    size_t max_keys = server.tracking_table_max_keys;
+    // 记录键数量小于 server.tracking_table_max_keys ，则不需要执行清除操作
+    if (raxSize(TrackingTable) <= max_keys) {
+        // timeout_counter 用于计算本轮清除键的数量
+        timeout_counter = 0;
+        return; /* Limit not reached. */
+    }
+
+    /* We have to invalidate a few keys to reach the limit again. The effort
+     * we do here is proportional to the number of times we entered this
+     * function and found that we are still over the limit. */
+    // 计算清除键的数量
+    int effort = 100 * (timeout_counter+1);
+
+    /* We just remove one key after another by using a random walk. */
+    // 开始清除操作
+    raxIterator ri;
+    raxStart(&ri,TrackingTable);
+    while(effort > 0) {
+        effort--;
+        raxSeek(&ri,"^",NULL,0);
+        // 获取随机的记录键
+        raxRandomWalk(&ri,0);
+        if (raxEOF(&ri)) break;
+        // 删除记录键并发送失效消息，0 代表不需要发送失效消息给广播模式下的客户端
+        trackingInvalidateKeyRaw(NULL,(char*)ri.key,ri.key_len,0);
+        // 本轮清除操作执行完成
+        if (raxSize(TrackingTable) <= max_keys) {
+            timeout_counter = 0;
+            raxStop(&ri);
+            return; /* Return ASAP: we are again under the limit. */
+        }
+    }
+
+    /* If we reach this point, we were not able to go under the configured
+     * limit using the maximum effort we had for this run. */
+    raxStop(&ri);
+    // 本轮清除操作未完成，timeout_counter + 1，下一轮清除的键的数量会增加。即每轮清除的键的数量会不断增加，直到 TrackingTable 记录键的数量达到要求
+    timeout_counter++;
+}
+```
+
 
 
 
