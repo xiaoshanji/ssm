@@ -868,3 +868,139 @@ public class DefaultResultSetHandler implements ResultSetHandler {
 
 
 
+# SqlSession 的创建过程
+
+​		`SqlSession`的创建过程分为`3`个阶段：`Configuration`实例的创建过程、`SqlSessionFactory`实例的创建过程和`SqlSession`实例化的过程。
+
+## 解析 XML 文件
+
+​		`MyBatis`中的`Configuration`组件用于描述主配置文件信息，框架在启动时会解析`XML`配置，将配置信息转换为`Configuration`对象。`JDK API`中提供了`3`种
+
+方式解析`XML`，分别为`DOM、SAX、XPath`，`MyBatis`框架中采用`XPath`方式解析`XML`文件中的配置信息。
+
+​		`MyBatis`通过`XPathParser`工具类封装了对`XML`的解析操作，同时使用`XNode`类增强了对`XML`节点的操作。使用`XNode`对象，可以很方便地获取节点的属
+
+性、子节点等信息。省去了`Document`对象和`XPath`对象的创建过程，`XPathParser`工具类封装了执行`XPath`表达式的方法，很大程度上简化了`XML`解析过程。
+
+
+
+## 创建 Configuration 实例
+
+​		`Configuration`是`MyBatis`中比较重要的组件，主要有以下作用：
+
+​				1、用于描述`MyBatis`配置信息，例如`<settings>`标签配置的参数信息。
+
+​				2、作为容器注册`MyBatis`其他组件，例如`TypeHandler、MappedStatement`等。
+
+​				3、提供工厂方法，创建`ResultSetHandler、StatementHandler、Executor、ParameterHandler`等组件实例。
+
+​		`MyBatis`通过`XMLConfigBuilder`类完成`Configuration`对象的构建工作：
+
+```java
+// XMLConfigBuilder 类
+public Configuration parse() {
+    // 避免 parse() 被同一个实例调用多次
+    if (parsed) {
+      throw new BuilderException("Each XMLConfigBuilder can only be used once.");
+    }
+    parsed = true;
+    /**
+    	evalNode：创建表示 configuration 节点的 XNode 对象
+    */
+    parseConfiguration(parser.evalNode("/configuration"));
+    // configuration 对象的实例化在 XMLConfigBuilder 的构造方法中
+    return configuration;
+}
+
+private void parseConfiguration(XNode root) {
+    try {
+      // issue #117 read properties first
+      propertiesElement(root.evalNode("properties")); // 处理 properties 子节点
+      Properties settings = settingsAsProperties(root.evalNode("settings")); // 处理 settings 子节点
+      loadCustomVfs(settings);
+      loadCustomLogImpl(settings);
+      typeAliasesElement(root.evalNode("typeAliases")); // 处理 typeAliases 子节点
+      pluginElement(root.evalNode("plugins")); // 处理 plugins 子节点
+      objectFactoryElement(root.evalNode("objectFactory")); // 处理 objectFactory 子节点
+      objectWrapperFactoryElement(root.evalNode("objectWrapperFactory")); // 处理 objectWrapperFactory 子节点
+      reflectorFactoryElement(root.evalNode("reflectorFactory")); // 处理 reflectorFactory 子节点
+      settingsElement(settings);
+      // read it after objectFactory and objectWrapperFactory issue #631
+      environmentsElement(root.evalNode("environments")); // 处理 environments 子节点
+      databaseIdProviderElement(root.evalNode("databaseIdProvider")); // 处理 databaseIdProvider 子节点
+      typeHandlerElement(root.evalNode("typeHandlers")); // 处理 typeHandlers 子节点
+      mapperElement(root.evalNode("mappers")); // 处理 mappers 子节点
+    } catch (Exception e) {
+      throw new BuilderException("Error parsing SQL Mapper Configuration. Cause: " + e, e);
+    }
+}
+```
+
+
+
+## 创建 SqlSession 实例
+
+​		在创建`SqlSession`实例之前需要先创建`SqlSessionFactory`工厂对象，然后调用`SqlSessionFactory`对象的`openSession()`方法。为了创建
+
+`SqlSessionFactory`对象，首先创建了一个`SqlSessionFactoryBuilder`对象，然后以`MyBatis`主配置文件输入流作为参数，调用`SqlSessionFactoryBuilder`对象的
+
+`build()`方法。
+
+```java
+// SqlSessionFactoryBuilder 类
+public SqlSessionFactory build(Reader reader, String environment, Properties properties) {
+    try {
+      // 创建 XMLConfigBuilder 用于创建 Configuration 对象
+      XMLConfigBuilder parser = new XMLConfigBuilder(reader, environment, properties);
+      return build(parser.parse());
+    } catch (Exception e) {
+      throw ExceptionFactory.wrapException("Error building SqlSession.", e);
+    } finally {
+      ErrorContext.instance().reset();
+      try {
+        reader.close();
+      } catch (IOException e) {
+        // Intentionally ignore. Prefer previous error.
+      }
+    }
+}
+
+public SqlSessionFactory build(Configuration config) {
+    return new DefaultSqlSessionFactory(config);
+}
+```
+
+​		`SqlSessionFactory`接口只有一个默认的实现，即`DefaultSqlSessionFactory`：
+
+```java
+// DefaultSqlSessionFactory 类
+public SqlSession openSession() {
+    return openSessionFromDataSource(configuration.getDefaultExecutorType(), null, false);
+}
+
+private SqlSession openSessionFromDataSource(ExecutorType execType, TransactionIsolationLevel level, boolean autoCommit) {
+    Transaction tx = null;
+    try {
+      // 获取主配置文件配置的环境信息
+      final Environment environment = configuration.getEnvironment();
+      // 创建事务管理器工厂，MyBatis 提供了两种事务管理器，分别为 JdbcTransaction 和 ManagedTransaction。其中，JdbcTransaction 是使用 JDBC 中的Connection 对象实现事务管理的，而 ManagedTransaction 表示事务由外部容器管理。分别由对应的工厂类 JdbcTransactionFactory 和ManagedTransactionFactory 创建
+      final TransactionFactory transactionFactory = getTransactionFactoryFromEnvironment(environment);
+      // 创建事务管理器
+      tx = transactionFactory.newTransaction(environment.getDataSource(), level, autoCommit);
+      // 根据主配置文件创建 Executor 实例
+      final Executor executor = configuration.newExecutor(tx, execType);
+      // 创建 DefaultSqlSession 实例
+      return new DefaultSqlSession(configuration, executor, autoCommit);
+    } catch (Exception e) {
+      closeTransaction(tx); // may have fetched a connection so lets call close()
+      throw ExceptionFactory.wrapException("Error opening session.  Cause: " + e, e);
+    } finally {
+      ErrorContext.instance().reset();
+    }
+}
+```
+
+
+
+
+
