@@ -1002,5 +1002,814 @@ private SqlSession openSessionFromDataSource(ExecutorType execType, TransactionI
 
 
 
+# SqlSession 执行 Mapper 过程
 
+## Mapper 接口的注册过程
+
+​		在创建`SqlSession`实例后，需要调用`SqlSession`的`getMapper()`方法获取一个`Mapper`的引用，然后通过该引用调用`Mapper`接口中定义的方法。而
+
+`getMapper()`方法返回的是一个动态代理对象，`MyBatis`中通过`MapperProxy`类实现动态代理：
+
+```java
+public class MapperProxy<T> implements InvocationHandler, Serializable {
+
+  private static final long serialVersionUID = -4724728412955527868L;
+  private final SqlSession sqlSession;
+  private final Class<T> mapperInterface;
+  private final Map<Method, MapperMethodInvoker> methodCache;
+
+  public MapperProxy(SqlSession sqlSession, Class<T> mapperInterface, Map<Method, MapperMethodInvoker> methodCache) {
+    this.sqlSession = sqlSession;
+    this.mapperInterface = mapperInterface;
+    this.methodCache = methodCache;
+  }
+
+  @Override
+  public Object invoke(Object proxy, Method method, Object[] args) throws Throwable {
+    try {
+      if (Object.class.equals(method.getDeclaringClass())) {
+        return method.invoke(this, args);
+      } else {
+        return cachedInvoker(method).invoke(proxy, method, args, sqlSession);
+      }
+    } catch (Throwable t) {
+      throw ExceptionUtil.unwrapThrowable(t);
+    }
+  }
+  
+  ...
+}
+```
+
+​		`MapperProxy`使用的是`JDK`内置的动态代理，实现了`InvocationHandler`接口，`invoke()`方法中为通用的拦截逻辑。使用`JDK`内置动态代理，通过
+
+`MapperProxy`类实现`InvocationHandler`接口，定义方法执行拦截逻辑后，还需要调用`java.lang.reflect.Proxy`类的`newProxyInstance()`方法创建代理对象。
+
+`MyBatis`对这一过程做了封装，使用`MapperProxyFactory`创建`Mapper`动态代理对象：
+
+```java
+public class MapperProxyFactory<T> {
+
+  private final Class<T> mapperInterface;
+  private final Map<Method, MapperMethodInvoker> methodCache = new ConcurrentHashMap<>();
+
+  public MapperProxyFactory(Class<T> mapperInterface) {
+    this.mapperInterface = mapperInterface;
+  }
+
+  public Class<T> getMapperInterface() {
+    return mapperInterface;
+  }
+
+  public Map<Method, MapperMethodInvoker> getMethodCache() {
+    return methodCache;
+  }
+
+  @SuppressWarnings("unchecked")
+  protected T newInstance(MapperProxy<T> mapperProxy) {
+    return (T) Proxy.newProxyInstance(mapperInterface.getClassLoader(), new Class[] { mapperInterface }, mapperProxy);
+  }
+  // 工厂方法
+  public T newInstance(SqlSession sqlSession) {
+    final MapperProxy<T> mapperProxy = new MapperProxy<>(sqlSession, mapperInterface, methodCache);
+    return newInstance(mapperProxy);
+  }
+
+}
+```
+
+​		`Configuration`对象中有一个`mapperRegistry`属性，`MyBatis`通过`mapperRegistry`属性注册`Mapper`接口与`MapperProxyFactory`对象之间的对应关系，
+
+`MyBatis`框架在应用启动时会解析所有的`Mapper`接口，然后调用`MapperRegistry`对象的`addMapper()`方法将`Mapper`接口信息和对应的`MapperProxyFactory`对象
+
+注册到`MapperRegistry`对象中：
+
+```java
+public class MapperRegistry {
+  // Configuration 对象引用
+  private final Configuration config;
+  // 用于注册 Mapper 接口对应的 Class 对象和 MapperProxyFactory 对象对应关系
+  private final Map<Class<?>, MapperProxyFactory<?>> knownMappers = new HashMap<>();
+
+  public MapperRegistry(Configuration config) {
+    this.config = config;
+  }
+  
+  // 根据 Mapper 接口 Class 对象获取 Mapper 动态代理对象
+  @SuppressWarnings("unchecked")
+  public <T> T getMapper(Class<T> type, SqlSession sqlSession) {
+    final MapperProxyFactory<T> mapperProxyFactory = (MapperProxyFactory<T>) knownMappers.get(type);
+    if (mapperProxyFactory == null) {
+      throw new BindingException("Type " + type + " is not known to the MapperRegistry.");
+    }
+    try {
+      return mapperProxyFactory.newInstance(sqlSession);
+    } catch (Exception e) {
+      throw new BindingException("Error getting mapper instance. Cause: " + e, e);
+    }
+  }
+
+  public <T> boolean hasMapper(Class<T> type) {
+    return knownMappers.containsKey(type);
+  }
+
+  // 根据 Mapper 接口 Class 对象创建 MapperProxyFactory 对象，并注册到 knownMappers 中
+  public <T> void addMapper(Class<T> type) {
+    if (type.isInterface()) {
+      if (hasMapper(type)) {
+        throw new BindingException("Type " + type + " is already known to the MapperRegistry.");
+      }
+      boolean loadCompleted = false;
+      try {
+        knownMappers.put(type, new MapperProxyFactory<>(type));
+        // It's important that the type is added before the parser is run
+        // otherwise the binding may automatically be attempted by the
+        // mapper parser. If the type is already known, it won't try.
+        MapperAnnotationBuilder parser = new MapperAnnotationBuilder(config, type);
+        parser.parse();
+        loadCompleted = true;
+      } finally {
+        if (!loadCompleted) {
+          knownMappers.remove(type);
+        }
+      }
+    }
+  }
+  ...
+}
+```
+
+
+
+## MappedStatement 注册过程
+
+​		`Configuration`类中有一个`mappedStatements`属性，该属性用于注册`MyBatis`中所有的`MappedStatement`对象，`mappedStatements`属性是一个`Map`对象，它
+
+的`Key`为`Mapper SQL`配置的`Id`，如果`SQL`是通过`XML`配置的，则`Id`为命名空间加上`<select|update|delete|insert>`标签的`Id`，如果`SQL`通过`Java`注解配
+
+置，则`Id`为`Mapper`接口的完全限定名`(`包括包名`)`加上方法名称。
+
+​		`MyBatis`主配置文件的解析是通过`XMLConfigBuilder`对象来完成的。在`XMLConfigBuilder`类的`parseConfiguration()`方法中会调用不同的方法解析对应的标
+
+签。`<mappers>`标签是通过`XMLConfigBuilder`类的`mapperElement()`方法来解析的：
+
+```java
+// XMLConfigBuilder 类
+private void mapperElement(XNode parent) throws Exception {
+    if (parent != null) {
+      for (XNode child : parent.getChildren()) {
+        //  通过 package 标签指定包名
+        if ("package".equals(child.getName())) {
+          String mapperPackage = child.getStringAttribute("name");
+          configuration.addMappers(mapperPackage);
+        } else {
+          String resource = child.getStringAttribute("resource");
+          String url = child.getStringAttribute("url");
+          String mapperClass = child.getStringAttribute("class");
+          // 通过 resource 属性指定 XML 文件路径
+          if (resource != null && url == null && mapperClass == null) {
+            ErrorContext.instance().resource(resource);
+            try(InputStream inputStream = Resources.getResourceAsStream(resource)) {
+              XMLMapperBuilder mapperParser = new XMLMapperBuilder(inputStream, configuration, resource, configuration.getSqlFragments());
+              mapperParser.parse();
+            }
+          } else if (resource == null && url != null && mapperClass == null) {
+            // 通过 url 属性指定 XML 文件路径
+            ErrorContext.instance().resource(url);
+            try(InputStream inputStream = Resources.getUrlAsStream(url)){
+              XMLMapperBuilder mapperParser = new XMLMapperBuilder(inputStream, configuration, url, configuration.getSqlFragments());
+              mapperParser.parse();
+            }
+          } else if (resource == null && url == null && mapperClass != null) {
+            // 通过 class 属性指定接口的完全限定名
+            Class<?> mapperInterface = Resources.classForName(mapperClass);
+            configuration.addMapper(mapperInterface);
+          } else {
+            throw new BuilderException("A mapper element may only specify a url, resource or class, but not more than one.");
+          }
+        }
+      }
+    }
+}
+```
+
+​		通过`url`指定`XML`文件路径：
+
+```java
+// XMLMapperBuilder 类
+public void parse() {
+    if (!configuration.isResourceLoaded(resource)) {
+      // 获取 mapper 节点对应的XNode对象
+      configurationElement(parser.evalNode("/mapper"));
+      // 将资源路径添加到 configuration 对象中
+      configuration.addLoadedResource(resource);
+      bindMapperForNamespace();
+    }
+	// 继续解析之前解析出现异常的 ResultMap 对象
+    parsePendingResultMaps();
+    // 继续解析之前解析出现异常的 CacheRef 对象
+    parsePendingCacheRefs();
+    // 继续解析之前解析出现异常的 <select lupdate |delete|insert> 标签配置
+    parsePendingStatements();
+}
+
+private void configurationElement(XNode context) {
+    try {
+      // 获取命令空间
+      String namespace = context.getStringAttribute("namespace");
+      if (namespace == null || namespace.isEmpty()) {
+        throw new BuilderException("Mapper's namespace cannot be empty");
+      }
+      // 设置当前正在解析的 Mapper配置的命名空间
+      builderAssistant.setCurrentNamespace(namespace);
+      // 解析 <cache-ref> 标签
+      cacheRefElement(context.evalNode("cache-ref"));
+      // 解析 <cache> 标签
+      cacheElement(context.evalNode("cache"));
+      // 解析所有 <parameterMap> 标签
+      parameterMapElement(context.evalNodes("/mapper/parameterMap"));
+      // 解析所有 <resultMap> 标签
+      resultMapElements(context.evalNodes("/mapper/resultMap"));
+      // 解析所有 <sql> 标签
+      sqlElement(context.evalNodes("/mapper/sql"));
+      // 解析所有 <select|insert|update|delete> 标签
+      buildStatementFromContext(context.evalNodes("select|insert|update|delete"));
+    } catch (Exception e) {
+      throw new BuilderException("Error parsing Mapper XML. The XML location is '" + resource + "'. Cause: " + e, e);
+    }
+}
+
+private void buildStatementFromContext(List<XNode> list) {
+    if (configuration.getDatabaseId() != null) {
+      buildStatementFromContext(list, configuration.getDatabaseId());
+    }
+    buildStatementFromContext(list, null);
+}
+
+private void buildStatementFromContext(List<XNode> list, String requiredDatabaseId) {
+    for (XNode context : list) {
+      // 通过 XMLStatementBuilder 对象对 <selectlupdate|insert|delete> 标签进行解析
+      final XMLStatementBuilder statementParser = new XMLStatementBuilder(configuration, builderAssistant, context, requiredDatabaseId);
+      try {
+        // 进行解析
+        statementParser.parseStatementNode();
+      } catch (IncompleteElementException e) {
+        configuration.addIncompleteStatement(statementParser);
+      }
+    }
+}
+```
+
+```java
+// XMLStatementBuilder 类
+public void parseStatementNode() {
+    String id = context.getStringAttribute("id");
+    String databaseId = context.getStringAttribute("databaseId");
+
+    if (!databaseIdMatchesCurrent(id, databaseId, this.requiredDatabaseId)) {
+      return;
+    }
+
+    String nodeName = context.getNode().getNodeName();
+    SqlCommandType sqlCommandType = SqlCommandType.valueOf(nodeName.toUpperCase(Locale.ENGLISH));
+    boolean isSelect = sqlCommandType == SqlCommandType.SELECT;
+    boolean flushCache = context.getBooleanAttribute("flushCache", !isSelect);
+    boolean useCache = context.getBooleanAttribute("useCache", isSelect);
+    boolean resultOrdered = context.getBooleanAttribute("resultOrdered", false);
+
+    // Include Fragments before parsing
+    // 将 <include> 标签内容替换为 <sql> 标签定义的 SQL 片段
+    XMLIncludeTransformer includeParser = new XMLIncludeTransformer(configuration, builderAssistant);
+    includeParser.applyIncludes(context.getNode());
+
+    String parameterType = context.getStringAttribute("parameterType");
+    Class<?> parameterTypeClass = resolveClass(parameterType);
+	// 获取 LanguageDriver 对象
+    String lang = context.getStringAttribute("lang");
+    LanguageDriver langDriver = getLanguageDriver(lang);
+
+    // Parse selectKey after includes and remove them.
+    // 解析 <selectKey> 标签
+    processSelectKeyNodes(id, parameterTypeClass, langDriver);
+
+    // Parse the SQL (pre: <selectKey> and <include> were parsed and removed)
+    KeyGenerator keyGenerator;
+    String keyStatementId = id + SelectKeyGenerator.SELECT_KEY_SUFFIX;
+    keyStatementId = builderAssistant.applyCurrentNamespace(keyStatementId, true);
+    // 获取主键生成策略
+    if (configuration.hasKeyGenerator(keyStatementId)) {
+      keyGenerator = configuration.getKeyGenerator(keyStatementId);
+    } else {
+      keyGenerator = context.getBooleanAttribute("useGeneratedKeys",
+          configuration.isUseGeneratedKeys() && SqlCommandType.INSERT.equals(sqlCommandType))
+          ? Jdbc3KeyGenerator.INSTANCE : NoKeyGenerator.INSTANCE;
+    }
+	// 通过 LanguageDriver 解析 SQL 内容，生成 SqlSource 对象
+    SqlSource sqlSource = langDriver.createSqlSource(configuration, context, parameterTypeClass);
+    // 默认 Statement 类型为 PREPARED
+    StatementType statementType = StatementType.valueOf(context.getStringAttribute("statementType", StatementType.PREPARED.toString()));
+    // 解析 <selectlupdate|insert|delete> 标签
+    Integer fetchSize = context.getIntAttribute("fetchSize");
+    Integer timeout = context.getIntAttribute("timeout");
+    String parameterMap = context.getStringAttribute("parameterMap");
+    // 获取 Mapper 返回结果类型 Class 对象
+    String resultType = context.getStringAttribute("resultType");
+    Class<?> resultTypeClass = resolveClass(resultType);
+    String resultMap = context.getStringAttribute("resultMap");
+    
+    String resultSetType = context.getStringAttribute("resultSetType");
+    ResultSetType resultSetTypeEnum = resolveResultSetType(resultSetType);
+    if (resultSetTypeEnum == null) {
+      resultSetTypeEnum = configuration.getDefaultResultSetType();
+    }
+    String keyProperty = context.getStringAttribute("keyProperty");
+    String keyColumn = context.getStringAttribute("keyColumn");
+    String resultSets = context.getStringAttribute("resultSets");
+	
+    // 创建 MappedStatement 对象。创建完成后，调用 Configuration 对象的 addMappedStatement() 方法将 MappedStatement 对象注册到 Configuration 对象中
+    builderAssistant.addMappedStatement(id, sqlSource, statementType, sqlCommandType,
+        fetchSize, timeout, parameterMap, parameterTypeClass, resultMap, resultTypeClass,
+        resultSetTypeEnum, flushCache, useCache, resultOrdered,
+        keyGenerator, keyProperty, keyColumn, databaseId, langDriver, resultSets);
+}
+```
+
+
+
+## Mapper 方法调用过程
+
+​		为了执行`Mapper`接口中定义的方法，首先需要调用`SqlSession`对象的`getMapper()`方法获取一个动态代理对象。当调用动态代理对象方法的时候，会执行
+
+`MapperProxy`类的`invoke()`方法：
+
+```java
+// MapperProxy 类
+public Object invoke(Object proxy, Method method, Object[] args) throws Throwable {
+    try {
+      // 从 Object 类继承的方法不做处理
+      if (Object.class.equals(method.getDeclaringClass())) {
+        return method.invoke(this, args);
+      } else {
+        return cachedInvoker(method).invoke(proxy, method, args, sqlSession);
+      }
+    } catch (Throwable t) {
+      throw ExceptionUtil.unwrapThrowable(t);
+    }
+}
+
+private MapperMethodInvoker cachedInvoker(Method method) throws Throwable {
+    try {
+      return MapUtil.computeIfAbsent(methodCache, method, m -> {
+        if (m.isDefault()) {
+          try {
+            if (privateLookupInMethod == null) {
+              return new DefaultMethodInvoker(getMethodHandleJava8(method));
+            } else {
+              return new DefaultMethodInvoker(getMethodHandleJava9(method));
+            }
+          } catch (IllegalAccessException | InstantiationException | InvocationTargetException
+              | NoSuchMethodException e) {
+            throw new RuntimeException(e);
+          }
+        } else {
+          return new PlainMethodInvoker(new MapperMethod(mapperInterface, method, sqlSession.getConfiguration()));
+        }
+      });
+    } catch (RuntimeException re) {
+      Throwable cause = re.getCause();
+      throw cause == null ? re : cause;
+    }
+}
+```
+
+```java
+// MapUtil 类
+public static <K, V> V computeIfAbsent(Map<K, V> map, K key, Function<K, V> mappingFunction) {
+    V value = map.get(key);
+    if (value != null) {
+      return value;
+    }
+    return map.computeIfAbsent(key, mappingFunction);
+}
+```
+
+```java
+// PlainMethodInvoker 类
+public Object invoke(Object proxy, Method method, Object[] args, SqlSession sqlSession) throws Throwable {
+      return mapperMethod.execute(sqlSession, args);
+}
+```
+
+
+
+​		`MapperMethod`类是对`Mapper`方法相关信息的封装，通过`MapperMethod`能够很方便地获取`SQL`语句的类型、方法的签名信息：
+
+```java
+public class MapperMethod {
+
+  private final SqlCommand command; 
+  private final MethodSignature method; 
+
+  public MapperMethod(Class<?> mapperInterface, Method method, Configuration config) {
+    this.command = new SqlCommand(config, mapperInterface, method);
+    this.method = new MethodSignature(config, mapperInterface, method);
+  }
+  ...
+}
+```
+
+​		`SqlCommand`用于获取`SQL`语句的类型、`Mapper`的`Id`等信息：
+
+```java
+public static class SqlCommand {
+
+    private final String name; // Mapper Id
+    private final SqlCommandType type; // SQL 类型
+
+    public SqlCommand(Configuration configuration, Class<?> mapperInterface, Method method) {
+      final String methodName = method.getName();
+      // 获取声明该方法的类或接口的 Class 对象
+      final Class<?> declaringClass = method.getDeclaringClass();
+      // 获取描述 <select|update|insert|delete> 标签的 Mappedstatement 对象
+      MappedStatement ms = resolveMappedStatement(mapperInterface, methodName, declaringClass,
+          configuration);
+      if (ms == null) {
+        if (method.getAnnotation(Flush.class) != null) {
+          name = null;
+          type = SqlCommandType.FLUSH;
+        } else {
+          throw new BindingException("Invalid bound statement (not found): "
+              + mapperInterface.getName() + "." + methodName);
+        }
+      } else {
+        name = ms.getId();
+        type = ms.getSqlCommandType();
+        if (type == SqlCommandType.UNKNOWN) {
+          throw new BindingException("Unknown execution method for: " + name);
+        }
+      }
+    }
+    private MappedStatement resolveMappedStatement(Class<?> mapperInterface, String methodName,
+        Class<?> declaringClass, Configuration configuration) {
+      // 获取 Mapper 的 Id
+      String statementId = mapperInterface.getName() + "." + methodName;
+      if (configuration.hasStatement(statementId)) {
+        // 如果 Configuration 对象中已经注册了 Mappedstatement 对象，则获取该 MappedStatement 对象
+        return configuration.getMappedStatement(statementId);
+      } else if (mapperInterface.equals(declaringClass)) {
+        return null;
+      }
+      // 如果方法是在 Mapper 父接口中定义的，则根据父接口获取对应的 Mappedstatement 对象
+      for (Class<?> superInterface : mapperInterface.getInterfaces()) {
+        if (declaringClass.isAssignableFrom(superInterface)) {
+          MappedStatement ms = resolveMappedStatement(superInterface, methodName,
+              declaringClass, configuration);
+          if (ms != null) {
+            return ms;
+          }
+        }
+      }
+      return null;
+    }
+    
+    ...
+}
+```
+
+
+
+​		`MethodSignature`用于获取方法的签名信息：
+
+```java
+public static class MethodSignature {
+
+    public MethodSignature(Configuration configuration, Class<?> mapperInterface, Method method) {
+      // 获取方法返回值类型
+      Type resolvedReturnType = TypeParameterResolver.resolveReturnType(method, mapperInterface);
+      if (resolvedReturnType instanceof Class<?>) {
+        this.returnType = (Class<?>) resolvedReturnType;
+      } else if (resolvedReturnType instanceof ParameterizedType) {
+        this.returnType = (Class<?>) ((ParameterizedType) resolvedReturnType).getRawType();
+      } else {
+        this.returnType = method.getReturnType();
+      }
+      // 返回值类型为 void
+      this.returnsVoid = void.class.equals(this.returnType);
+      // 返回值类型为集合
+      this.returnsMany = configuration.getObjectFactory().isCollection(this.returnType) || this.returnType.isArray();
+      // 返回值类型为 Cursor
+      this.returnsCursor = Cursor.class.equals(this.returnType);
+      // 返回值类型为 Optional
+      this.returnsOptional = Optional.class.equals(this.returnType);
+      this.mapKey = getMapKey(method);
+      // 返回值类型为 Map
+      this.returnsMap = this.mapKey != null;
+      // RowBounds 参数位置索引，用于处理分页查询
+      this.rowBoundsIndex = getUniqueParamIndex(method, RowBounds.class);
+      // resultHandler 参数位置索引，用于处理每行数据
+      this.resultHandlerIndex = getUniqueParamIndex(method, ResultHandler.class);
+      // ParamNameResolver 用于解析 Mapper 方法参数
+      this.paramNameResolver = new ParamNameResolver(configuration, method);
+    }
+    ...
+}
+```
+
+```java
+// ParamNameResolver 类
+public ParamNameResolver(Configuration config, Method method) {
+    this.useActualParamName = config.isUseActualParamName();
+    final Class<?>[] paramTypes = method.getParameterTypes();
+    // 获取所有参数注解
+    final Annotation[][] paramAnnotations = method.getParameterAnnotations();
+    final SortedMap<Integer, String> map = new TreeMap<>();
+    int paramCount = paramAnnotations.length;
+    // get names from @Param annotations
+    // 从 @Param 注解中获取参数名称
+    for (int paramIndex = 0; paramIndex < paramCount; paramIndex++) {
+      if (isSpecialParameter(paramTypes[paramIndex])) {
+        // skip special parameters
+        continue;
+      }
+      String name = null;
+      for (Annotation annotation : paramAnnotations[paramIndex]) {
+        // 方法参数中是否有 Param 注解
+        if (annotation instanceof Param) {
+          hasParamAnnotation = true;
+          // 获取参数名称
+          name = ((Param) annotation).value();
+          break;
+        }
+      }
+      if (name == null) {
+        // @Param was not specified.
+        // 未指定 @Param 注解，用于判断是否使用实际的参数名称
+        if (useActualParamName) {
+          // 获取参数名
+          name = getActualParamName(method, paramIndex);
+        }
+        if (name == null) {
+          // use the parameter index as the name ("0", "1", ...)
+          // gcode issue #71
+          name = String.valueOf(map.size());
+        }
+      }
+      // 将参数信息存放在 Map 中，Key 为参数位置索引，value 为参数名称
+      map.put(paramIndex, name);
+    }
+    // 将参数信息保存在 names 属性中
+    names = Collections.unmodifiableSortedMap(map);
+}
+```
+
+
+
+​		到此为止，整个`MapperMethod`对象的创建过程已经完成。`MapperMethod`提供了一个`execute()`方法，用于执行`SQL`命令。在`MapperProxy`类的`invoke()`方
+
+法中获取`MapperMethod`对象后，最终会调用`MapperMethod`类的`execute()`：
+
+```java
+// MapperMethod 类
+public Object execute(SqlSession sqlSession, Object[] args) {
+    Object result;
+    // 其中 command 为 MapperMethod 构造时创建的 Sqlcommand 对象
+    // 获取 SQL 语句类型
+    switch (command.getType()) {
+      case INSERT: {
+        // 获取参数信息
+        Object param = method.convertArgsToSqlCommandParam(args);
+        // 调用 Sqlsession 的 insert() 方法，然后调用 rowCountResult() 方法统计
+        result = rowCountResult(sqlSession.insert(command.getName(), param));
+        break;
+      }
+      case UPDATE: {
+        Object param = method.convertArgsToSqlCommandParam(args);
+        result = rowCountResult(sqlSession.update(command.getName(), param));
+        break;
+      }
+      case DELETE: {
+        Object param = method.convertArgsToSqlCommandParam(args);
+        result = rowCountResult(sqlSession.delete(command.getName(), param));
+        break;
+      }
+      case SELECT:
+        if (method.returnsVoid() && method.hasResultHandler()) {
+          executeWithResultHandler(sqlSession, args);
+          result = null;
+        } else if (method.returnsMany()) {
+          result = executeForMany(sqlSession, args);
+        } else if (method.returnsMap()) {
+          result = executeForMap(sqlSession, args);
+        } else if (method.returnsCursor()) {
+          result = executeForCursor(sqlSession, args);
+        } else {
+          Object param = method.convertArgsToSqlCommandParam(args);
+          result = sqlSession.selectOne(command.getName(), param);
+          if (method.returnsOptional()
+              && (result == null || !method.getReturnType().equals(result.getClass()))) {
+            result = Optional.ofNullable(result);
+          }
+        }
+        break;
+      case FLUSH:
+        result = sqlSession.flushStatements();
+        break;
+      default:
+        throw new BindingException("Unknown execution method for: " + command.getName());
+    }
+    if (result == null && method.getReturnType().isPrimitive() && !method.returnsVoid()) {
+      throw new BindingException("Mapper method '" + command.getName()
+          + " attempted to return null from a method with a primitive return type (" + method.getReturnType() + ").");
+    }
+    return result;
+}
+
+private <E> Object executeForMany(SqlSession sqlSession, Object[] args) {
+    List<E> result;
+    Object param = method.convertArgsToSqlCommandParam(args);
+    if (method.hasRowBounds()) {
+      RowBounds rowBounds = method.extractRowBounds(args);
+      result = sqlSession.selectList(command.getName(), param, rowBounds);
+    } else {
+      result = sqlSession.selectList(command.getName(), param);
+    }
+    // issue #510 Collections & arrays support
+    if (!method.getReturnType().isAssignableFrom(result.getClass())) {
+      if (method.getReturnType().isArray()) {
+        return convertToArray(result);
+      } else {
+        return convertToDeclaredCollection(sqlSession.getConfiguration(), result);
+      }
+    }
+    return result;
+}
+```
+
+
+
+## SqlSession 执行 Mapper 过程
+
+​		`SqlSession`接口只有一个默认的实现，即`DefaultSqlSession`。
+
+```java
+// DefaultSqlSession 类
+private <E> List<E> selectList(String statement, Object parameter, RowBounds rowBounds, ResultHandler handler) {
+    try {
+      // 根据 Mapper 的 Id 获取对应的 Mappedstatement 对象
+      MappedStatement ms = configuration.getMappedStatement(statement);
+      // 以 MappedStatement 对象作为参数，调用 Executor 的 query() 方法
+      return executor.query(ms, wrapCollection(parameter), rowBounds, handler);
+    } catch (Exception e) {
+      throw ExceptionFactory.wrapException("Error querying database.  Cause: " + e, e);
+    } finally {
+      ErrorContext.instance().reset();
+    }
+}
+```
+
+```java
+// BaseExecutor
+public <E> List<E> query(MappedStatement ms, Object parameter, RowBounds rowBounds, ResultHandler resultHandler) throws SQLException {
+    // 获取 BoundSql 对象，BoundSql 是对动态 SQL 解析生成的 SQL 语句和参数映射信息的封装
+    BoundSql boundSql = ms.getBoundSql(parameter);
+    // 创建 CacheKey，用于缓存 Key
+    CacheKey key = createCacheKey(ms, parameter, rowBounds, boundSql);
+    return query(ms, parameter, rowBounds, resultHandler, key, boundSql);
+}
+
+public <E> List<E> query(MappedStatement ms, Object parameter, RowBounds rowBounds, ResultHandler resultHandler, CacheKey key, BoundSql boundSql) throws SQLException {
+    ErrorContext.instance().resource(ms.getResource()).activity("executing a query").object(ms.getId());
+    if (closed) {
+      throw new ExecutorException("Executor was closed.");
+    }
+    if (queryStack == 0 && ms.isFlushCacheRequired()) {
+      clearLocalCache();
+    }
+    List<E> list;
+    try {
+      queryStack++;
+      // 从缓存中获取结果
+      list = resultHandler == null ? (List<E>) localCache.getObject(key) : null;
+      if (list != null) {
+        handleLocallyCachedOutputParameters(ms, key, parameter, boundSql);
+      } else {
+        // 若缓存中获取不到，则调用 queryFromDatabase() 方法从数据库中查询
+        list = queryFromDatabase(ms, parameter, rowBounds, resultHandler, key, boundSql);
+      }
+    } finally {
+      queryStack--;
+    }
+    if (queryStack == 0) {
+      for (DeferredLoad deferredLoad : deferredLoads) {
+        deferredLoad.load();
+      }
+      // issue #601
+      deferredLoads.clear();
+      if (configuration.getLocalCacheScope() == LocalCacheScope.STATEMENT) {
+        // issue #482
+        clearLocalCache();
+      }
+    }
+    return list;
+}
+
+private <E> List<E> queryFromDatabase(MappedStatement ms, Object parameter, RowBounds rowBounds, ResultHandler resultHandler, CacheKey key, BoundSql boundSql) throws SQLException {
+    List<E> list;
+    localCache.putObject(key, EXECUTION_PLACEHOLDER);
+    try {
+      // 调用 doQuery() 方法查询
+      list = doQuery(ms, parameter, rowBounds, resultHandler, boundSql);
+    } finally {
+      localCache.removeObject(key);
+    }
+    // 缓存查询结果
+    localCache.putObject(key, list);
+    if (ms.getStatementType() == StatementType.CALLABLE) {
+      localOutputParameterCache.putObject(key, parameter);
+    }
+    return list;
+}
+```
+
+```java
+// SimpleExecutor 类
+public <E> List<E> doQuery(MappedStatement ms, Object parameter, RowBounds rowBounds, ResultHandler resultHandler, BoundSql boundSql) throws SQLException {
+    Statement stmt = null;
+    try {
+      Configuration configuration = ms.getConfiguration();
+      // 获取 StatementHandler 对象
+      StatementHandler handler = configuration.newStatementHandler(wrapper, ms, parameter, rowBounds, resultHandler, boundSql);
+      // 创建 Statement 对象，并进行设置参数等操作
+      stmt = prepareStatement(handler, ms.getStatementLog());
+      // 执行查询操作
+      return handler.query(stmt, resultHandler);
+    } finally {
+      closeStatement(stmt);
+    }
+}
+
+private Statement prepareStatement(StatementHandler handler, Log statementLog) throws SQLException {
+    Statement stmt;
+    // 获取 JDBC 中的 Connection 对象
+    Connection connection = getConnection(statementLog);
+    // 创建 Statement 对象
+    stmt = handler.prepare(connection, transaction.getTimeout());
+    // 设置参数
+    handler.parameterize(stmt);
+    return stmt;
+}
+```
+
+```java
+// SimpleStatementHandler 类
+public <E> List<E> query(Statement statement, ResultHandler resultHandler) throws SQLException {
+    String sql = boundSql.getSql();
+    // 执行 SQL 语句
+    statement.execute(sql);
+    // 处理结果集
+    return resultSetHandler.handleResultSets(statement);
+}
+```
+
+```java
+// DefaultResultSetHandler 类
+public List<Object> handleResultSets(Statement stmt) throws SQLException {
+    ErrorContext.instance().activity("handling results").object(mappedStatement.getId());
+
+    final List<Object> multipleResults = new ArrayList<>();
+
+    int resultSetCount = 0;
+    // 获取 ResultSet 对象，将 ResultSet 对象包装为 ResultSetwrapper
+    ResultSetWrapper rsw = getFirstResultSet(stmt);
+	// 获取 ResultMap 信息，一般只有一个 ResultMap
+    List<ResultMap> resultMaps = mappedStatement.getResultMaps();
+    int resultMapCount = resultMaps.size();
+    validateResultMapsCount(rsw, resultMapCount);
+    while (rsw != null && resultMapCount > resultSetCount) {
+      ResultMap resultMap = resultMaps.get(resultSetCount);
+      // 调用 handleResultset 方法处理结果集
+      handleResultSet(rsw, resultMap, multipleResults, null);
+      rsw = getNextResultSet(stmt);
+      cleanUpAfterHandlingResultSet();
+      resultSetCount++;
+    }
+
+    String[] resultSets = mappedStatement.getResultSets();
+    if (resultSets != null) {
+      while (rsw != null && resultSetCount < resultSets.length) {
+        ResultMapping parentMapping = nextResultMaps.get(resultSets[resultSetCount]);
+        if (parentMapping != null) {
+          String nestedResultMapId = parentMapping.getNestedResultMapId();
+          ResultMap resultMap = configuration.getResultMap(nestedResultMapId);
+          handleResultSet(rsw, resultMap, null, parentMapping);
+        }
+        rsw = getNextResultSet(stmt);
+        cleanUpAfterHandlingResultSet();
+        resultSetCount++;
+      }
+    }
+
+    return collapseSingleResultList(multipleResults);
+}
+```
 
