@@ -1813,3 +1813,367 @@ public List<Object> handleResultSets(Statement stmt) throws SQLException {
 }
 ```
 
+
+
+# 缓存
+
+​		`MyBatis`提供了一级缓存和二级缓存，其中一级缓存基于`SqlSession`实现，而二级缓存基于`Mapper`实现。
+
+​		一级缓存默认是开启的，而且不能关闭。MyBatis提供了一个配置参数`localCacheScope`，用于控制一级缓存的级别，该参数的取值为`SESSION、STATEMENT`，
+
+当指定`localCacheScope`参数值为`SESSION`时，缓存对整个`SqlSession`有效，只有执行`DML`语句`(`更新语句`)`时，缓存才会被清除。当`localCacheScope`值为
+
+`STATEMENT`时，缓存仅对当前执行的语句有效，当语句执行完毕后，缓存就会被清空。
+
+​		`MyBatis`的缓存基于`JVM`堆内存实现，即所有的缓存数据都存放在`Java`对象中。`MyBatis`通过`Cache`接口定义缓存对象的行为：
+
+```java
+public interface Cache {
+  // 获取缓存的 Id，通常情况下缓存的 Id 为 Mapper 的命名空间名称
+  String getId();
+  // 将一个Java对象添加到缓存中，该方法有两个参数，第一个参数为缓存的Key，即CacheKey的实例；第二个参数为需要缓存的对象
+  void putObject(Object key, Object value);
+  // 获取缓存Key对应的缓存对象。
+  Object getObject(Object key);
+  // 将一个对象从缓存中移除
+  Object removeObject(Object key);
+  // 清空缓存
+  void clear();
+
+  int getSize();
+  // 返回一个ReadWriteLock对象，该方法在 3.2.6 版本后已经不再使用
+  default ReadWriteLock getReadWriteLock() {
+    return null;
+  }
+}
+```
+
+​		MyBatis中的缓存类采用装饰器模式设计，`Cache`接口有一个基本的实现类，即`PerpetualCache`类，该类的实现比较简单，通过一个`HashMap`实例存放缓存对
+
+象。需要注意的是，`PerpetualCache`类重写了`Object`类的`equals()`方法，当两个缓存对象的`Id`相同时，即认为缓存对象相同。另外，`PerpetualCache`类还重
+
+写了`Object`类的`hashCode()`方法，仅以缓存对象的`Id`作为因子生成`hashCode`。
+
+![](image/QQ截图20220607090936.png)
+
+
+
+## 一级缓存
+
+​		`MyBatis`的一级缓存是`SqlSession`级别的缓存，`SqlSession`提供了面向用户的`API`，但是真正执行`SQL`操作的是`Executor`组件。`Executor`采用模板方法设
+
+计模式，`BaseExecutor`类用于处理一些通用的逻辑，其中一级缓存相关的逻辑就是在`BaseExecutor`类中完成的：
+
+```java
+public abstract class BaseExecutor implements Executor {
+
+  protected PerpetualCache localCache; // 一级缓存对象
+  protected PerpetualCache localOutputParameterCache; // 存储过程结果缓存对象
+  
+  protected BaseExecutor(Configuration configuration, Transaction transaction) {
+    this.localCache = new PerpetualCache("LocalCache");
+    this.localOutputParameterCache = new PerpetualCache("LocalOutputParameterCache");
+	...
+  }
+  ...
+}
+```
+
+​		`MyBatis`通过`CacheKey`对象来描述缓存的`Key`值。在进行查询操作时，首先创建`CacheKey`对象。如果两次查询操作`CacheKey`对象相同，就认为这两次查询
+
+执行的是相同的`SQL`语句：
+
+```java
+// BaseExecutor 类
+public CacheKey createCacheKey(MappedStatement ms, Object parameterObject, RowBounds rowBounds, BoundSql boundSql) {
+    if (closed) {
+      throw new ExecutorException("Executor was closed.");
+    }
+    CacheKey cacheKey = new CacheKey();
+    cacheKey.update(ms.getId()); // Mapper Id：Mapper 命名空间加标签 ID
+    cacheKey.update(rowBounds.getOffset()); // 偏移量
+    cacheKey.update(rowBounds.getLimit()); // 条数
+    cacheKey.update(boundSql.getSql()); // SQL 语句
+    List<ParameterMapping> parameterMappings = boundSql.getParameterMappings();
+    TypeHandlerRegistry typeHandlerRegistry = ms.getConfiguration().getTypeHandlerRegistry();
+    // mimic DefaultParameterHandler logic
+    // 参数值
+    for (ParameterMapping parameterMapping : parameterMappings) {
+      if (parameterMapping.getMode() != ParameterMode.OUT) {
+        Object value;
+        String propertyName = parameterMapping.getProperty();
+        if (boundSql.hasAdditionalParameter(propertyName)) {
+          value = boundSql.getAdditionalParameter(propertyName);
+        } else if (parameterObject == null) {
+          value = null;
+        } else if (typeHandlerRegistry.hasTypeHandler(parameterObject.getClass())) {
+          value = parameterObject;
+        } else {
+          MetaObject metaObject = configuration.newMetaObject(parameterObject);
+          value = metaObject.getValue(propertyName);
+        }
+        cacheKey.update(value);
+      }
+    }
+    // Environment Id
+    if (configuration.getEnvironment() != null) {
+      // issue #176
+      cacheKey.update(configuration.getEnvironment().getId());
+    }
+    return cacheKey;
+}
+```
+
+​		在查询时，首先会从缓存中获取，如果没有，则从数据库查询并缓存：
+
+```java
+// BaseExecutor 类
+public <E> List<E> query(MappedStatement ms, Object parameter, RowBounds rowBounds, ResultHandler resultHandler, CacheKey key, BoundSql boundSql) throws SQLException {
+    ErrorContext.instance().resource(ms.getResource()).activity("executing a query").object(ms.getId());
+    if (closed) {
+      throw new ExecutorException("Executor was closed.");
+    }
+    if (queryStack == 0 && ms.isFlushCacheRequired()) {
+      clearLocalCache();
+    }
+    List<E> list;
+    try {
+      queryStack++;
+      // 查询缓存
+      list = resultHandler == null ? (List<E>) localCache.getObject(key) : null;
+      if (list != null) {
+        handleLocallyCachedOutputParameters(ms, key, parameter, boundSql);
+      } else {
+        list = queryFromDatabase(ms, parameter, rowBounds, resultHandler, key, boundSql);
+      }
+    } finally {
+      queryStack--;
+    }
+    if (queryStack == 0) {
+      for (DeferredLoad deferredLoad : deferredLoads) {
+        deferredLoad.load();
+      }
+      // issue #601
+      deferredLoads.clear();
+      // 如果 localCacheScope 属性设置为 STATEMENT，则每次查询操作完成后，都会调用 clearLocalCache() 方法清空缓存
+      if (configuration.getLocalCacheScope() == LocalCacheScope.STATEMENT) {
+        // issue #482
+        clearLocalCache();
+      }
+    }
+    return list;
+}
+```
+
+
+
+​		在分布式环境下，务必将`MyBatis`的`localCacheScope`属性设置为`STATEMENT`，避免其他应用节点执行`SQL`更新语句后，本节点缓存得不到刷新而导致的数据
+
+一致性问题。
+
+
+
+## 二级缓存
+
+​		`Executor`接口有几种不同的实现，分别为`SimpleExecutor、BatchExecutor、ReuseExecutor`。另外，还有一个比较特殊的`CachingExecutor`，
+
+`CachingExecutor`用到了装饰器模式，在其他几种`Executor`的基础上增加了二级缓存功能。
+
+```java
+// Configuration 类
+public Executor newExecutor(Transaction transaction, ExecutorType executorType) {
+    executorType = executorType == null ? defaultExecutorType : executorType;
+    executorType = executorType == null ? ExecutorType.SIMPLE : executorType;
+    Executor executor;
+	// 根据 executor 类型创建对象的 Executor 对象
+    if (ExecutorType.BATCH == executorType) {
+      executor = new BatchExecutor(this, transaction);
+    } else if (ExecutorType.REUSE == executorType) {
+      executor = new ReuseExecutor(this, transaction);
+    } else {
+      executor = new SimpleExecutor(this, transaction);
+    }
+    //如果 cacheEnabled 属性为 ture，则使用 cachingExecutor 对 Executor 进行装饰
+    if (cacheEnabled) {
+      executor = new CachingExecutor(executor);
+    }
+    executor = (Executor) interceptorChain.pluginAll(executor);
+    return executor;
+}
+```
+
+```java
+public class CachingExecutor implements Executor {
+
+  private final Executor delegate;
+  private final TransactionalCacheManager tcm = new TransactionalCacheManager();
+  ...
+}
+```
+
+```java
+public class TransactionalCacheManager {
+  // 通过 HashMap 对象维护二级缓存对应的 TransactionalCache 实例
+  private final Map<Cache, TransactionalCache> transactionalCaches = new HashMap<>();
+
+  public void clear(Cache cache) {
+    getTransactionalCache(cache).clear();
+  }
+
+  public Object getObject(Cache cache, CacheKey key) {
+    // 获取二级缓存对应的 TransactionalCache 对象，然后根据缓存 Key 获取缓存对象
+    return getTransactionalCache(cache).getObject(key);
+  }
+
+  public void putObject(Cache cache, CacheKey key, Object value) {
+    getTransactionalCache(cache).putObject(key, value);
+  }
+
+  public void commit() {
+    for (TransactionalCache txCache : transactionalCaches.values()) {
+      txCache.commit();
+    }
+  }
+
+  public void rollback() {
+    for (TransactionalCache txCache : transactionalCaches.values()) {
+      txCache.rollback();
+    }
+  }
+
+  private TransactionalCache getTransactionalCache(Cache cache) {
+    // 获取二级缓存对应的 Transactionalcache 对象,如果获取不到，则创建，然后添加到 Map 中
+    return MapUtil.computeIfAbsent(transactionalCaches, cache, TransactionalCache::new);
+  }
+}
+```
+
+​		二级缓存的工作机制：
+
+```java
+// CachingExecutor
+public <E> List<E> query(MappedStatement ms, Object parameterObject, RowBounds rowBounds, ResultHandler resultHandler, CacheKey key, BoundSql boundSql)
+      throws SQLException {
+    // 获取 Mappedstatement 对象中维护的二级缓存对象
+    Cache cache = ms.getCache();
+    if (cache != null) {
+      // 判断是否需要刷新二级缓存
+      flushCacheIfRequired(ms);
+      if (ms.isUseCache() && resultHandler == null) {
+        ensureNoOutParams(ms, boundSql);
+        @SuppressWarnings("unchecked")
+        // 从 Mappedstatement 对象对应的二级缓存中获取数据
+        List<E> list = (List<E>) tcm.getObject(cache, key);
+        if (list == null) {
+          // 如果缓存数据不存在，则从数据库中查询数据
+          list = delegate.query(ms, parameterObject, rowBounds, resultHandler, key, boundSql);
+          // 将数据存放到 MappedStatement 对象对应的二级缓存中
+          tcm.putObject(cache, key, list); // issue #578 and #116
+        }
+        return list;
+      }
+    }
+    return delegate.query(ms, parameterObject, rowBounds, resultHandler, key, boundSql);
+}
+
+private void flushCacheIfRequired(MappedStatement ms) {
+    Cache cache = ms.getCache();
+    // ms.isFlushCacheRequired() 会判断 <select|update|delete|insert> 标签的 flushCache 属性，如果属性值为 true，就清空缓存。<select> 标签的flushCache 属性值默认为 false，而 <update|delete|insert> 标签的 flushCache 属性值默认为 true。
+    if (cache != null && ms.isFlushCacheRequired()) {
+      tcm.clear(cache);
+    }
+}
+```
+
+​		`XMLMapperBuilder`在解析`Mapper`配置时会调用`cacheElement()`方法解析`<cache>`标签：
+
+```java
+private void cacheElement(XNode context) {
+    if (context != null) {
+      String type = context.getStringAttribute("type", "PERPETUAL");
+      Class<? extends Cache> typeClass = typeAliasRegistry.resolveAlias(type);
+      String eviction = context.getStringAttribute("eviction", "LRU");
+      Class<? extends Cache> evictionClass = typeAliasRegistry.resolveAlias(eviction);
+      Long flushInterval = context.getLongAttribute("flushInterval");
+      Integer size = context.getIntAttribute("size");
+      boolean readWrite = !context.getBooleanAttribute("readOnly", false);
+      boolean blocking = context.getBooleanAttribute("blocking", false);
+      Properties props = context.getChildrenAsProperties();
+      builderAssistant.useNewCache(typeClass, evictionClass, flushInterval, size, readWrite, blocking, props);
+    }
+}
+```
+
+​		在获取`<cache>`标签的所有属性信息后，调用`MapperBuilderAssistant`对象的`userNewCache()`方法创建二级缓存实例，然后通过`MapperBuilderAssistant`的
+
+`currentCache`属性保存二级缓存对象的引用。在调用`MapperBuilderAssistant`对象的`addMappedStatement()`方法创建`MappedStatement`对象时会将当前命名空间
+
+对应的二级缓存对象的引用添加到`MappedStatement`对象中。
+
+
+
+## 使用 Redis 缓存
+
+​		`MyBatis`除了提供内置的一级缓存和二级缓存外，还支持使用第三方缓存作为二级缓存。
+
+​		使用`Redis`作为二级缓存，提供了一个比较核心的缓存实现类，即`RedisCache`类。`RedisCache`实现了`Cache`接口，使用`Jedis`客户端操作`Redis`，在
+
+`RedisCache`构造方法中建立与`Redis`的连接：
+
+```java
+// RedisCache 类
+public RedisCache(final String id) {
+    if (id == null) {
+      throw new IllegalArgumentException("Cache instances require an ID");
+    }
+    this.id = id;
+    // 通过 RedisconfigurationBuilder 对象获取 Redis 配置信息
+    RedisConfig redisConfig = RedisConfigurationBuilder.getInstance().parseConfiguration();
+    // 实例化 JedisPool，与 Redis 服务器建立连接
+	pool = new JedisPool(redisConfig, redisConfig.getHost(), redisConfig.getPort(),
+			redisConfig.getConnectionTimeout(), redisConfig.getSoTimeout(), redisConfig.getPassword(),
+			redisConfig.getDatabase(), redisConfig.getClientName());
+}
+```
+
+​		`RedisCache`使用`Redis`的`Hash`数据结构存放缓存数据。在`RedisCache`类的`putObject()`方法中，首先对`Java`对象进行序列化，提供了两种序列化策略，即
+
+`JDK`内置的序列化机制和第三方序列化框架`Kryo`，具体使用哪种序列化方式，可以在配置文件中配置：
+
+```java
+// RedisCache 类
+public void putObject(final Object key, final Object value) {
+    execute(new RedisCallback() {
+      @Override
+      public Object doWithRedis(Jedis jedis) {
+        jedis.hset(id.toString().getBytes(), key.toString().getBytes(), SerializeUtil.serialize(value));
+        return null;
+      }
+    });
+}
+
+public Object getObject(final Object key) {
+    return execute(new RedisCallback() {
+      @Override
+      public Object doWithRedis(Jedis jedis) {
+        return SerializeUtil.unserialize(jedis.hget(id.toString().getBytes(), key.toString().getBytes()));
+      }
+    });
+}
+
+private Object execute(RedisCallback callback) {
+    Jedis jedis = pool.getResource();
+    try {
+      return callback.doWithRedis(jedis);
+    } finally {
+      jedis.close();
+    }
+}
+```
+
+
+
+
+
+
+
