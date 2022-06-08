@@ -2173,6 +2173,71 @@ private Object execute(RedisCallback callback) {
 
 
 
+# 日志
+
+​		`MyBatis`通过`Log`接口定义日志操作规范。针对不同的日志框架提供对`Log`接口对应的实现：
+
+```java
+public interface Log {
+
+  boolean isDebugEnabled();
+
+  boolean isTraceEnabled();
+
+  void error(String s, Throwable e);
+
+  void error(String s);
+
+  void debug(String s);
+
+  void trace(String s);
+
+  void warn(String s);
+
+}
+```
+
+​		`Log`实现类的逻辑比较简单，只是调用对应日志框架相关的`API`打印日志。
+
+​		当未指定使用哪种日志实现时，`MyBatis`能够按照顺序查找`Classpath`下的日志框架相关`JAR`包。如果`Classpath`下有对应的日志包，则使用该日志框架打印
+
+日志：
+
+```java
+public final class LogFactory {
+
+  /**
+   * Marker to be used by logging implementations that support markers.
+   */
+  public static final String MARKER = "MYBATIS";
+
+  private static Constructor<? extends Log> logConstructor;
+
+  static {
+    tryImplementation(LogFactory::useSlf4jLogging);
+    tryImplementation(LogFactory::useCommonsLogging);
+    tryImplementation(LogFactory::useLog4J2Logging);
+    tryImplementation(LogFactory::useLog4JLogging);
+    tryImplementation(LogFactory::useJdkLogging);
+    tryImplementation(LogFactory::useNoLogging);
+  }
+  
+  private static void tryImplementation(Runnable runnable) {
+    if (logConstructor == null) {
+      try {
+        runnable.run();
+      } catch (Throwable t) {
+        // ignore
+      }
+    }
+  }
+ 
+  ...
+}
+```
+
+
+
 
 
 
