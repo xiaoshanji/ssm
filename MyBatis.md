@@ -2238,6 +2238,482 @@ public final class LogFactory {
 
 
 
+# 动态SQL
+
+​		`SqlSource`就代表`Java`注解或者`XML`文件配置的`SQL`资源：
+
+```java
+public interface SqlSource {
+  BoundSql getBoundSql(Object parameterObject);
+}
+```
+
+![](image/QQ截图20220609112849.png)
+
+​		`ProviderSqlSource`：用于描述通过`@Select、@SelectProvider`等注解配置的`SQL`资源信息。
+
+​		`DynamicSqlSource`：用于描述`Mapper XML`文件中配置的`SQL`资源信息，这些`SQL`通常包含动态`SQL`配置或者`${}`参数占位符，需要在`Mapper`调用时才能确
+
+定具体的`SQL`语句。
+
+​		`RawSqlSource`：用于描述`Mapper XML`文件中配置的`SQL`资源信息，与`DynamicSqlSource`不同的是，这些SQL语句在解析`XML`配置的时候就能确定，即不包
+
+含动态`SQL`相关配置。
+
+​		`StaticSqlSource`：用于描述`ProviderSqlSource、DynamicSqlSource、RawSqlSource`解析后得到的静态`SQL`资源。无论是`Java`注解还是`XML`文件配置的`SQL`
+
+信息，在`Mapper`调用时都会根据用户传入的参数将`Mapper`配置转换为`StaticSqlSource`类。
+
+```java
+public class StaticSqlSource implements SqlSource {
+  // Mapper 解析后的 sql
+  private final String sql;
+  // 参数映射信息
+  private final List<ParameterMapping> parameterMappings;
+  private final Configuration configuration;
+
+  public StaticSqlSource(Configuration configuration, String sql) {
+    this(configuration, sql, null);
+  }
+
+  public StaticSqlSource(Configuration configuration, String sql, List<ParameterMapping> parameterMappings) {
+    this.sql = sql;
+    this.parameterMappings = parameterMappings;
+    this.configuration = configuration;
+  }
+
+  @Override
+  public BoundSql getBoundSql(Object parameterObject) {
+    return new BoundSql(configuration, sql, parameterMappings, parameterObject);
+  }
+}
+```
+
+
+
+​		`BoundSql`是对`SQL`语句及参数信息的封装，它是`SqlSource`解析后的结果：
+
+```java
+public class BoundSql {
+  // Mapper 解析后的 sql
+  private final String sql;
+  // Mapper 参数映射信息
+  private final List<ParameterMapping> parameterMappings;
+  // Mapper 参数对象
+  private final Object parameterObject;
+  // 额外参数信息，包括 <bind> 标签绑定的参数，内置参数
+  private final Map<String, Object> additionalParameters;
+  // 参数对象对应的 MetaObject 对象
+  private final MetaObject metaParameters;
+
+  public BoundSql(Configuration configuration, String sql, List<ParameterMapping> parameterMappings, Object parameterObject) {
+    this.sql = sql;
+    this.parameterMappings = parameterMappings;
+    this.parameterObject = parameterObject;
+    this.additionalParameters = new HashMap<>();
+    this.metaParameters = configuration.newMetaObject(additionalParameters);
+  }
+  ...
+}
+```
+
+
+
+## LanguageDriver
+
+```java
+public interface LanguageDriver {
+  // 创建 ParameterHandler 对象
+  ParameterHandler createParameterHandler(MappedStatement mappedStatement, Object parameterObject, BoundSql boundSql);
+  // 创建 SqlSource 对象
+  SqlSource createSqlSource(Configuration configuration, XNode script, Class<?> parameterType);
+
+  SqlSource createSqlSource(Configuration configuration, String script, Class<?> parameterType);
+
+}
+```
+
+​		`MyBatis`中为`LanguageDriver`接口提供了两个实现类，分别为`XMLLanguageDriver`和`RawLanguageDriver`。
+
+​				`XMLLanguageDriver`为`XML`语言驱动，为`MyBatis`提供了通过`XML`标签`(`常用的`<if>、<where>`等标签`)`结合`OGNL`表达式语法实现动态`SQL`的功能。
+
+​				`RawLanguageDriver`表示仅支持静态`SQL`配置，不支持动态`SQL`功能。
+
+```java
+public class XMLLanguageDriver implements LanguageDriver {
+
+  @Override
+  public ParameterHandler createParameterHandler(MappedStatement mappedStatement, Object parameterObject, BoundSql boundSql) {
+    return new DefaultParameterHandler(mappedStatement, parameterObject, boundSql);
+  }
+
+  // 解析 XML 文件中配置的 SQL 信息
+  @Override
+  public SqlSource createSqlSource(Configuration configuration, XNode script, Class<?> parameterType) {
+    // 创建 XMLScriptBuilder 对象
+    XMLScriptBuilder builder = new XMLScriptBuilder(configuration, script, parameterType);
+    // 去解析 SQL 资源
+    return builder.parseScriptNode();
+  }
+
+  // 该方法用于解析 Java 注解中配置的 SQL 信息
+  @Override
+  public SqlSource createSqlSource(Configuration configuration, String script, Class<?> parameterType) {
+
+	// 若字符串以 <script> 标签开头，则以 XML 方式解析
+    if (script.startsWith("<script>")) {
+      XPathParser parser = new XPathParser(script, false, configuration.getVariables(), new XMLMapperEntityResolver());
+      return createSqlSource(configuration, parser.evalNode("/script"), parameterType);
+    } else {
+      // issue #127
+      // 解析 SQL 配置中的全局变量
+      script = PropertyParser.parse(script, configuration.getVariables());
+      TextSqlNode textSqlNode = new TextSqlNode(script);
+      // 如果 SQL 中仍包含 ${} 参数占位符，则返回 DynamicSqlSource 实例，否则返回 RawSqlSource
+      if (textSqlNode.isDynamic()) {
+        return new DynamicSqlSource(configuration, textSqlNode);
+      } else {
+        return new RawSqlSource(configuration, script, parameterType);
+      }
+    }
+  }
+}
+```
+
+
+
+## SqlNode
+
+​		`SqlNode`用于描述`Mapper SQL`配置中的`SQL`节点，它是`MyBatis`框架实现动态`SQL`的基石：
+
+```java
+public interface SqlNode {
+  // 解析 SQL 节点，根据参数信息生成静态 SQL 内容。
+  // DynamicContext 对象中封装了 Mapper 调用时传入的参数信息及 MyBatis 内置的 _parameter 和 _databaseId 参数
+  boolean apply(DynamicContext context);
+}
+```
+
+​		动态`SQL`所使用的标签都分别对应一种具体的`SqlNode`实现类。
+
+![](image/QQ截图20220609123603.png)
+
+```java
+public class MixedSqlNode implements SqlNode {
+  private final List<SqlNode> contents;
+
+  public MixedSqlNode(List<SqlNode> contents) {
+    this.contents = contents;
+  }
+
+  @Override
+  public boolean apply(DynamicContext context) {
+    contents.forEach(node -> node.apply(context));
+    return true;
+  }
+}
+```
+
+```java
+public class IfSqlNode implements SqlNode {
+  // 解析 OGNL 表达式
+  private final ExpressionEvaluator evaluator;
+  // if 标签 test 属性的内容
+  private final String test;
+  // if 标签内的 SQL 内容
+  private final SqlNode contents;
+
+  public IfSqlNode(SqlNode contents, String test) {
+    this.test = test;
+    this.contents = contents;
+    this.evaluator = new ExpressionEvaluator();
+  }
+
+  @Override
+  public boolean apply(DynamicContext context) {
+    // 如果 OGNL 表达式值为 true,则调用 <if> 标签内容对应的 sqlNode 的 apply() 方法
+    if (evaluator.evaluateBoolean(test, context.getBindings())) {
+      contents.apply(context);
+      return true;
+    }
+    return false;
+  }
+
+}
+```
+
+
+
+## 动态 SQL 解析过程
+
+​		了解`MyBatis`动态`SQL`的解析过程，可以从`XMLLanguageDriver`类的`createSqlSource()`方法出发进行分析：
+
+```java
+// XMLLanguageDriver 类
+public SqlSource createSqlSource(Configuration configuration, XNode script, Class<?> parameterType) {
+    XMLScriptBuilder builder = new XMLScriptBuilder(configuration, script, parameterType);
+    return builder.parseScriptNode();
+}
+```
+
+```java
+// XMLScriptBuilder 类
+public SqlSource parseScriptNode() {
+    // 将 SQL 配置转换为 SqlNode 对象
+    MixedSqlNode rootSqlNode = parseDynamicTags(context);
+    SqlSource sqlSource;
+    // 判断 Mapper SQL 配置中是否包含动态 SQL 元素，如果是，就创建 DynamicsqlSource 对象，否则创建 RawSqlSource 对象
+    if (isDynamic) {
+      sqlSource = new DynamicSqlSource(configuration, rootSqlNode);
+    } else {
+      sqlSource = new RawSqlSource(configuration, rootSqlNode, parameterType);
+    }
+    return sqlSource;
+}
+
+protected MixedSqlNode parseDynamicTags(XNode node) {
+    List<SqlNode> contents = new ArrayList<>();
+    NodeList children = node.getNode().getChildNodes();
+    // 对 XML 子元素进行遍历
+    for (int i = 0; i < children.getLength(); i++) {
+      XNode child = node.newXNode(children.item(i));
+      // 如果子元素为 SQL文本内容，则使用 TextSqlNode 描述该节点
+      if (child.getNode().getNodeType() == Node.CDATA_SECTION_NODE || child.getNode().getNodeType() == Node.TEXT_NODE) {
+        String data = child.getStringBody("");
+        TextSqlNode textSqlNode = new TextSqlNode(data);
+        // 若 SQL 文本中包含 ${} 参数占位符，则为动态 SQL
+        if (textSqlNode.isDynamic()) {
+          contents.add(textSqlNode);
+          isDynamic = true;
+        } else {
+          // 如果 SQL 文本中不包含 ${} 参数占位符，则不是动态 SQL
+          contents.add(new StaticTextSqlNode(data));
+        }
+      } else if (child.getNode().getNodeType() == Node.ELEMENT_NODE) { // issue #628
+        // 如果子元素为 <if>、<where> 等标签，则使用对应的 NodeHandler 处理
+        String nodeName = child.getNode().getNodeName();
+        NodeHandler handler = nodeHandlerMap.get(nodeName);
+        if (handler == null) {
+          throw new BuilderException("Unknown element <" + nodeName + "> in SQL statement.");
+        }
+        handler.handleNode(child, contents);
+        isDynamic = true;
+      }
+    }
+    return new MixedSqlNode(contents);
+}
+```
+
+
+
+​		动态`SQL`标签解析完成后，将解析后生成的`SqlNode`对象封装在`SqlSource`对象中。`MyBatis`中的`MappedStatement`用于描述`Mapper`中的`SQL`配置，
+
+`SqlSource`创建完毕后，最终会存放在`MappedStatement`对象的`sqlSource`属性中，`Executor`组件操作数据库时，会调用`MappedStatement`对象的
+
+`getBoundSql()`方法获取`BoundSql`对象。
+
+```java
+// MappedStatement 类
+public BoundSql getBoundSql(Object parameterObject) {
+    BoundSql boundSql = sqlSource.getBoundSql(parameterObject); // SqlNode 对象解析成 SQL 语句的过程
+    List<ParameterMapping> parameterMappings = boundSql.getParameterMappings();
+    if (parameterMappings == null || parameterMappings.isEmpty()) {
+      boundSql = new BoundSql(configuration, boundSql.getSql(), parameterMap.getParameterMappings(), parameterObject);
+    }
+
+    // check for nested result maps in parameter mappings (issue #30)
+    for (ParameterMapping pm : boundSql.getParameterMappings()) {
+      String rmId = pm.getResultMapId();
+      if (rmId != null) {
+        ResultMap rm = configuration.getResultMap(rmId);
+        if (rm != null) {
+          hasNestedResultMaps |= rm.hasNestedResultMaps();
+        }
+      }
+    }
+
+    return boundSql;
+}
+```
+
+```java
+// DynamicSqlSource 类
+public BoundSql getBoundSql(Object parameterObject) {
+    // 通过参数对象创建动态 SQL 上下文对象
+    DynamicContext context = new DynamicContext(configuration, parameterObject);
+    // 以 DynamicContext 对象作为参数调用 sqlNode 的 apply() 方法
+    rootSqlNode.apply(context);
+    // 创建 SqlSourceBuilder 对象
+    SqlSourceBuilder sqlSourceParser = new SqlSourceBuilder(configuration);
+    Class<?> parameterType = parameterObject == null ? Object.class : parameterObject.getClass();
+    // 获取解析后的 SQL 内容，然后生成 StaticSqlSource 对象
+    SqlSource sqlSource = sqlSourceParser.parse(context.getSql(), parameterType, context.getBindings());
+    // 获取 BoundSql 实例
+    BoundSql boundSql = sqlSource.getBoundSql(parameterObject);
+    // 将 <bind> 标签绑定的参数添加到 Boundsql 对象中
+    context.getBindings().forEach(boundSql::setAdditionalParameter);
+    return boundSql;
+}
+```
+
+```java
+// SqlSourceBuilder
+public SqlSource parse(String originalSql, Class<?> parameterType, Map<String, Object> additionalParameters) {
+    // ParameterMappingTokenHandler 为 Mybatis 参数映射处理器，用于处理 SQL 中的 #{} 参数占位符
+    ParameterMappingTokenHandler handler = new ParameterMappingTokenHandler(configuration, parameterType, additionalParameters);
+    // Token 解析器，用于解析 #{} 参数
+    GenericTokenParser parser = new GenericTokenParser("#{", "}", handler);
+    String sql;
+    // 将 #{} 参数占位符转换为 ?
+    if (configuration.isShrinkWhitespacesInSql()) {
+      sql = parser.parse(removeExtraWhitespaces(originalSql));
+    } else {
+      sql = parser.parse(originalSql);
+    }
+    return new StaticSqlSource(configuration, sql, handler.getParameterMappings());
+}
+```
+
+```java
+// GenericTokenParser 类
+public String parse(String text) {
+    if (text == null || text.isEmpty()) {
+      return "";
+    }
+    // search open token
+    // 获取第一个 #{ 在 SQL 中的位置
+    int start = text.indexOf(openToken);
+    // 不存在占位符
+    if (start == -1) {
+      return text;
+    }
+    // 将 SQL 转为 char 数组
+    char[] src = text.toCharArray();
+    // 记录解析的 #{ 或 } 的偏移量，避免重复解析
+    int offset = 0;
+    final StringBuilder builder = new StringBuilder();
+    // 占位符中的内容
+    StringBuilder expression = null;
+    // 遍历所有的 #{} 中的内容，然后替换参数占位符
+    do {
+      if (start > 0 && src[start - 1] == '\\') {
+        // this open token is escaped. remove the backslash and continue.
+        builder.append(src, offset, start - offset - 1).append(openToken);
+        offset = start + openToken.length();
+      } else {
+        // found open token. let's search close token.
+        if (expression == null) {
+          expression = new StringBuilder();
+        } else {
+          expression.setLength(0);
+        }
+        builder.append(src, offset, start - offset);
+        offset = start + openToken.length();
+        int end = text.indexOf(closeToken, offset);
+        while (end > -1) {
+          if (end > offset && src[end - 1] == '\\') {
+            // this close token is escaped. remove the backslash and continue.
+            expression.append(src, offset, end - offset - 1).append(closeToken);
+            offset = end + closeToken.length();
+            end = text.indexOf(closeToken, offset);
+          } else {
+            expression.append(src, offset, end - offset);
+            break;
+          }
+        }
+        if (end == -1) {
+          // close token was not found.
+          builder.append(src, start, src.length - start);
+          offset = src.length;
+        } else {
+          // 替换参数占位符
+          builder.append(handler.handleToken(expression.toString()));
+          offset = end + closeToken.length();
+        }
+      }
+      start = text.indexOf(openToken, offset);
+    } while (start > -1);
+    if (offset < src.length) {
+      builder.append(src, offset, src.length - offset);
+    }
+    return builder.toString();
+}
+```
+
+```java
+// ParameterMappingTokenHandler 类
+public String handleToken(String content) {
+      parameterMappings.add(buildParameterMapping(content)); // 对占位符内容进行解析，将占位符内容替换为 ParameterMapping 对象
+      return "?";
+}
+
+private ParameterMapping buildParameterMapping(String content) {
+      // 将占位符内容转换为 Map 对象
+      Map<String, String> propertiesMap = parseParameterMapping(content);
+      // property 对应的值为参数占位符名称
+      String property = propertiesMap.get("property");
+      Class<?> propertyType;
+      // 如果内置参数或 <bind> 标签绑定的参数包含该属性，则参数类型为 Getter 方法返回值类型
+      if (metaParameters.hasGetter(property)) { // issue #448 get type from additional params
+        propertyType = metaParameters.getGetterType(property);
+      } else if (typeHandlerRegistry.hasTypeHandler(parameterType)) { // 判读该参数类型是否注册了 TypeHandler,如果注册了，则使用参数类型
+        propertyType = parameterType;
+      } else if (JdbcType.CURSOR.name().equals(propertiesMap.get("jdbcType"))) {// 如果指定了 jdbcType 属性，并且为 CURSOR 类型，则使用Resultset 类型
+        propertyType = java.sql.ResultSet.class;
+      } else if (property == null || Map.class.isAssignableFrom(parameterType)) { // 如果参数类型为 Map 接口的子类型，则使用 Object 类型
+        propertyType = Object.class;
+      } else {
+        // 获取 parameterType 对应的 MetaClass 对象，方便获取参数类型的反射信息
+        MetaClass metaClass = MetaClass.forClass(parameterType, configuration.getReflectorFactory());
+        // 如果参数类型中包含 property 属性指定的内容，则使用 Getter 方法返回类型
+        if (metaClass.hasGetter(property)) {
+          propertyType = metaClass.getGetterType(property);
+        } else {
+          propertyType = Object.class;
+        }
+      }
+      // 使用建造者模式构建 ParameterMapping 对象
+      ParameterMapping.Builder builder = new ParameterMapping.Builder(configuration, property, propertyType);
+      Class<?> javaType = propertyType;
+      String typeHandlerAlias = null;
+      for (Map.Entry<String, String> entry : propertiesMap.entrySet()) {
+        String name = entry.getKey();
+        String value = entry.getValue();
+        // 指定 ParameterMapping 对象的属性
+        if ("javaType".equals(name)) {
+          javaType = resolveClass(value);
+          builder.javaType(javaType);
+        } else if ("jdbcType".equals(name)) {
+          builder.jdbcType(resolveJdbcType(value));
+        } else if ("mode".equals(name)) {
+          builder.mode(resolveParameterMode(value));
+        } else if ("numericScale".equals(name)) {
+          builder.numericScale(Integer.valueOf(value));
+        } else if ("resultMap".equals(name)) {
+          builder.resultMapId(value);
+        } else if ("typeHandler".equals(name)) {
+          typeHandlerAlias = value;
+        } else if ("jdbcTypeName".equals(name)) {
+          builder.jdbcTypeName(value);
+        } else if ("property".equals(name)) {
+          // Do Nothing
+        } else if ("expression".equals(name)) {
+          throw new BuilderException("Expression based parameters are not supported yet");
+        } else {
+          throw new BuilderException("An invalid property '" + name + "' was found in mapping #{" + content + "}.  Valid properties are " + PARAMETER_PROPERTIES);
+        }
+      }
+      if (typeHandlerAlias != null) {
+        builder.typeHandler(resolveTypeHandler(javaType, typeHandlerAlias));
+      }
+      return builder.build();
+}
+```
+
+
+
+
+
 
 
 
