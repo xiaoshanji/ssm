@@ -2712,7 +2712,240 @@ private ParameterMapping buildParameterMapping(String content) {
 
 
 
+# 插件
 
+## 注册过程
+
+​		`MyBatis`的插件实际上就是一个拦截器，`Configuration`类中维护了一个`InterceptorChain`的实例。
+
+```java
+public class Configuration {
+    protected final InterceptorChain interceptorChain = new InterceptorChain(); // 拦截器链，用于存放通过 <plugins> 标签注册的所有拦截器
+    
+    public void addInterceptor(Interceptor interceptor) {
+    	interceptorChain.addInterceptor(interceptor);
+	}
+    ...
+}
+```
+
+​		`MyBatis`框架在应用启动时会对`<plugins>`标签进行解析：
+
+```java
+// XMLConfigBuilder 类
+private void pluginElement(XNode parent) throws Exception {
+    if (parent != null) {
+      for (XNode child : parent.getChildren()) {
+        // 获取 <plugins> 标签的 interceptor 属性
+        String interceptor = child.getStringAttribute("interceptor");
+        // 获取拦截器属性，转换为 Properties 对象
+        Properties properties = child.getChildrenAsProperties();
+        // 创建拦截器实例，通过反射机制
+        Interceptor interceptorInstance = (Interceptor) resolveClass(interceptor).getDeclaredConstructor().newInstance();
+        // 设置拦截器实例属性信息
+        interceptorInstance.setProperties(properties);
+        // 将拦截器添加到拦截器链中
+        configuration.addInterceptor(interceptorInstance);
+      }
+    }
+}
+```
+
+
+
+## 执行过程
+
+​		`MyBatis`使用工厂方法创建`Executor、ParameterHandler、ResultSetHandler、StatementHandler`组件的实例，在工厂方法中执行拦截逻辑：
+
+```java
+  // Configuration 类
+  public ParameterHandler newParameterHandler(MappedStatement mappedStatement, Object parameterObject, BoundSql boundSql) {
+    ParameterHandler parameterHandler = mappedStatement.getLang().createParameterHandler(mappedStatement, parameterObject, boundSql);
+    // 创建 ParameterHandler 代理对象
+    parameterHandler = (ParameterHandler) interceptorChain.pluginAll(parameterHandler);
+    return parameterHandler;
+  }
+
+  public ResultSetHandler newResultSetHandler(Executor executor, MappedStatement mappedStatement, RowBounds rowBounds, ParameterHandler parameterHandler,
+      ResultHandler resultHandler, BoundSql boundSql) {
+    ResultSetHandler resultSetHandler = new DefaultResultSetHandler(executor, mappedStatement, parameterHandler, resultHandler, boundSql, rowBounds);
+    // 创建 ResultSetHandler 代理对象
+    resultSetHandler = (ResultSetHandler) interceptorChain.pluginAll(resultSetHandler);
+    return resultSetHandler;
+  }
+
+  public StatementHandler newStatementHandler(Executor executor, MappedStatement mappedStatement, Object parameterObject, RowBounds rowBounds, ResultHandler resultHandler, BoundSql boundSql) {
+    StatementHandler statementHandler = new RoutingStatementHandler(executor, mappedStatement, parameterObject, rowBounds, resultHandler, boundSql);
+    // 创建 StatementHandler 代理对象
+    statementHandler = (StatementHandler) interceptorChain.pluginAll(statementHandler);
+    return statementHandler;
+  }
+
+  public Executor newExecutor(Transaction transaction, ExecutorType executorType) {
+    executorType = executorType == null ? defaultExecutorType : executorType;
+    executorType = executorType == null ? ExecutorType.SIMPLE : executorType;
+    Executor executor;
+    if (ExecutorType.BATCH == executorType) {
+      executor = new BatchExecutor(this, transaction);
+    } else if (ExecutorType.REUSE == executorType) {
+      executor = new ReuseExecutor(this, transaction);
+    } else {
+      executor = new SimpleExecutor(this, transaction);
+    }
+    if (cacheEnabled) {
+      executor = new CachingExecutor(executor);
+    }
+    // 创建 Executor 代理对象
+    executor = (Executor) interceptorChain.pluginAll(executor);
+    return executor;
+  }
+```
+
+```java
+public class InterceptorChain {
+
+  private final List<Interceptor> interceptors = new ArrayList<>();
+
+  // 调用所有拦截器对象的 plugin() 方法执行拦截逻辑
+  public Object pluginAll(Object target) {
+    for (Interceptor interceptor : interceptors) {
+      target = interceptor.plugin(target);
+    }
+    return target;
+  }
+
+  public void addInterceptor(Interceptor interceptor) {
+    interceptors.add(interceptor);
+  }
+
+  public List<Interceptor> getInterceptors() {
+    return Collections.unmodifiableList(interceptors);
+  }
+
+}
+```
+
+```java
+public interface Interceptor {
+  // 定义拦截逻辑，该方法会在目标方法调用时执行
+  Object intercept(Invocation invocation) throws Throwable;
+  // 用于创建 Executor、ParameterHandler、ResultSetHandler 或 StatementHandler 的代理对象，该方法的参数即为 Executor、ParameterHandler、ResultSetHandler 或 StatementHandler 组件的实例
+  default Object plugin(Object target) {
+    return Plugin.wrap(target, this);
+  }
+  // 设置插件的属性值
+  default void setProperties(Properties properties) {
+    // NOP
+  }
+
+}
+```
+
+```java
+public class Invocation {
+  // 目标对象，即 Executor、ParameterHandler、ResultSetHandler 或 StatementHandler 组件的实例
+  private final Object target;
+  // 目标方法，即拦截的方法
+  private final Method method;
+  // 目标方法参数
+  private final Object[] args;
+
+  public Invocation(Object target, Method method, Object[] args) {
+    this.target = target;
+    this.method = method;
+    this.args = args;
+  }
+
+  public Object getTarget() {
+    return target;
+  }
+
+  public Method getMethod() {
+    return method;
+  }
+
+  public Object[] getArgs() {
+    return args;
+  }
+  // 执行目标方法，自定义插件类中，拦截逻辑执行完毕后一般都需要调用 proceed() 方法执行目标方法的原有逻辑。
+  public Object proceed() throws InvocationTargetException, IllegalAccessException {
+    return method.invoke(target, args);
+  }
+
+}
+```
+
+​		为了便于创建`Executor、ParameterHandler、ResultSetHandler`或`StatementHandler`实例的代理对象，`MyBatis`中提供了一个`Plugin`工具类：
+
+```java
+public class Plugin implements InvocationHandler { // JDK 动态代理
+  // 目标对象，即 Executor、ParameterHandler、ResultSetHandler 或 StatementHandler 组件的实例
+  private final Object target;
+  // 自定义拦截器实例
+  private final Interceptor interceptor;
+  // Intercepts 注解指定的方法
+  private final Map<Class<?>, Set<Method>> signatureMap;
+
+  private Plugin(Object target, Interceptor interceptor, Map<Class<?>, Set<Method>> signatureMap) {
+    this.target = target;
+    this.interceptor = interceptor;
+    this.signatureMap = signatureMap;
+  }
+  // 简化动态代理对象的创建
+  public static Object wrap(Object target, Interceptor interceptor) {
+    // 调用 getsignatureMap() 方法获取自定义插件中，通过 Intercepts 注解指定的方法
+    Map<Class<?>, Set<Method>> signatureMap = getSignatureMap(interceptor);
+    Class<?> type = target.getClass();
+    // 获取当前 Intercepts 注解指定要拦截的组件的接口信息
+    Class<?>[] interfaces = getAllInterfaces(type, signatureMap);
+    if (interfaces.length > 0) {
+      return Proxy.newProxyInstance(
+          type.getClassLoader(),
+          interfaces,
+          new Plugin(target, interceptor, signatureMap));
+    }
+    return target;
+  }
+
+  @Override
+  public Object invoke(Object proxy, Method method, Object[] args) throws Throwable {
+    try {
+      Set<Method> methods = signatureMap.get(method.getDeclaringClass());
+      // 如果该方法是 Intercepts 注解指定的方法，则调用拦截器实例的 intercept() 方法执行拦截逻辑
+      if (methods != null && methods.contains(method)) {
+        return interceptor.intercept(new Invocation(target, method, args));
+      }
+      return method.invoke(target, args);
+    } catch (Exception e) {
+      throw ExceptionUtil.unwrapThrowable(e);
+    }
+  }
+    
+  private static Map<Class<?>, Set<Method>> getSignatureMap(Interceptor interceptor) {
+    // 获取 Intercepts 注解信息
+    Intercepts interceptsAnnotation = interceptor.getClass().getAnnotation(Intercepts.class);
+    // issue #251
+    if (interceptsAnnotation == null) {
+      throw new PluginException("No @Intercepts annotation was found in interceptor " + interceptor.getClass().getName());
+    }
+    // 获取所有 Signature 注解信息
+    Signature[] sigs = interceptsAnnotation.value();
+    Map<Class<?>, Set<Method>> signatureMap = new HashMap<>();
+    for (Signature sig : sigs) {
+      // 对所有 signature 注解进行遍历，把 signature 注解指定拦截的组件及方法添加到 Map 中
+      Set<Method> methods = MapUtil.computeIfAbsent(signatureMap, sig.type(), k -> new HashSet<>());
+      try {
+        Method method = sig.type().getMethod(sig.method(), sig.args());
+        methods.add(method);
+      } catch (NoSuchMethodException e) {
+        throw new PluginException("Could not find method on " + sig.type() + " named " + sig.method() + ". Cause: " + e, e);
+      }
+    }
+    return signatureMap;
+  }
+  ...
+}
+```
 
 
 
